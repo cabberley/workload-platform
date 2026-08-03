@@ -1,12 +1,25 @@
 import { useEffect, useState } from "react";
 import { fetchModules, fetchWorkloads } from "./api/client";
 import type { ModuleManifest } from "./api/types";
-import { useAsync } from "./hooks/useAsync";
+import { useAsync, type AsyncState } from "./hooks/useAsync";
 import { WorkloadSelector } from "./panels/WorkloadSelector";
 import { WorkloadView } from "./panels/WorkloadView";
 import { ModulesTable } from "./panels/ModulesTable";
 import { GrafanaPanel } from "./panels/GrafanaPanel";
+import { EstateView } from "./panels/EstateView";
+import { FindingsView } from "./panels/FindingsView";
+import { DriftView } from "./panels/DriftView";
 import { card } from "./styles";
+
+/** In-page sections. `estate` is estate-wide; the rest are scoped to the selected workload. */
+type Tab = "estate" | "workload" | "findings" | "drift";
+
+const TABS: { id: Tab; label: string; scoped: boolean }[] = [
+  { id: "estate", label: "Estate", scoped: false },
+  { id: "workload", label: "Workload", scoped: true },
+  { id: "findings", label: "Findings", scoped: true },
+  { id: "drift", label: "Drift", scoped: true },
+];
 
 /**
  * In-boundary console. Reads the API read models only (no state writes from the SPA):
@@ -17,6 +30,7 @@ import { card } from "./styles";
 export function App() {
   const workloadsState = useAsync<string[]>(fetchWorkloads, []);
   const [selected, setSelected] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>("estate");
 
   const [modules, setModules] = useState<ModuleManifest[]>([]);
   const [modulesError, setModulesError] = useState<string | null>(null);
@@ -48,18 +62,36 @@ export function App() {
         <WorkloadSelector state={workloadsState} selected={selected} onSelect={setSelected} />
       </section>
 
-      {selected ? (
-        // `key={selected}` remounts the subtree on selection change so every useAsync hook resets
-        // to `loading` synchronously — React discards the previous workload's graph/health/SPOF/drift
-        // state. This guarantees no render can paint one workload's success under another's heading
-        // (fail-closed: a selection change never shows a stale green/all-clear view).
-        <WorkloadView key={selected} workload={selected} />
-      ) : (
-        workloadsState.status === "success" &&
-        workloadsState.data.length > 0 && (
-          <p style={{ color: "#5f6368" }}>Select a workload to view its dependency graph.</p>
-        )
-      )}
+      <nav
+        aria-label="Console views"
+        style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}
+      >
+        {TABS.map((t) => {
+          const active = tab === t.id;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              aria-pressed={active}
+              onClick={() => setTab(t.id)}
+              style={{
+                padding: "6px 14px",
+                fontSize: 14,
+                borderRadius: 999,
+                border: active ? "1px solid #1a73e8" : "1px solid #ccc",
+                background: active ? "#e8f0fe" : "#fff",
+                color: active ? "#1a73e8" : "#3c4043",
+                fontWeight: active ? 700 : 500,
+                cursor: "pointer",
+              }}
+            >
+              {t.label}
+            </button>
+          );
+        })}
+      </nav>
+
+      <section style={card}>{renderTab(tab, selected, workloadsState)}</section>
 
       <div style={{ display: "grid", gap: 20, marginTop: 24 }}>
         <GrafanaPanel />
@@ -72,4 +104,31 @@ export function App() {
       </div>
     </main>
   );
+}
+
+/**
+ * Render the active view. Scoped views require a selected workload and are wrapped with
+ * `key={selected}` so a selection change remounts them — every child `useAsync` resets to
+ * `loading` synchronously and no render can paint one workload's success under another's heading
+ * (fail-closed: a selection change never shows a stale green/all-clear view).
+ */
+function renderTab(tab: Tab, selected: string | null, workloadsState: AsyncState<string[]>) {
+  if (tab === "estate") {
+    return <EstateView state={workloadsState} />;
+  }
+  if (!selected) {
+    return (
+      <p style={{ color: "#5f6368", margin: 0 }}>
+        Select a workload above to view its {tab}.
+      </p>
+    );
+  }
+  switch (tab) {
+    case "workload":
+      return <WorkloadView key={selected} workload={selected} />;
+    case "findings":
+      return <FindingsView key={selected} workload={selected} />;
+    case "drift":
+      return <DriftView key={selected} workload={selected} />;
+  }
 }
