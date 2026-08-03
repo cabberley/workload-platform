@@ -52,7 +52,7 @@ where = ["src"]
 packs_engine = ["schemas/*.schema.json"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 addopts = "-q"
 
