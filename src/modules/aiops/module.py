@@ -473,7 +473,24 @@ def _merge_candidates(
         for pack_id, version in contributing
         if pack_id
     ]
-    finding.evidence = list(finding.evidence) + pack_refs
+    # Carry connector provenance (MED 6): now that signals can come from >1 connector, cite which
+    # connector(s) supplied the observations so an operator can trace a finding back to its source.
+    # Deterministic / order-free: distinct source ids, sorted. The cited observation's source is
+    # listed first (as the primary evidence), followed by any other contributing sources.
+    cited_source = str(cited.source)
+    contributing_sources = sorted({str(signal.source) for _rule, signal in candidates})
+    ordered_sources = [cited_source] + [s for s in contributing_sources if s != cited_source]
+    connector_refs = [
+        SourceReference(
+            kind="connector",
+            id=source_id,
+            detail=(
+                "cited observation source" if source_id == cited_source else "observation source"
+            ),
+        )
+        for source_id in ordered_sources
+    ]
+    finding.evidence = list(finding.evidence) + pack_refs + connector_refs
     finding.packId = winner_rule["packId"]
     finding.packVersion = winner_rule["packVersion"]
     if len(contributing) > 1:

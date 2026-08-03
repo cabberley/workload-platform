@@ -36,6 +36,13 @@ ENV_SUBSCRIPTION_ID = "WP_SUBSCRIPTION_ID"
 ENV_ALERT_WEBHOOK_URL = "WP_ALERT_WEBHOOK_URL"
 ENV_SYSTEM_PULSE_BASE_URL = "SYSTEM_PULSE_BASE_URL"
 SYSTEM_PULSE_TOKEN_ENV = "SYSTEM_PULSE_READ_TOKEN"  # noqa: S105 - env var *name*, not a secret
+# Azure Monitor connector (aiops). A Log Analytics workspace id gates the logs edge; the metrics
+# edge additionally needs a regional endpoint + namespace. All are Key Vault-backed *values*; only
+# the env var names live in code (keyless — Managed Identity supplies the credential).
+ENV_AZURE_MONITOR_WORKSPACE_ID = "AZURE_MONITOR_WORKSPACE_ID"
+ENV_AZURE_MONITOR_RESOURCE_IDS = "AZURE_MONITOR_RESOURCE_IDS"
+ENV_AZURE_MONITOR_METRICS_ENDPOINT = "AZURE_MONITOR_METRICS_ENDPOINT"
+ENV_AZURE_MONITOR_METRIC_NAMESPACE = "AZURE_MONITOR_METRIC_NAMESPACE"
 
 _DEFAULT_CONTENT_ROOT = "content"
 _WEBHOOK_TIMEOUT_S = 10.0
@@ -91,6 +98,11 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     * ``"notifier"`` (alerts) — needs ``$WP_ALERT_WEBHOOK_URL`` (a Key Vault-backed value).
     * ``"system_pulse"`` (aiops) — needs ``$SYSTEM_PULSE_BASE_URL``; the read token is resolved at
       the edge from the Key Vault-backed ``$SYSTEM_PULSE_READ_TOKEN`` (never embedded here).
+    * ``"azure_monitor"`` (aiops) — needs ``$AZURE_MONITOR_WORKSPACE_ID`` (Log Analytics workspace,
+      for the aggregated logs edge) **and** a keyless credential; optional
+      ``$AZURE_MONITOR_RESOURCE_IDS`` / ``$AZURE_MONITOR_METRICS_ENDPOINT`` /
+      ``$AZURE_MONITOR_METRIC_NAMESPACE`` enable the metrics edge. The SDK imports lazily at the
+      edge, so a missing package leaves the key absent (fail closed) rather than crashing.
 
     ``config`` defaults to ``os.environ``; tests pass an explicit mapping.
     """
@@ -102,13 +114,7 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     _add_network(registry, cfg, credential)
     _add_notifier(registry, cfg)
     _add_system_pulse(registry, cfg)
-
-    # TODO(human): azure_monitor extension point (issue #6). When #6 lands its keyless
-    # AzureMonitorClient, wire it here in ~2 lines, guarded/fail-closed like the others, e.g.:
-    #     if cfg.get("AZURE_MONITOR_WORKSPACE_ID") and credential is not None:
-    #         from modules.aiops.connectors.azure_monitor import AzureMonitorClient
-    #         registry["azure_monitor"] = AzureMonitorClient(credential=credential)
-    # Do NOT import azure_monitor until #6 is on main.
+    _add_azure_monitor(registry, cfg, credential)
 
     return registry
 
@@ -175,6 +181,49 @@ def _add_system_pulse(registry: dict[str, object], cfg: Mapping[str, str]) -> No
 
         registry["system_pulse"] = SystemPulseClient(
             SystemPulseConfig(base_url=base_url, token_env=SYSTEM_PULSE_TOKEN_ENV)
+        )
+    except Exception:  # noqa: BLE001 - fail closed: omit the connector, never crash wiring
+        return
+
+
+def _add_azure_monitor(
+    registry: dict[str, object], cfg: Mapping[str, str], credential: object | None
+) -> None:
+    """aiops' Azure Monitor connector — keyless, read-only, guarded, fail-closed.
+
+    Registered ONLY when a Log Analytics workspace id (``$AZURE_MONITOR_WORKSPACE_ID``, gating the
+    aggregated logs edge) **and** a keyless credential are both present. A ``credential_provider``
+    closure over the wiring credential keeps the connector keyless (Managed Identity via
+    ``DefaultAzureCredential``) — no key/secret/connection string is ever read here. Optional
+    ``$AZURE_MONITOR_RESOURCE_IDS`` (comma-separated) plus a regional metrics endpoint + namespace
+    enable the metrics edge. The connector imports its Azure SDKs lazily at the edge, so a missing
+    SDK simply fails closed at query time; this builder never raises — a missing workspace or
+    credential leaves the key **absent** so the module fails closed on lookup.
+    """
+    workspace_id = (cfg.get(ENV_AZURE_MONITOR_WORKSPACE_ID) or "").strip()
+    if not workspace_id or credential is None:
+        return
+    resource_ids = [
+        rid.strip()
+        for rid in (cfg.get(ENV_AZURE_MONITOR_RESOURCE_IDS) or "").split(",")
+        if rid.strip()
+    ]
+    metrics_endpoint = (cfg.get(ENV_AZURE_MONITOR_METRICS_ENDPOINT) or "").strip() or None
+    metric_namespace = (cfg.get(ENV_AZURE_MONITOR_METRIC_NAMESPACE) or "").strip() or None
+    try:
+        from modules.aiops.connectors.azure_monitor import (
+            AzureMonitorClient,
+            AzureMonitorConfig,
+        )
+
+        registry["azure_monitor"] = AzureMonitorClient(
+            AzureMonitorConfig(
+                workspace_id=workspace_id,
+                resource_ids=resource_ids,
+                metrics_endpoint=metrics_endpoint,
+                metric_namespace=metric_namespace,
+            ),
+            credential_provider=lambda: credential,
         )
     except Exception:  # noqa: BLE001 - fail closed: omit the connector, never crash wiring
         return

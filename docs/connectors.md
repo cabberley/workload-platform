@@ -5,6 +5,14 @@ keyless, fail-closed, bounded, and free of any Azure/vendor SDK at import time**
 lives in [`src/shared/connectors`](../src/shared/connectors); see
 [ADR 0004](adr/0004-connector-framework.md) for the rationale.
 
+**Connectors:**
+
+- **System Pulse** — Epic telemetry over HTTP (this document).
+- **[Azure Monitor](azure-monitor.md)** — read-only metrics (`azure-monitor-querymetrics`) +
+  aggregated, PII-safe logs (`azure-monitor-query`), keyless via Managed Identity. See that page
+  for the least-privilege RBAC (Monitoring Reader / Log Analytics Reader), config env vars, and the
+  no-raw-log-egress guarantee.
+
 ## The pattern
 
 A connector is a thin client whose **only** I/O is one `fetch_raw()` edge method. Pure mapping
