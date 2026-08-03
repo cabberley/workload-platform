@@ -63,6 +63,17 @@ _MANIFEST = ModuleManifest(
 # are imported above; re-exported here so the module's public RCA surface is unchanged.
 
 
+def _encode_id_component(text: object) -> str:
+    """Percent-encode ``%`` and ``:`` in one finding-id component so it can never contain the ``::``
+    delimiter. This keeps the detection-id namespaces provably disjoint regardless of metric/node
+    content: a legacy id (``detect::<metric>::<node>``) always has exactly two structural ``::``
+    (three components) while a windowed/expression id (``detect::win::…`` / ``detect::expr::…``)
+    always has three — so a metric literally named ``win::cpu`` cannot collide with a windowed
+    ``cpu``. Components without ``%``/``:`` (the common case) are returned unchanged, so existing
+    ids stay byte-for-byte identical."""
+    return str(text).replace("%", "%25").replace(":", "%3A")
+
+
 def detect_metric_breach(signal: dict) -> Finding | None:
     """Pure threshold detection for one telemetry signal.
 
@@ -79,7 +90,8 @@ def detect_metric_breach(signal: dict) -> Finding | None:
     if not breached:
         return None
     return Finding(
-        id=f"detect::{signal['name']}::{signal.get('nodeId', 'na')}",
+        id=f"detect::{_encode_id_component(signal['name'])}::"
+        f"{_encode_id_component(signal.get('nodeId', 'na'))}",
         module="aiops",
         title=f"Telemetry breach: {signal['name']}",
         passed=False,
@@ -230,6 +242,10 @@ def load_telemetry_rules(
     Only packs whose ``manifest.targets`` include ``workload`` are loaded (the engine filters), so
     an epic telemetry pack never detects against a sap estate. Each rule keeps its ``packId`` /
     ``packVersion`` provenance. Malformed bodies/signals are skipped and surfaced — never raised.
+
+    Signals that declare a ``window`` or ``expression`` are NOT threshold rules: they are routed to
+    the compiled-detector path (:func:`load_windowed_detectors`) and skipped here (no note — they
+    are re-homed, not malformed), so a single-sample threshold never double-fires a windowed one.
     """
     if packs is None:
         return [], []
@@ -238,18 +254,122 @@ def load_telemetry_rules(
     notes: list[str] = []
     for pack in engine.load_for_workload(workload, PackType.telemetry):
         body = pack.body
-        raw_signals = body.get("signals") if isinstance(body, dict) else None
+        if not isinstance(body, dict):
+            notes.append(f"pack {pack.manifest.id}: body is not an object — skipped")
+            continue
+        raw_signals = body.get("signals")
         if not isinstance(raw_signals, list):
-            if isinstance(body, dict) and "signals" in body:
-                notes.append(f"pack {pack.manifest.id}: 'signals' is not a list — skipped")
+            notes.append(
+                f"pack {pack.manifest.id}: 'signals' is absent or not a list — skipped"
+            )
             continue
         for raw in raw_signals:
+            if _is_windowed_signal(raw):
+                continue  # handled by the compiled-detector path, not the threshold path
             rule, note = _parse_signal_rule(raw, pack.manifest.id, pack.manifest.version)
             if note is not None:
                 notes.append(note)
             if rule is not None:
                 rules.append(rule)
     return rules, notes
+
+
+def _is_windowed_signal(raw: Any) -> bool:
+    """True if a raw signal declares a ``window`` or ``expression`` (compiled-detector path).
+
+    Mirrors ``modules.aiops.detectors.classify_signal`` without importing it at module load time
+    (that module imports this one). Kept trivial and in-sync by the shared unit tests.
+    """
+    return isinstance(raw, dict) and ("window" in raw or "expression" in raw)
+
+
+def load_windowed_detectors(
+    packs: object | None, workload: str
+) -> tuple[list[Any], list[str]]:
+    """Compile target-aware windowed/expression detectors for ``workload``. Returns ``(detectors,
+    notes)``.
+
+    Delegates to the pure :func:`modules.aiops.detectors.compile_detectors` (imported lazily to
+    avoid an import cycle) restricted to the ``window``/``expression`` kinds — the threshold kind
+    stays on the cross-pack collective fuse in :func:`load_telemetry_rules`/``fuse_detections`` so
+    multi-pack collision-merge is byte-for-byte preserved. Malformed/unsafe detectors are surfaced,
+    never silently skipped.
+    """
+    if packs is None:
+        return [], []
+    from modules.aiops.detectors import compile_detectors
+
+    engine = cast(_PacksEngineLike, packs)
+    detectors: list[Any] = []
+    notes: list[str] = []
+    for pack in engine.load_for_workload(workload, PackType.telemetry):
+        pack_detectors, pack_notes = compile_detectors(
+            pack.body,
+            pack.manifest.id,
+            pack.manifest.version,
+            kinds={"window", "expression"},
+        )
+        detectors.extend(pack_detectors)
+        notes.extend(pack_notes)
+    return detectors, notes
+
+
+def run_windowed_detectors(
+    detectors: list[Any], signals: list[Signal], estate: list[ResourceNode]
+) -> list[Finding]:
+    """Run compiled window/expression detectors over the observed signals; dedup by id. Pure.
+
+    Detectors emit kind-namespaced ids (``detect::win::`` / ``detect::expr::``) that never clash
+    with threshold ids, but two packs can define the same windowed signal on the same node. We emit
+    exactly one deterministic finding per id (highest severity, then pack provenance) while citing
+    every contributing pack — no provenance lost, output order-free.
+    """
+    by_id: dict[str, list[Finding]] = defaultdict(list)
+    for detector in detectors:
+        for finding in detector(signals, estate):
+            by_id[finding.id].append(finding)
+    merged = [_merge_windowed(group) for group in by_id.values()]
+    merged.sort(key=lambda f: f.id)
+    return merged
+
+
+def _merge_windowed(group: list[Finding]) -> Finding:
+    """Pick the deterministic winner for one id and union the contributing pack references."""
+    winner = sorted(
+        group,
+        key=lambda f: (
+            -_severity_rank(f.severity.value),
+            str(f.packId or ""),
+            str(f.packVersion or ""),
+        ),
+    )[0]
+    if len(group) == 1:
+        return winner
+    pack_refs = {
+        (str(f.packId or ""), str(f.packVersion or ""))
+        for f in group
+        if f.packId
+    }
+    existing = {(ref.kind, ref.id, ref.detail) for ref in winner.evidence}
+    for pack_id, version in sorted(pack_refs):
+        ref = SourceReference(kind="pack", id=pack_id, detail=f"version {version}")
+        if (ref.kind, ref.id, ref.detail) not in existing:
+            winner.evidence.append(ref)
+    return winner
+
+
+def _collect_detector_pack_sources(
+    detectors: list[Any],
+    into: dict[tuple[str | None, str | None], SourceReference],
+) -> None:
+    """Accumulate a distinct ``SourceReference`` per detector's Telemetry Pack (id@version)."""
+    for detector in detectors:
+        key = (detector.pack_id, detector.pack_version)
+        if not detector.pack_id or key in into:
+            continue
+        into[key] = SourceReference(
+            kind="pack", id=str(detector.pack_id), detail=f"version {detector.pack_version}"
+        )
 
 
 def _fetch_source_signals(
@@ -561,10 +681,20 @@ class AiopsModule(Module):
             rules, rule_notes = load_telemetry_rules(ctx.packs, workload)
             notes.extend(rule_notes)
             _collect_pack_sources(rules, pack_sources)
-            if not rules:
-                continue  # no telemetry thresholds for this workload
+            # Windowed/expression detectors (issue #51) compile at load time (fail-closed) and run
+            # over the SAME signal stream, feeding the SAME detection -> RCA path as thresholds.
+            windowed_detectors, detector_notes = load_windowed_detectors(ctx.packs, workload)
+            notes.extend(detector_notes)
+            _collect_detector_pack_sources(windowed_detectors, pack_sources)
+            if not rules and not windowed_detectors:
+                continue  # no telemetry detection content for this workload
 
-            metric_names = sorted({str(rule["name"]) for rule in rules})
+            # Fetch every metric named by a threshold rule OR a compiled detector, so a windowed
+            # detector over a metric no threshold watches still gets its observations.
+            metric_names = sorted(
+                {str(rule["name"]) for rule in rules}
+                | {str(det.name) for det in windowed_detectors}
+            )
             signals, available, unavailable = _observe_signals(ctx.clients, metric_names)
             sources_observed = True
             sources_available.update(available)
@@ -573,7 +703,14 @@ class AiopsModule(Module):
                 notes.append(f"{workload}: no telemetry observed from any source")
                 continue
 
-            workload_detections = fuse_detections(rules, signals, state.get_estate(workload))
+            estate = state.get_estate(workload)
+            # Threshold path (unchanged, cross-pack collision-merge) + compiled windowed/expression
+            # detectors, combined into one order-free detection set for correlation.
+            workload_detections = fuse_detections(rules, signals, estate)
+            workload_detections.extend(
+                run_windowed_detectors(windowed_detectors, signals, estate)
+            )
+            workload_detections.sort(key=lambda finding: finding.id)
             graph = state.get_graph(workload)
             blast_of = _blast_radius_map(graph)
             for finding in workload_detections:
@@ -631,4 +768,6 @@ __all__ = [
     "detect_metric_breach",
     "fuse_detections",
     "load_telemetry_rules",
+    "load_windowed_detectors",
+    "run_windowed_detectors",
 ]
