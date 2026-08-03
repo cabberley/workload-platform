@@ -171,6 +171,11 @@ module jobApps 'modules/module-job.bicep' = [for m in jobModules: {
     maxExecutions: m.max
     cpu: m.cpu
     memoryGi: m.mem
+    // Compute-only worker jobs reach the single-writer API over its INTERNAL ingress. Derived
+    // from the API container-app's ingress FQDN (coreApps[0] == the 'api' app, deployed as
+    // wp-api) so the value is correct by construction — never a hardcoded host. Referencing this
+    // output also orders the API app before the jobs.
+    apiBaseUrl: 'https://${coreApps[0].outputs.fqdn}'
   }
 }]
 

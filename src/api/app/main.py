@@ -7,6 +7,7 @@ low replica counts while the compute-heavy modules scale freely.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -51,6 +52,40 @@ def get_store() -> StateStore:
 StoreDep = Annotated[StateStore, Depends(get_store)]
 
 
+# The packs engine and edge-client registry are built once per process and injected into modules
+# the API runs in-process, mirroring `get_store`. They are cached and exposed as FastAPI
+# dependencies so tests can override them with fakes via `app.dependency_overrides`. Both are
+# built by the composition root (`cli.wiring`) — the single place that knows concrete client types.
+_packs: object | None = None
+_packs_built = False
+_clients: Mapping[str, object] | None = None
+
+
+def get_packs() -> object | None:
+    """Return the process-wide verified packs engine (or ``None`` if no content root). Cached."""
+    global _packs, _packs_built
+    if not _packs_built:
+        from cli.wiring import build_packs_engine
+
+        _packs = build_packs_engine()
+        _packs_built = True
+    return _packs
+
+
+def get_clients() -> Mapping[str, object]:
+    """Return the process-wide keyless edge-client registry (possibly partial/empty). Cached."""
+    global _clients
+    if _clients is None:
+        from cli.wiring import build_client_registry
+
+        _clients = build_client_registry()
+    return _clients
+
+
+PacksDep = Annotated[object | None, Depends(get_packs)]
+ClientsDep = Annotated[Mapping[str, object], Depends(get_clients)]
+
+
 @app.get("/api/health")
 def health() -> dict[str, object]:
     """Liveness + per-module health. Used by CI smoke and platform probes."""
@@ -72,19 +107,26 @@ class RunRequest(BaseModel):
 
 
 @app.post("/api/modules/{name}/run")
-def run_module_endpoint(name: str, req: RunRequest, store: StoreDep) -> ModuleRunResult:
+def run_module_endpoint(
+    name: str, req: RunRequest, store: StoreDep, packs: PacksDep, clients: ClientsDep
+) -> ModuleRunResult:
     """Run a single module by name (also how the ACA Job worker's compute is exercised in-process).
 
     Compute and write are separated: :func:`~shared.module_base.run_module` computes the result
-    with a **read-only** state view (it cannot write shared state); then — because this is the API,
-    the single writer — the endpoint commits the run atomically when the scope carries a
-    ``workload`` (findings always, plus estate/graph when the run produced them).
+    with a **read-only** state view (it cannot write shared state), the verified ``packs`` engine,
+    and the keyless edge-client registry injected here at the boundary; then — because this is the
+    API, the single writer — the endpoint commits the run atomically when the scope carries a
+    ``workload`` (findings always, plus estate/graph when the run produced them). The API keeps its
+    fast in-process ``ReadOnlyState`` view (it is co-located with the store); only the worker reads
+    over HTTP.
     """
     try:
         module = registry.get(name)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    result = run_module(module, scope=req.scope, state=ReadOnlyState(store))
+    result = run_module(
+        module, scope=req.scope, state=ReadOnlyState(store), packs=packs, clients=clients
+    )
     workload = req.scope.get("workload")
     if workload:
         store.commit_run(workload, result)  # API is the single writer
@@ -161,6 +203,21 @@ def get_findings(
 ) -> list[Finding]:
     """Return current findings for ``workload``, optionally filtered to one ``module``."""
     return store.get_findings(workload, module)
+
+
+# The previous-snapshot read models below exist so the worker's read-only `ApiStateReader` can
+# implement the FULL `ReadableState` Protocol over HTTP — reassessments/aiops run in the worker
+# and must read prior state to compute drift/detections without ever holding a writable store.
+@app.get("/api/workloads/{workload}/previous-findings")
+def get_previous_findings(workload: str, store: StoreDep) -> list[Finding]:
+    """Return the findings captured by the most recent snapshot for ``workload`` (empty if none)."""
+    return store.get_previous_findings(workload)
+
+
+@app.get("/api/workloads/{workload}/previous-node-ids")
+def get_previous_node_ids(workload: str, store: StoreDep) -> list[str]:
+    """Return the estate node ids captured by the most recent snapshot (empty if none)."""
+    return store.get_previous_node_ids(workload)
 
 
 @app.get("/api/workloads/{workload}/drift")

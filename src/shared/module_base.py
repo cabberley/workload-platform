@@ -71,6 +71,7 @@ def run_module(
     *,
     scope: dict[str, str] | None = None,
     state: ReadableState | None = None,
+    packs: object | None = None,
     clients: Mapping[str, object] | None = None,
 ) -> ModuleRunResult:
     """**Compute-only**: run ``module`` and return its ``ModuleRunResult``. Never persists.
@@ -78,10 +79,12 @@ def run_module(
     Persistence is the exclusive job of the API core (the single writer); this helper only does
     the compute half so the split is explicit. Both the API ``/run`` endpoint (which then commits)
     and the ACA worker (which then POSTs the result to the API) call this — neither writes state
-    from inside the compute step. Modules receive a read-only ``state`` view (or ``None``) and the
-    edge-client registry ``clients`` injected at the process boundary (or ``None``).
+    from inside the compute step. Modules receive a read-only ``state`` view (or ``None``), the
+    verified ``packs`` engine (or ``None``), and the edge-client registry ``clients`` injected at
+    the process boundary (or ``None``). ``packs`` is forwarded verbatim so quality_checks/aiops/
+    dependency_graph actually see the content they consume (previously dropped here — issue #24).
     """
-    ctx = ModuleContext(state=state, clients=clients)
+    ctx = ModuleContext(packs=packs, state=state, clients=clients)
     return module.run(ctx, scope=scope)
 
 
