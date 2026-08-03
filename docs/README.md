@@ -7,6 +7,7 @@ codename *Aegis*). This repository implements that blueprint as a buildable scaf
 - **`../AGENTS.md`** — the multi-agent build model and roles.
 - **`adr/`** — Architecture Decision Records; one decision per file.
 - **`observability.md`** — platform self-observability: health/readiness, internal metrics, tracing seams.
+- **`telemetry-visualization.md`** — telemetry visualization on **Azure Managed Grafana** over Azure Monitor (keyless, in-boundary, no-PII boards + embedding). See ADR `0007`.
 - **`workload-generalization.md`** — proof the platform is workload-agnostic: a new workload type (Epic, SAP, Citrix, bespoke) is onboarded with **content packs only, no code change**.
 - **Blueprint** — kept outside the repo (no customer/proprietary content in git). Key docs:
   - 01 Executive Summary · 02 Solution Architecture · 03 Module Specifications

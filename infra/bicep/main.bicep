@@ -32,6 +32,27 @@ module core 'modules/core.bicep' = {
 }
 
 // ======================================================================================
+// Telemetry visualization — Azure Managed Grafana over Azure Monitor (issue #58, ADR 0007).
+// Keyless: the instance reuses the SHARED user-assigned Managed Identity from core (identityId) as
+// its DATA-SOURCE (read) identity, granted ONLY least-privilege READ roles (Monitoring Reader +
+// Log Analytics Reader) scoped to this resource group — see grafana.bicep for the scope rationale.
+// No API keys, no data-source secrets, no board JSON in IaC.
+//
+// Provisioning the Azure Monitor data source + dashboards is NOT done here: it is performed
+// out-of-band by a SEPARATE Entra caller (CI Managed Identity or operator) holding the Grafana
+// Editor data-plane role — NOT this shared identity, which only READS Azure Monitor at query time.
+// Boards are versioned in infra/grafana and imported via the Grafana API (infra/grafana/README.md).
+// ======================================================================================
+module grafana 'modules/grafana.bicep' = {
+  name: 'grafana'
+  params: {
+    location: location
+    identityResourceId: core.outputs.identityId
+    identityPrincipalId: core.outputs.identityPrincipalId
+  }
+}
+
+// ======================================================================================
 // API core + web — the platform, NOT modules. The API core is the single writer, so it
 // stays modest (http-concurrency scaling) while the six modules below scale independently.
 // (These use their own images' default entrypoints — no command override.)
@@ -182,3 +203,8 @@ module jobApps 'modules/module-job.bicep' = [for m in jobModules: {
 output registryLoginServer string = core.outputs.registryLoginServer
 output apiFqdn string = coreApps[0].outputs.fqdn
 output webFqdn string = coreApps[1].outputs.fqdn
+// Managed Grafana public endpoint (no secrets). Feed this into the web build-time VITE_GRAFANA_URL
+// (the keyless deep-link surface) — Managed Grafana blocks iframing by default, so this raw
+// endpoint is NOT an embeddable panel URL. Only set VITE_GRAFANA_PANEL_URL to a separate,
+// auth-proxied, embeddable panel URL; never a token in either.
+output grafanaEndpoint string = grafana.outputs.grafanaEndpoint

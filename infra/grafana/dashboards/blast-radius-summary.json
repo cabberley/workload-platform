@@ -1,0 +1,119 @@
+{
+  "__comment": "SYNTHETIC, PARAMETERIZED TARGET board (issue #58). REQUIRES #86: queries the platform's INTENDED Log Analytics custom tables WpSpof_CL and WpFinding_CL, which NOTHING emits today (no telemetry-export path yet) — so this board does NOT render until #86 lands. Versioned here as the target schema. No real subscription/workspace/resource id, URL, or token — only Grafana template variables with synthetic defaults, bound at import time (see infra/grafana/README.md). Aggregate blast-radius/SPOF summary only, PII-free.",
+  "uid": "wp-blast-radius",
+  "title": "Aegis · Blast Radius & SPOF Summary",
+  "description": "TARGET board — requires the #86 telemetry-export path. Reads the intended custom tables WpSpof_CL (Workload_s, NodeRef_s) and WpFinding_CL (Workload_s, BlastRadius_d, TimeGenerated), which are not emitted yet, so this board fails at query time until #86 lands. Versioned as the target schema.",
+  "tags": ["aegis", "baseline", "blast-radius", "no-pii", "requires-86", "target-board"],
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": true,
+  "timezone": "",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "monitor",
+        "label": "Azure Monitor data source",
+        "type": "datasource",
+        "query": "grafana-azure-monitor-datasource",
+        "current": {}
+      },
+      {
+        "name": "subscription",
+        "label": "Subscription",
+        "type": "textbox",
+        "description": "Deploy-time: set to the in-boundary subscription id (never committed).",
+        "query": "00000000-0000-0000-0000-000000000000",
+        "current": { "text": "00000000-0000-0000-0000-000000000000", "value": "00000000-0000-0000-0000-000000000000" },
+        "options": [ { "text": "00000000-0000-0000-0000-000000000000", "value": "00000000-0000-0000-0000-000000000000", "selected": true } ]
+      },
+      {
+        "name": "workspace",
+        "label": "Log Analytics workspace (resource id)",
+        "type": "textbox",
+        "description": "Deploy-time: set to the in-boundary Log Analytics workspace resource id (from deploy outputs).",
+        "query": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/wp-rg/providers/Microsoft.OperationalInsights/workspaces/wp-log",
+        "current": { "text": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/wp-rg/providers/Microsoft.OperationalInsights/workspaces/wp-log", "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/wp-rg/providers/Microsoft.OperationalInsights/workspaces/wp-log" },
+        "options": [ { "text": "wp-log (synthetic)", "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/wp-rg/providers/Microsoft.OperationalInsights/workspaces/wp-log", "selected": true } ]
+      },
+      {
+        "name": "workload",
+        "label": "Workload",
+        "type": "custom",
+        "description": "Synthetic workload scope — replace options at provision time with your in-boundary workloads.",
+        "query": "atlas,borealis,cascade",
+        "includeAll": true,
+        "multi": true,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active SPOFs (count)",
+      "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+      "description": "Number of single points of failure currently reported. Count only — no node identity shown.",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "Azure Log Analytics",
+          "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+          "subscription": "${subscription}",
+          "azureLogAnalytics": {
+            "resources": ["${workspace}"],
+            "dashboardTime": true,
+            "timeColumn": "TimeGenerated",
+            "query": "// Synthetic aggregate query — table name is a placeholder, rebind at provision time.\nWpSpof_CL\n| where Workload_s in (${workload:singlequote})\n| summarize Spofs = dcount(NodeRef_s)"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "bargauge",
+      "title": "Blast-radius distribution (bucketed)",
+      "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+      "description": "How many findings fall into each blast-radius bucket. Aggregate distribution only.",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "Azure Log Analytics",
+          "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+          "subscription": "${subscription}",
+          "azureLogAnalytics": {
+            "resources": ["${workspace}"],
+            "dashboardTime": true,
+            "timeColumn": "TimeGenerated",
+            "query": "WpFinding_CL\n| where Workload_s in (${workload:singlequote})\n| summarize Findings = count() by Bucket = case(BlastRadius_d <= 2, 'low', BlastRadius_d <= 6, 'medium', 'high')"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Max blast radius over time",
+      "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+      "description": "Peak blast radius across the selected workloads per interval. Aggregate maximum only.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "Azure Log Analytics",
+          "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+          "subscription": "${subscription}",
+          "azureLogAnalytics": {
+            "resources": ["${workspace}"],
+            "dashboardTime": true,
+            "timeColumn": "TimeGenerated",
+            "query": "WpFinding_CL\n| where Workload_s in (${workload:singlequote})\n| summarize MaxBlastRadius = max(BlastRadius_d) by bin(TimeGenerated, 15m)"
+          }
+        }
+      ]
+    }
+  ]
+}
