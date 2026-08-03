@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.microsoft.com/packs/ops.schema.json",
+  "title": "Ops Pack body",
+  "description": "Notification routing table consumed by the Alerts & Notifications module (load_ops_routing + route).",
+  "type": "object",
+  "additionalProperties": false,
+  "$comment": "route() reads routes.get(sev, default) with a hard-coded 'ticket' fallback (alerts/module.py:117-123), and load_ops_routing reads routes/default/runbook independently (alerts/module.py:135-158). So default-only, routes-only, or both are all valid; at least one must be present.",
+  "anyOf": [
+    { "required": ["default"] },
+    { "required": ["routes"] }
+  ],
+  "properties": {
+    "default": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Fallback channel when a severity has no explicit route."
+    },
+    "routes": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "Map of Severity -> channel (e.g. none | ticket | email | page).",
+      "propertyNames": {
+        "enum": ["info", "low", "medium", "high", "critical"]
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "runbook": {
+      "type": ["string", "null"],
+      "description": "Runbook link surfaced with routed notifications; null/absent is skipped via a truthy check (alerts/module.py:157). 'default' and 'routes' stay strict — a fallback policy must carry a real value."
+    }
+  }
+}

@@ -13,6 +13,10 @@ from packs_engine.registry import (
     SemVer,
 )
 
+# Schema validation is a DEV/CI + studio-time gate (jsonschema-backed, guarded import); it does not
+# affect the runtime signature trust gate in engine.py.
+from packs_engine.schema import validate_pack
+
 __all__ = [
     "Pack",
     "PacksEngine",
@@ -29,4 +33,6 @@ __all__ = [
     "RegistryError",
     "RegistryLockError",
     "SemVer",
+    # Per-type JSON-Schema validation (issue #33).
+    "validate_pack",
 ]

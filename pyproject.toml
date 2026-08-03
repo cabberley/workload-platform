@@ -27,6 +27,7 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "types-PyYAML>=6.0",
+    "jsonschema>=4.20",
 ]
 # Optional backend deps for the Azure StateStore (WORKLOADS_STATE_BACKEND=azure).
 # NOT part of the base install — `import shared.state` must work without azure packages.
@@ -42,6 +43,11 @@ wp-worker = "cli.worker:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Ship the pack-body JSON Schemas inside the wheel so packs_engine.schema can load them via
+# importlib.resources whether running from a checkout or an installed package.
+packs_engine = ["schemas/*.schema.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

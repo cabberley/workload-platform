@@ -264,6 +264,38 @@ class RegistryEntry:
             raise CorruptRegistryError(f"Invalid registry entry: {data!r} ({exc})") from exc
 
 
+def parse_registry_index(
+    raw: object, *, source: str = "registry index"
+) -> dict[PackRef, RegistryEntry]:
+    """Validate a JSON-parsed registry index and return its entries keyed by ref. Fail closed.
+
+    Single source of truth for what a *valid* pack registry index is: object shape, ``int`` schema
+    ``version`` equal to :data:`INDEX_SCHEMA_VERSION`, a list of well-formed entries, and no
+    duplicate ``id@version`` ref. Reused by :meth:`PackRegistry._load` AND the pack-validate CI gate
+    (``scripts/validate_packs.py``) so the two can never diverge on what counts as a valid index.
+    Raises :class:`CorruptRegistryError` on any violation.
+    """
+    if not isinstance(raw, dict):
+        raise CorruptRegistryError(f"{source} is not a JSON object")
+    version = raw.get("version")
+    if type(version) is not int or version != INDEX_SCHEMA_VERSION:
+        raise CorruptRegistryError(
+            f"{source} has missing/unsupported schema version {version!r} "
+            f"(expected int {INDEX_SCHEMA_VERSION})"
+        )
+    if not isinstance(raw.get("entries"), list):
+        raise CorruptRegistryError(f"{source} has a non-list 'entries'")
+    entries: dict[PackRef, RegistryEntry] = {}
+    for item in raw["entries"]:
+        if not isinstance(item, dict):
+            raise CorruptRegistryError(f"Registry entry is not an object: {item!r}")
+        entry = RegistryEntry.from_dict(item)
+        if entry.ref in entries:
+            raise CorruptRegistryError(f"Duplicate registry entry for {entry.ref}")
+        entries[entry.ref] = entry
+    return entries
+
+
 # --------------------------------------------------------------------------------------
 # PackRegistry — the on-disk index.
 # --------------------------------------------------------------------------------------
@@ -322,29 +354,7 @@ class PackRegistry:
             raise CorruptRegistryError(
                 f"Registry index unreadable at {self.index_path}: {exc}"
             ) from exc
-        if not isinstance(raw, dict):
-            raise CorruptRegistryError(
-                f"Registry index at {self.index_path} is not a JSON object"
-            )
-        version = raw.get("version")
-        if type(version) is not int or version != INDEX_SCHEMA_VERSION:
-            raise CorruptRegistryError(
-                f"Registry index at {self.index_path} has missing/unsupported schema "
-                f"version {version!r} (expected int {INDEX_SCHEMA_VERSION})"
-            )
-        if not isinstance(raw.get("entries"), list):
-            raise CorruptRegistryError(
-                f"Registry index at {self.index_path} has a non-list 'entries'"
-            )
-        entries: dict[PackRef, RegistryEntry] = {}
-        for item in raw["entries"]:
-            if not isinstance(item, dict):
-                raise CorruptRegistryError(f"Registry entry is not an object: {item!r}")
-            entry = RegistryEntry.from_dict(item)
-            if entry.ref in entries:
-                raise CorruptRegistryError(f"Duplicate registry entry for {entry.ref}")
-            entries[entry.ref] = entry
-        return entries
+        return parse_registry_index(raw, source=f"Registry index at {self.index_path}")
 
     def _save(self, entries: dict[PackRef, RegistryEntry]) -> None:
         ordered = sorted(entries.values(), key=lambda e: e.ref)

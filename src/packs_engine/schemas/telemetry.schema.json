@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.microsoft.com/packs/telemetry.schema.json",
+  "title": "Telemetry Pack body",
+  "description": "Threshold signals consumed by the AIOps module (fuse_detections). Each signal is a role-scoped threshold rule.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["signals"],
+  "properties": {
+    "signals": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "One detection rule. TelemetryRuleSpec uses extra='ignore' for forward-compat (aiops/module.py:161-175), so unknown fields are allowed; the known fields are all required.",
+        "required": ["name", "op", "threshold", "severity", "nodeId"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "op": {
+            "type": "string",
+            "enum": ["gt", "lt"],
+            "description": "Breach direction: value greater-than / less-than threshold (aiops/module.py:172)."
+          },
+          "threshold": {
+            "type": "number",
+            "description": "Numeric breach threshold. Booleans are rejected here and non-finite (nan/inf) values are rejected by validate_pack's finite check (aiops/module.py:184-192)."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "low", "medium", "high", "critical"]
+          },
+          "nodeId": {
+            "type": "string",
+            "pattern": "^role:\\s*\\S.*$",
+            "description": "Role selector role:<name>; the name must be non-whitespace to survive _role_from_selector (aiops/module.py:196-205)."
+          }
+        }
+      }
+    },
+    "logAnalysis": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "note": { "type": "string" }
+      }
+    }
+  }
+}

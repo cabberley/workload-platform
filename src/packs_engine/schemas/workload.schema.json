@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.microsoft.com/packs/workload.schema.json",
+  "title": "Workload Definition Pack body",
+  "description": "Classifies estate resources into workload/tier/role. Consumed by the Discovery module (classify + definitions_from_packs).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["definitions"],
+  "$comment": "When the pack-level 'workload' is absent, every definition must assign at least one label (workload/tier/role) — a selector-only entry would inherit nothing and be a no-op that can shadow later definitions (discovery/module.py:87-90,106-112).",
+  "if": {
+    "not": { "required": ["workload"] }
+  },
+  "then": {
+    "properties": {
+      "definitions": {
+        "items": {
+          "anyOf": [
+            { "required": ["workload"] },
+            { "required": ["tier"] },
+            { "required": ["role"] }
+          ]
+        }
+      }
+    }
+  },
+  "properties": {
+    "workload": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional default workload kind entries inherit when they omit their own (discovery/module.py:106-112)."
+    },
+    "definitions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "A selector→label entry. classify() matches on resourceType and/or a tagKey/tagValue pair (discovery/module.py:77-85), so at least one meaningful selector is required and tagKey/tagValue must appear together.",
+        "properties": {
+          "resourceType": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Azure resource type matched case-insensitively against discovered nodes (discovery/module.py:77-83)."
+          },
+          "tagKey": { "type": "string", "minLength": 1 },
+          "tagValue": { "type": "string" },
+          "workload": { "type": "string", "minLength": 1 },
+          "tier": { "type": "string", "minLength": 1 },
+          "role": { "type": "string", "minLength": 1 }
+        },
+        "anyOf": [
+          { "required": ["resourceType"] },
+          { "required": ["tagKey", "tagValue"] }
+        ],
+        "dependentRequired": {
+          "tagKey": ["tagValue"],
+          "tagValue": ["tagKey"]
+        }
+      }
+    }
+  }
+}

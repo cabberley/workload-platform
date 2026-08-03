@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.microsoft.com/packs/rule.schema.json",
+  "title": "Rule Pack body",
+  "description": "WAF/WARA/APRL-style checks applied to estate nodes by the Quality Checks module.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules"],
+  "properties": {
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "One rule. RuleSpec defaults every field (id->'rule', severity->medium) and uses extra='ignore' for forward-compat (quality_checks/module.py:108,112,118-127), so no field is required; a rule without a supported predicate is valid content — it yields a fail-closed unsupported/unevaluable FAILURE (quality_checks/module.py:146-155).",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable rule id — carried into Finding provenance. RuleSpec types id:str (default 'rule'), so a supplied id must be a non-null string."
+          },
+          "title": { "type": ["string", "null"], "minLength": 1 },
+          "resourceType": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "description": "Optional Azure resource type filter (RuleSpec resourceType:str|None); null/absent => rule applies to every node (quality_checks/module.py:141-142)."
+          },
+          "requiredTag": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "description": "Optional supported predicate (RuleSpec requiredTag:str|None): tag that must be present on the node (quality_checks/module.py:108,146-148)."
+          },
+          "severity": {
+            "anyOf": [
+              { "type": "null" },
+              { "type": "string", "enum": ["info", "low", "medium", "high", "critical"] }
+            ],
+            "description": "null is normalized to medium (quality_checks/module.py:_coerce_severity, :80-82); a NON-null value must be a valid Severity."
+          },
+          "description": {
+            "type": "string",
+            "description": "Intentionally NON-nullable to match RuleSpec.description:str='' — _normalize_rule does NOT pre-coerce description, so a null value raises ValidationError and the rule is dropped at runtime (quality_checks/module.py:166-190)."
+          },
+          "packId": { "type": ["string", "null"] },
+          "packVersion": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}
