@@ -18,6 +18,7 @@ dependencies = [
     "azure-identity>=1.17",
     "azure-mgmt-resourcegraph>=8.0",
     "azure-monitor-query>=1.4",
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

@@ -3,6 +3,20 @@
 Packs are the only inbound artifact (content, not code). This engine is the trust gate:
 it computes SHA-256 over pack content and verifies the HMAC signature **before** a pack is
 allowed to execute. Unknown/invalid signature => fail closed (refuse).
+
+## Two independent, separately-documented trust gates
+
+1. **Legacy HMAC (symmetric)** — :func:`verify` checks the body-only ``sha256`` and an HMAC over it
+   using an injected ``signing_secret`` (Key Vault at the boundary). Active when a secret is set and
+   ``verify_sig`` is on. Unchanged behavior; existing packs/tests rely on it.
+2. **Detached asymmetric signature (issue #35)** — when a :class:`~shared.signing.Verifier` is
+   injected, each pack's :attr:`~shared.contracts.PackManifest.pack_signature` is verified against
+   the pack's *canonical bytes* via :func:`shared.signing.verify_pack`. A missing or invalid
+   detached signature fails closed (:class:`PackVerificationError`).
+
+The two gates are deliberately kept separate: HMAC is a body-integrity MAC; the detached signature
+is an asymmetric provenance signature over canonical (version-identity) bytes. When **no** verifier
+is injected, gate (2) is inert and today's behavior is preserved exactly.
 """
 from __future__ import annotations
 
@@ -15,6 +29,7 @@ from typing import Any
 import yaml
 
 from shared.contracts import PackManifest, PackType
+from shared.signing import Verifier, verify_pack
 
 
 class PackVerificationError(RuntimeError):
@@ -54,9 +69,18 @@ class Pack:
 class PacksEngine:
     """Discovers packs under a content root and returns verified packs on demand."""
 
-    def __init__(self, content_root: str | Path, *, signing_secret: bytes | None = None) -> None:
+    def __init__(
+        self,
+        content_root: str | Path,
+        *,
+        signing_secret: bytes | None = None,
+        signature_verifier: Verifier | None = None,
+    ) -> None:
         self.root = Path(content_root)
         self._secret = signing_secret
+        # Optional, independent detached-signature gate (issue #35). Inert when None: today's
+        # HMAC-only behavior is preserved exactly.
+        self._verifier = signature_verifier
 
     def _iter_pack_files(self) -> list[Path]:
         return sorted(
@@ -83,8 +107,30 @@ class PacksEngine:
             if verify_sig:
                 body_bytes = json.dumps(raw.get("body", {}), sort_keys=True).encode()
                 verify(manifest, body_bytes, self._secret)
+            # Independent detached-signature gate (issue #35): only active when a verifier is
+            # injected, so no-verifier callers keep today's behavior unchanged. Fail closed.
+            if self._verifier is not None:
+                self._verify_detached(manifest, raw, self._verifier)
             packs.append(Pack(manifest=manifest, body=raw.get("body", {})))
         return packs
+
+    @staticmethod
+    def _verify_detached(manifest: PackManifest, raw: dict[str, Any], verifier: Verifier) -> None:
+        """Refuse to load a pack whose detached signature is missing or does not verify.
+
+        The signature covers ``canonical_bytes(raw)`` (the same canonicalizer the registry uses),
+        so a tampered byte or a missing ``pack_signature`` fails closed here before the pack is
+        handed to any module.
+        """
+        signature = manifest.pack_signature
+        if signature is None:
+            raise PackVerificationError(
+                f"Pack {manifest.id}: missing detached signature (fail closed)"
+            )
+        if not verify_pack(raw, signature, verifier):
+            raise PackVerificationError(
+                f"Pack {manifest.id}: detached signature failed verification (fail closed)"
+            )
 
     def load_for_workload(self, workload: str, pack_type: PackType) -> list[Pack]:
         """Return verified packs of a type that target the given workload kind."""

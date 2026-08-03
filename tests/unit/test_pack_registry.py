@@ -59,7 +59,13 @@ def test_canonical_bytes_excludes_signing_fields():
     signed = _pack()
     signed["manifest"]["sha256"] = "a" * 64
     signed["manifest"]["signature"] = "deadbeef"
-    assert set(EXCLUDED_MANIFEST_FIELDS) == {"sha256", "signature"}
+    signed["manifest"]["pack_signature"] = {
+        "algorithm": "ed25519",
+        "signature": "Zm9v",
+        "key_id": "ephemeral",
+        "canonical_digest": "b" * 64,
+    }
+    assert set(EXCLUDED_MANIFEST_FIELDS) == {"sha256", "signature", "pack_signature"}
     assert canonical_digest(base) == canonical_digest(signed)
 
 

@@ -21,4 +21,14 @@ jobs:
       - name: Validate pack schema + signature
         env:
           PYTHONPATH: src
+          # Detached-signature policy (issue #35): a pack that CARRIES a pack_signature MUST be
+          # cryptographically verified against WP_PACK_PUBLIC_KEY, or the build fails closed
+          # (structural self-consistency is never accepted on its own). Unsigned seed packs are
+          # allowed until mandatory signing is turned on. Current CI has no trust root configured,
+          # so the shipped (unsigned) seed packs pass while any present signature fails closed.
+          # TODO(human): once provisioned, provide WP_PACK_PUBLIC_KEY (the KV signing key's public
+          # bytes, base64 raw Ed25519) and set WP_REQUIRE_PACK_SIGNATURES=1 to enforce mandatory +
+          # cryptographic verification for every published pack.
+          # WP_REQUIRE_PACK_SIGNATURES: "1"
+          # WP_PACK_PUBLIC_KEY: ${{ vars.WP_PACK_PUBLIC_KEY }}
         run: python scripts/validate_packs.py content
