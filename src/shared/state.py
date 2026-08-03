@@ -29,6 +29,7 @@ from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from uuid import uuid4
 
 from shared.contracts import (
     DriftReport,
@@ -141,19 +142,22 @@ class StateStore(ReadableState, Protocol):
 # --------------------------------------------------------------------------------------
 # Read-only view — the object handed to modules.
 #
-# NOTE: perfect in-process immutability is impossible in Python, and it is NOT the real boundary.
-# In production the isolation boundary is the *process* boundary: modules deploy as their own ACA
-# apps and reach state only through the API over HTTP — they never hold a store reference. The
-# wrapper below is an ACCIDENTAL-USE guard: it removes the obvious footguns (no ``.put_*`` on the
-# view, and no bound read method whose ``__self__`` exposes a writer).
+# NOTE: Python has no true ``private``, so this is NOT a security sandbox and does NOT claim
+# structural isolation. Determined, out-of-band access can still reach the backend via the mangled
+# attribute (e.g. ``reader._StateReader__backend``) — name-mangling is obfuscation, not isolation.
+# The REAL single-writer guarantee is the *process* boundary: in production modules deploy as their
+# own ACA apps and reach state only through the API over HTTP — they never hold a store reference.
+# The wrapper below is only an ACCIDENTAL-USE guard: it blocks the ordinary/bound-method write path
+# (no ``.put_*`` on the view, and no bound read method whose ``__self__`` exposes a writer).
 # --------------------------------------------------------------------------------------
 class _StateReader:
     """Dedicated read-only view over a backend, exposing ONLY the read methods.
 
-    The writable backend is held name-mangled/private, so a bound read method's ``__self__`` (this
-    object) has no ``put_*``/``add_findings``/``snapshot``/``commit_run`` to reach. This is an
-    accidental-use guard, not a security sandbox — the real isolation boundary is the process
-    boundary (see the module note above).
+    A bound read method's ``__self__`` (this object) has no ``put_*``/``add_findings``/``snapshot``/
+    ``commit_run`` to reach, so the ordinary write path is closed. This is an ACCIDENTAL-USE guard,
+    not a sandbox: the backend is held under a name-mangled attribute, which merely obscures rather
+    than prevents access (``self._StateReader__backend`` still resolves it). The real isolation
+    boundary is the process boundary (see the module note above).
     """
 
     def __init__(self, backend: ReadableState) -> None:
@@ -457,20 +461,28 @@ class LocalStateStore:
 
 
 # --------------------------------------------------------------------------------------
-# Azure backend — same Protocol, azure SDK imports guarded. Not exercised by unit tests, but a
-# complete, typed implementation: Table Storage for the transactional store, Blob Storage for
-# point-in-time snapshots, keyless via Managed Identity. Network stays at the edge (client
-# construction in ``from_env``; each method does exactly one round trip family).
+# Azure backend — same Protocol, azure SDK imports guarded (so ``import shared.state`` never needs
+# azure packages). Not exercised in production by unit tests, but fully implemented, typed, and
+# covered by azure-*mocked* tests. Design: a per-scope **manifest** entity in Table Storage is the
+# SINGLE commit point and the SOLE read path; it points at immutable, version-scoped JSON blobs in
+# Blob Storage (estate/graph/findings). Keyless via Managed Identity; network stays at the edge.
 # --------------------------------------------------------------------------------------
-_AZ_FINDINGS_TABLE = "findings"
 _AZ_SNAPSHOTS_TABLE = "snapshots"
 _AZ_INDEX_TABLE = "workloads"
 _AZ_INDEX_PARTITION = "_index"
-_BATCH_LIMIT = 100
+_MAX_COMMIT_RETRIES = 8
 
 
 class AzureStateStore:
-    """Azure ``StateStore``: Table Storage + Blob snapshots, keyless via Managed Identity."""
+    """Azure ``StateStore``: a manifest entity points at version-scoped blobs; keyless MI.
+
+    Every commit writes each touched component (estate/graph/findings) to a **unique**
+    version-scoped blob, then flips the per-scope manifest with an **ETag-conditional** write. All
+    reads resolve the current blob paths from the manifest FIRST, so a commit that fails before the
+    manifest write is invisible, and concurrent commits never clobber one another's blobs (unique
+    ids) — the ETag loser re-reads and retries. The manifest is the only commit point AND the only
+    read path.
+    """
 
     def __init__(
         self,
@@ -508,7 +520,7 @@ class AzureStateStore:
         container_name = os.environ.get("WORKLOADS_STATE_CONTAINER", "state")
 
         table_service = TableServiceClient(endpoint=table_endpoint, credential=credential)
-        for table in (_AZ_FINDINGS_TABLE, _AZ_SNAPSHOTS_TABLE, _AZ_INDEX_TABLE):
+        for table in (_AZ_SNAPSHOTS_TABLE, _AZ_INDEX_TABLE):
             table_service.create_table_if_not_exists(table)
 
         blob_service = BlobServiceClient(account_url=blob_endpoint, credential=credential)
@@ -521,29 +533,8 @@ class AzureStateStore:
     def _table(self, name: str) -> TableClient:
         return self._tables.get_table_client(name)
 
-    def _manifest_entity(self, workload: str) -> dict[str, Any] | None:
-        """Raw read of the per-workload manifest/pointer entity (may be absent)."""
-        from azure.core.exceptions import ResourceNotFoundError
-
-        try:
-            entity = self._table(_AZ_INDEX_TABLE).get_entity(
-                _AZ_INDEX_PARTITION, encode_storage_key(workload)
-            )
-        except ResourceNotFoundError:
-            return None
-        return dict(entity)
-
-    def _manifest(self, workload: str) -> dict[str, Any] | None:
-        """Read the manifest but only expose it once it is marked ``complete``.
-
-        Readers resolve current estate/graph via this manifest, so a commit that fails before the
-        manifest is (re)written LAST is never visible — the previous complete manifest still points
-        at the previous blob versions.
-        """
-        entity = self._manifest_entity(workload)
-        if entity is None or not entity.get("complete"):
-            return None
-        return entity
+    def _index_table(self) -> TableClient:
+        return self._table(_AZ_INDEX_TABLE)
 
     def _read_blob(self, name: str) -> str | None:
         from azure.core.exceptions import ResourceNotFoundError
@@ -557,21 +548,70 @@ class AzureStateStore:
     def _write_blob(self, name: str, data: str) -> None:
         self._container.upload_blob(name, data.encode("utf-8"), overwrite=True)
 
-    def _upsert_findings(self, workload: str, findings: list[Finding]) -> None:
-        table = self._table(_AZ_FINDINGS_TABLE)
-        partition = encode_storage_key(workload)
-        entities = [
-            {
-                "PartitionKey": partition,
-                "RowKey": encode_storage_key(finding.id),
-                "module": finding.module,
-                "data": finding.model_dump_json(),
-            }
-            for finding in findings
-        ]
-        for start in range(0, len(entities), _BATCH_LIMIT):
-            chunk = entities[start : start + _BATCH_LIMIT]
-            table.submit_transaction([("upsert", entity) for entity in chunk])
+    # -- the manifest: the single commit point AND the sole read path --------------------
+    def _manifest_with_etag(self, workload: str) -> tuple[dict[str, Any] | None, str | None]:
+        """Read the per-scope manifest entity and its ETag (both ``None`` if it does not exist).
+
+        The manifest is written atomically as one entity, so its mere presence means "committed";
+        the ETag lets a concurrent commit detect that it lost the race and retry.
+        """
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            entity = self._index_table().get_entity(
+                _AZ_INDEX_PARTITION, encode_storage_key(workload)
+            )
+        except ResourceNotFoundError:
+            return None, None
+        metadata = getattr(entity, "metadata", None)
+        etag = metadata.get("etag") if metadata else None
+        return dict(entity), etag
+
+    def _manifest(self, workload: str) -> dict[str, Any] | None:
+        manifest, _etag = self._manifest_with_etag(workload)
+        return manifest
+
+    # -- component resolution: read blobs THROUGH one manifest (never a component directly) ---
+    def _estate_of(self, manifest: dict[str, Any] | None) -> list[ResourceNode]:
+        if manifest is None:
+            return []
+        blob = str(manifest.get("estate_blob") or "")
+        raw = self._read_blob(blob) if blob else None
+        if raw is None:
+            return []
+        return [ResourceNode.model_validate(item) for item in json.loads(raw)]
+
+    def _graph_of(self, manifest: dict[str, Any] | None) -> WorkloadGraph | None:
+        if manifest is None:
+            return None
+        blob = str(manifest.get("graph_blob") or "")
+        raw = self._read_blob(blob) if blob else None
+        if raw is None:
+            return None
+        return WorkloadGraph.model_validate_json(raw)
+
+    def _findings_of(
+        self, manifest: dict[str, Any] | None, module: str | None = None
+    ) -> list[Finding]:
+        if manifest is None:
+            return []
+        blob = str(manifest.get("findings_blob") or "")
+        raw = self._read_blob(blob) if blob else None
+        if raw is None:
+            return []
+        findings = [Finding.model_validate(item) for item in json.loads(raw)]
+        if module is not None:
+            findings = [finding for finding in findings if finding.module == module]
+        findings.sort(key=lambda finding: (finding.module, finding.id))
+        return findings
+
+    @staticmethod
+    def _merge_findings(previous: list[Finding], new: list[Finding]) -> list[Finding]:
+        """Additive upsert of findings by id (new wins), preserving prior findings."""
+        by_id = {finding.id: finding for finding in previous}
+        for finding in new:
+            by_id[finding.id] = finding
+        return list(by_id.values())
 
     def _commit(
         self,
@@ -581,95 +621,96 @@ class AzureStateStore:
         graph: WorkloadGraph | None,
         findings: list[Finding],
     ) -> dict[str, int]:
-        """All-or-nothing commit: write payload blobs FIRST, manifest LAST (the commit point).
+        """Atomic commit via the manifest — the SINGLE commit point.
 
-        Estate/graph blobs are versioned, so a new write never overwrites the version the current
-        (complete) manifest points at. Findings are upserted. Only after every blob/finding write
-        succeeds do we replace the ONE manifest entity (``complete=True``) — the atomic commit
-        point readers resolve through, so a mid-write failure is never visible. ``estate``/``graph``
-        of ``None`` leave the existing pointer untouched; an empty estate list clears the estate.
+        Each touched component is written to a **unique** version-scoped blob (so concurrent
+        commits never clobber a shared name), then the per-scope manifest is flipped with an
+        **ETag-conditional** write. On a precondition failure we re-read the manifest, recompute
+        the next version, rewrite the version-scoped blobs, and retry (bounded). Because readers
+        resolve everything through the manifest, a failure before the manifest write is invisible.
+        ``estate``/``graph`` of ``None`` leave the existing pointer untouched; an empty estate list
+        clears the estate; findings are merged additively onto the current committed set.
         """
-        partition = encode_storage_key(workload)
-        manifest = self._manifest_entity(workload)
-        prev_version = int(manifest["version"]) if manifest else 0
-        estate_blob = str(manifest["estate_blob"]) if manifest else ""
-        graph_blob = str(manifest["graph_blob"]) if manifest else ""
+        from azure.core import MatchConditions
+        from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
-        counts = {"estate": 0, "graph": 0, "findings": 0}
-        version = prev_version + 1 if (estate is not None or graph is not None) else prev_version
+        scope = encode_storage_key(workload)
+        last_error: Exception | None = None
+        for _attempt in range(_MAX_COMMIT_RETRIES):
+            manifest, etag = self._manifest_with_etag(workload)
+            version = (int(manifest["version"]) + 1) if manifest else 1
+            estate_blob = str(manifest["estate_blob"]) if manifest else ""
+            graph_blob = str(manifest["graph_blob"]) if manifest else ""
+            findings_blob = str(manifest["findings_blob"]) if manifest else ""
+            commit_id = uuid4().hex  # unique per attempt: concurrent commits can't clobber blobs
 
-        if estate is not None:
-            estate_blob = f"estate/{partition}/{version:06d}.json"
-            self._write_blob(
-                estate_blob, json.dumps([node.model_dump(mode="json") for node in estate])
-            )
-            counts["estate"] = len(estate)
-        if graph is not None:
-            graph_blob = f"graph/{partition}/{version:06d}.json"
-            self._write_blob(graph_blob, graph.model_dump_json())
-            counts["graph"] = 1
-        if findings:
-            self._upsert_findings(workload, findings)
-            counts["findings"] = len(findings)
+            counts = {"estate": 0, "graph": 0, "findings": 0}
+            if estate is not None:
+                estate_blob = f"{scope}/estate/{commit_id}.json"
+                self._write_blob(
+                    estate_blob, json.dumps([node.model_dump(mode="json") for node in estate])
+                )
+                counts["estate"] = len(estate)
+            if graph is not None:
+                graph_blob = f"{scope}/graph/{commit_id}.json"
+                self._write_blob(graph_blob, graph.model_dump_json())
+                counts["graph"] = 1
+            if findings:
+                merged = self._merge_findings(self._findings_of(manifest), findings)
+                findings_blob = f"{scope}/findings/{commit_id}.json"
+                self._write_blob(
+                    findings_blob,
+                    json.dumps([finding.model_dump(mode="json") for finding in merged]),
+                )
+                counts["findings"] = len(findings)
 
-        # Commit point — replace the single manifest entity LAST.
-        self._table(_AZ_INDEX_TABLE).upsert_entity(
-            {
+            entity = {
                 "PartitionKey": _AZ_INDEX_PARTITION,
-                "RowKey": partition,
+                "RowKey": scope,
                 "workload": workload,
                 "estate_blob": estate_blob,
                 "graph_blob": graph_blob,
+                "findings_blob": findings_blob,
                 "version": version,
                 "complete": True,
                 "committed_at": _now_iso(),
             }
-        )
-        return counts
+            try:
+                if manifest is None:
+                    # First commit: create fails if a concurrent commit created it first.
+                    self._index_table().create_entity(entity)
+                else:
+                    # Commit point: conditional on the ETag we read — loser retries.
+                    self._index_table().update_entity(
+                        entity,
+                        mode="replace",
+                        etag=etag,
+                        match_condition=MatchConditions.IfNotModified,
+                    )
+                return counts
+            except (ResourceExistsError, ResourceModifiedError) as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(
+            "AzureStateStore.commit_run: manifest contention exceeded "
+            f"{_MAX_COMMIT_RETRIES} retries"
+        ) from last_error
 
-    # -- reads ---------------------------------------------------------------------------
+    # -- reads (ALL resolve through the manifest) ----------------------------------------
     def list_workloads(self) -> list[str]:
-        entities = self._table(_AZ_INDEX_TABLE).query_entities(
+        entities = self._index_table().query_entities(
             "PartitionKey eq @pk", parameters={"pk": _AZ_INDEX_PARTITION}
         )
-        return sorted({str(entity["workload"]) for entity in entities if entity.get("complete")})
+        return sorted({str(entity["workload"]) for entity in entities})
 
     def get_estate(self, workload: str) -> list[ResourceNode]:
-        manifest = self._manifest(workload)
-        if manifest is None:
-            return []
-        blob = str(manifest.get("estate_blob") or "")
-        if not blob:
-            return []
-        raw = self._read_blob(blob)
-        if raw is None:
-            return []
-        return [ResourceNode.model_validate(item) for item in json.loads(raw)]
+        return self._estate_of(self._manifest(workload))
 
     def get_graph(self, workload: str) -> WorkloadGraph | None:
-        manifest = self._manifest(workload)
-        if manifest is None:
-            return None
-        blob = str(manifest.get("graph_blob") or "")
-        if not blob:
-            return None
-        raw = self._read_blob(blob)
-        if raw is None:
-            return None
-        return WorkloadGraph.model_validate_json(raw)
+        return self._graph_of(self._manifest(workload))
 
     def get_findings(self, workload: str, module: str | None = None) -> list[Finding]:
-        # Parameterized OData: untrusted values are bound, never interpolated, and the partition
-        # key is the injection-proof encoded workload.
-        query = "PartitionKey eq @pk"
-        parameters: dict[str, object] = {"pk": encode_storage_key(workload)}
-        if module is not None:
-            query += " and module eq @module"
-            parameters["module"] = module
-        entities = self._table(_AZ_FINDINGS_TABLE).query_entities(query, parameters=parameters)
-        findings = [Finding.model_validate_json(str(entity["data"])) for entity in entities]
-        findings.sort(key=lambda finding: (finding.module, finding.id))
-        return findings
+        return self._findings_of(self._manifest(workload), module)
 
     def get_previous_findings(self, workload: str) -> list[Finding]:
         snap = self._latest_snapshot(workload)
@@ -713,31 +754,35 @@ class AzureStateStore:
         self._commit(workload, estate=None, graph=None, findings=findings)
 
     def commit_run(self, workload: str, result: ModuleRunResult) -> dict[str, int]:
-        """Persist a whole run atomically (blobs first, manifest last). See :meth:`_commit`."""
+        """Persist a whole run atomically through the manifest. See :meth:`_commit`."""
         return self._commit(
             workload, estate=result.estate, graph=result.graph, findings=result.findings
         )
 
     def snapshot(self, workload: str) -> str:
-        """Freeze current findings + estate node ids into a point-in-time snapshot; return its id.
+        """Freeze ONE coherent committed version into a point-in-time snapshot; return its id.
 
-        Two-phase so the pointer is only EXPOSED after the blob exists AND ids stay collision-free:
-        (1) claim the sequence RowKey with a conditional ``create_entity`` marked ``complete=False``
-        (retry with a bumped sequence on conflict, so two concurrent snapshots can't collide);
-        (2) upload the snapshot blob, THEN mark the pointer ``complete=True``. Readers list only
-        ``complete`` snapshots, so a failure before the blob finishes leaves no dangling pointer.
+        Estate and findings are read from a SINGLE manifest resolution (one version), so a commit
+        that interleaves cannot yield a mixed snapshot. Two-phase pointer so it is exposed only
+        after its blob exists AND ids stay collision-free: (1) claim the sequence RowKey with a
+        conditional ``create_entity`` marked ``complete=False`` (retry with a bumped sequence on
+        conflict); (2) upload the snapshot blob, THEN mark the pointer ``complete=True``. Readers
+        list only ``complete`` snapshots, so a failure before the blob finishes leaves no dangling
+        pointer.
         """
         from azure.core.exceptions import ResourceExistsError
-        from azure.data.tables import UpdateMode
 
         table = self._table(_AZ_SNAPSHOTS_TABLE)
         partition = encode_storage_key(workload)
-        findings = self.get_findings(workload)
-        node_ids = [node.id for node in self.get_estate(workload)]
+        manifest = self._manifest(workload)  # resolve ONE version, then read both from it
+        version = int(manifest["version"]) if manifest else 0
+        node_ids = [node.id for node in self._estate_of(manifest)]
+        findings = self._findings_of(manifest)
         payload = json.dumps(
             {
                 "findings": [finding.model_dump(mode="json") for finding in findings],
                 "nodes": node_ids,
+                "version": version,
             }
         )
         existing = list(
@@ -756,6 +801,7 @@ class AzureStateStore:
                         "RowKey": row_key,
                         "snapshot_id": snapshot_id,
                         "blob": blob_name,
+                        "version": version,
                         "complete": False,
                         "created_at": _now_iso(),
                     }
@@ -767,7 +813,7 @@ class AzureStateStore:
             self._write_blob(blob_name, payload)
             table.update_entity(
                 {"PartitionKey": partition, "RowKey": row_key, "complete": True},
-                mode=UpdateMode.MERGE,
+                mode="merge",
             )
             return snapshot_id
 

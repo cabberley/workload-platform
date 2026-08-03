@@ -7,6 +7,7 @@ same isolated backend. Each test below is written so it would fail without the c
 from __future__ import annotations
 
 import importlib.util
+import json
 import threading
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from shared.contracts import (
 )
 from shared.module_base import Module, ModuleContext, run_module
 from shared.state import (
+    AzureStateStore,
     LocalStateStore,
     ReadableState,
     ReadOnlyState,
@@ -80,6 +82,20 @@ def _azure_tables_installed() -> bool:
     """
     try:
         return importlib.util.find_spec("azure.data.tables") is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def _azure_core_installed() -> bool:
+    """True if ``azure.core`` (exceptions + ``MatchConditions``) is importable.
+
+    The azure-mocked tests below need only ``azure.core`` (installed as a transitive dep), NOT
+    ``azure.data.tables``/``azure.storage.blob`` — those SDKs are fully faked. ``AzureStateStore``
+    imports ``azure.core`` lazily inside its methods, so the fakes exercise the real conditional
+    write / manifest logic without any live Azure or the heavy table/blob SDKs.
+    """
+    try:
+        return importlib.util.find_spec("azure.core") is not None
     except ModuleNotFoundError:
         return False
 
@@ -307,6 +323,12 @@ def test_read_only_bound_methods_self_has_no_writer(store: LocalStateStore) -> N
     # Round-2 re-flag: a captured bound read method must NOT expose a writable backend via its
     # ``__self__`` (the old code bound directly to the store, so ``_get_estate.__self__`` WAS the
     # writable store). Now every bound method's ``__self__`` is the private read-only reader.
+    #
+    # HONESTY (Round-3): this only guards the ORDINARY/bound-method path. Python has no true
+    # ``private``: determined name-mangled access (``reader._StateReader__backend``) still reaches
+    # the writable store. That is obfuscation, not isolation, so we deliberately do NOT assert such
+    # access is impossible. The real single-writer guarantee is the PROCESS boundary (worker
+    # computes, only the API writes); here we only assert the accidental-use guard holds.
     view = ReadOnlyState(store)
     bound_selves = [
         getattr(attr, "__self__", None) for attr in vars(view).values()
@@ -320,6 +342,10 @@ def test_read_only_bound_methods_self_has_no_writer(store: LocalStateStore) -> N
             assert not hasattr(owner, writer)
     # And the obvious traversal a careless module might try is dead:
     assert not hasattr(view.get_estate.__self__, "put_estate")
+    # Document (not assert-as-impossible) the known name-mangled backdoor: it exists, by design of
+    # Python's attribute model; the guard's job is only to stop accidental/ordinary writes.
+    reader_self = view._get_estate.__self__
+    assert getattr(reader_self, "_StateReader__backend", None) is store
 
 
 def test_read_only_view_reads_through_to_backend(store: LocalStateStore) -> None:
@@ -616,3 +642,259 @@ def test_api_drift_reports_estate_node_changes(client: TestClient) -> None:
     drift = client.get("/api/workloads/epic/drift").json()
     assert drift["addedNodes"] == ["lb-web"]
     assert drift["removedNodes"] == ["vm-odb-1"]
+
+
+# --------------------------------------------------------------------------------------
+# Round-3 Azure hardening — exercised against *faked* Table + Blob clients (no live Azure, no
+# azure-data-tables / azure-storage-blob; only ``azure.core`` for the real exception types +
+# ``MatchConditions`` that ``AzureStateStore`` uses). The fakes model exactly the two guarantees
+# the fixes rely on: (a) ``create_entity`` fails if the row exists; (b) ``update_entity`` with an
+# ``etag`` fails (ResourceModifiedError) if that etag is stale — i.e. optimistic concurrency.
+# --------------------------------------------------------------------------------------
+azure_only = pytest.mark.skipif(
+    not _azure_core_installed(),
+    reason="azure.core (exceptions + MatchConditions) is not installed",
+)
+
+
+class _FakeEntity(dict):
+    """A dict that also carries ``.metadata['etag']`` like ``azure.data.tables.TableEntity``."""
+
+    def __init__(self, data: dict[str, object], *, etag: str) -> None:
+        super().__init__(data)
+        self.metadata = {"etag": etag}
+
+
+class _FakeTable:
+    """In-memory stand-in for ``TableClient`` with real ETag optimistic-concurrency semantics."""
+
+    def __init__(self) -> None:
+        self.rows: dict[tuple[str, str], dict[str, object]] = {}
+        self.etags: dict[tuple[str, str], str] = {}
+        self._seq = 0
+        self.lock = threading.Lock()
+
+    def _new_etag(self) -> str:
+        self._seq += 1
+        return f"W/etag-{self._seq}"
+
+    def get_entity(self, partition_key: str, row_key: str) -> _FakeEntity:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        with self.lock:
+            key = (partition_key, row_key)
+            if key not in self.rows:
+                raise ResourceNotFoundError(f"no entity {key}")
+            return _FakeEntity(self.rows[key], etag=self.etags[key])
+
+    def create_entity(self, entity: dict[str, object]) -> None:
+        from azure.core.exceptions import ResourceExistsError
+
+        with self.lock:
+            key = (str(entity["PartitionKey"]), str(entity["RowKey"]))
+            if key in self.rows:
+                raise ResourceExistsError(f"entity exists {key}")
+            self.rows[key] = dict(entity)
+            self.etags[key] = self._new_etag()
+
+    def update_entity(
+        self,
+        entity: dict[str, object],
+        *,
+        mode: str = "merge",
+        etag: str | None = None,
+        match_condition: object = None,
+    ) -> None:
+        from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+
+        with self.lock:
+            key = (str(entity["PartitionKey"]), str(entity["RowKey"]))
+            if key not in self.rows:
+                raise ResourceNotFoundError(f"no entity {key}")
+            if etag is not None and etag != self.etags[key]:
+                raise ResourceModifiedError(f"etag mismatch {key}")
+            if mode == "replace":
+                self.rows[key] = dict(entity)
+            else:
+                self.rows[key].update(dict(entity))
+            self.etags[key] = self._new_etag()
+
+    def query_entities(
+        self, query: str, *, parameters: dict[str, object] | None = None
+    ) -> list[dict[str, object]]:
+        # The store only ever filters on ``PartitionKey eq @pk``; return matching row copies.
+        pk = str((parameters or {})["pk"])
+        with self.lock:
+            return [dict(v) for (p, _r), v in self.rows.items() if p == pk]
+
+
+class _FakeTableService:
+    def __init__(self) -> None:
+        self._tables: dict[str, _FakeTable] = {}
+
+    def get_table_client(self, name: str) -> _FakeTable:
+        return self._tables.setdefault(name, _FakeTable())
+
+
+class _FakeDownloader:
+    def __init__(self, data: bytes, encoding: str | None) -> None:
+        self._data = data
+        self._encoding = encoding
+
+    def readall(self) -> str | bytes:
+        return self._data.decode(self._encoding) if self._encoding else self._data
+
+
+class _FakeContainer:
+    def __init__(self) -> None:
+        self.blobs: dict[str, bytes] = {}
+        self.lock = threading.Lock()
+
+    def download_blob(self, name: str, *, encoding: str | None = None) -> _FakeDownloader:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        with self.lock:
+            if name not in self.blobs:
+                raise ResourceNotFoundError(f"no blob {name}")
+            return _FakeDownloader(self.blobs[name], encoding)
+
+    def upload_blob(self, name: str, data: bytes, *, overwrite: bool = False) -> None:
+        from azure.core.exceptions import ResourceExistsError
+
+        with self.lock:
+            if name in self.blobs and not overwrite:
+                raise ResourceExistsError(f"blob exists {name}")
+            self.blobs[name] = bytes(data)
+
+
+def _azure_store() -> tuple[AzureStateStore, _FakeTableService, _FakeContainer]:
+    service = _FakeTableService()
+    container = _FakeContainer()
+    store = AzureStateStore(table_service=service, container=container)  # type: ignore[arg-type]
+    return store, service, container
+
+
+def _run_result(
+    *,
+    estate: list[ResourceNode] | None = None,
+    graph: WorkloadGraph | None = None,
+    findings: list[Finding] | None = None,
+) -> ModuleRunResult:
+    return ModuleRunResult(
+        module="synthetic", ok=True, estate=estate, graph=graph, findings=findings or [],
+    )
+
+
+@azure_only
+def test_azure_commit_run_round_trips_through_manifest() -> None:
+    store, service, _container = _azure_store()
+    store.commit_run(
+        "epic",
+        _run_result(estate=_nodes(), graph=_graph(),
+                    findings=[_finding("q1", "quality_checks", passed=False)]),
+    )
+    assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1", "lb-web"]
+    assert store.get_graph("epic") is not None
+    assert [f.id for f in store.get_findings("epic")] == ["q1"]
+    assert store.list_workloads() == ["epic"]
+    # The manifest is the single commit point: exactly one index entity backs all four reads.
+    index = service.get_table_client("workloads")
+    assert len(index.rows) == 1
+
+
+@azure_only
+def test_azure_mid_commit_failure_is_invisible(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Fix 1: readers resolve through the manifest, so a commit that dies before the manifest write
+    # leaves the prior committed version fully visible (no partial findings/estate leak).
+    store, _service, _container = _azure_store()
+    store.commit_run(
+        "epic",
+        _run_result(estate=_nodes(), findings=[_finding("q1", "quality_checks", passed=True)]),
+    )
+    good_nodes = [n.id for n in store.get_estate("epic")]
+    good_findings = [f.id for f in store.get_findings("epic")]
+
+    original = store._write_blob
+
+    def boom(name: str, data: str) -> None:
+        if "/findings/" in name:
+            raise RuntimeError("blob upload failed mid-commit")
+        original(name, data)
+
+    monkeypatch.setattr(store, "_write_blob", boom)
+    with pytest.raises(RuntimeError, match="mid-commit"):
+        store.commit_run(
+            "epic",
+            _run_result(estate=[], findings=[_finding("q2", "quality_checks", passed=False)]),
+        )
+    # The failed commit never touched the manifest → prior version is intact.
+    assert [n.id for n in store.get_estate("epic")] == good_nodes
+    assert [f.id for f in store.get_findings("epic")] == good_findings
+
+
+@azure_only
+def test_azure_reads_ignore_blobs_not_referenced_by_manifest() -> None:
+    # Fix 1: reads NEVER scan component blobs directly; a stray blob no manifest points at is
+    # invisible (an attacker planting a findings blob cannot inject findings).
+    store, _service, container = _azure_store()
+    store.commit_run("epic", _run_result(findings=[_finding("q1", "quality_checks", passed=True)]))
+    scope = encode_storage_key("epic")
+    stray = json.dumps([_finding("HACK", "quality_checks", passed=False).model_dump(mode="json")])
+    container.upload_blob(f"{scope}/findings/deadbeef.json", stray.encode("utf-8"), overwrite=True)
+    assert [f.id for f in store.get_findings("epic")] == ["q1"]
+
+
+@azure_only
+def test_azure_concurrent_commits_preserve_all_findings_via_etag_retry() -> None:
+    # Fix 1: concurrent commits use unique (uuid) blob names + an ETag-conditional manifest write,
+    # so the loser retries and MERGES rather than clobbering — every finding survives.
+    store, _service, _container = _azure_store()
+    store.commit_run(
+        "epic", _run_result(findings=[_finding("base", "quality_checks", passed=True)])
+    )
+
+    def add(i: int) -> None:
+        store.add_findings("epic", [_finding(f"f{i}", "quality_checks", passed=False)])
+
+    threads = [threading.Thread(target=add, args=(i,)) for i in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    ids = sorted(f.id for f in store.get_findings("epic"))
+    assert ids == sorted(["base", "f0", "f1", "f2", "f3", "f4"])
+
+
+@azure_only
+def test_azure_snapshot_captures_one_coherent_version() -> None:
+    # Fix 2: the snapshot resolves ONE manifest version and reads estate + findings from it, so a
+    # later commit cannot produce a mixed snapshot.
+    store, _service, _container = _azure_store()
+    store.commit_run(
+        "epic",
+        _run_result(estate=_nodes(), findings=[_finding("q1", "quality_checks", passed=True)]),
+    )
+    snapshot_id = store.snapshot("epic")
+    # Advance to a new version: different estate + an added finding.
+    store.commit_run(
+        "epic",
+        _run_result(
+            estate=[_nodes()[0]], findings=[_finding("q2", "quality_checks", passed=False)]
+        ),
+    )
+    assert store.get_previous_node_ids("epic") == ["vm-odb-1", "lb-web"]
+    assert [f.id for f in store.get_previous_findings("epic")] == ["q1"]
+    assert snapshot_id.startswith("snap::epic::")
+    # Current state reflects the newer version (estate swapped, findings merged).
+    assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1"]
+    assert sorted(f.id for f in store.get_findings("epic")) == ["q1", "q2"]
+
+
+@azure_only
+def test_azure_empty_estate_clears_via_manifest() -> None:
+    # Fix 2 (is-not-None semantics) carried through the manifest: an explicit empty estate clears.
+    store, _service, _container = _azure_store()
+    store.commit_run("epic", _run_result(estate=_nodes()))
+    assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1", "lb-web"]
+    store.commit_run("epic", _run_result(estate=[]))
+    assert store.get_estate("epic") == []
