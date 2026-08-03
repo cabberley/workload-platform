@@ -84,9 +84,15 @@ _AUTH_SCHEME = "Bearer"
 
 
 class SignalSource(StrEnum):
-    """Provenance tag for signals emitted by this connector."""
+    """Provenance tag for signals emitted by an AIOps telemetry connector.
+
+    Additive, back-compatible contract: each connector stamps its own member so a fused signal
+    self-describes its origin. ``system_pulse`` is the Epic System Pulse feed; ``azure_monitor`` is
+    the read-only Azure Monitor metrics/logs connector.
+    """
 
     system_pulse = "system-pulse"
+    azure_monitor = "azure-monitor"
 
 
 class Signal(BaseModel):
@@ -196,6 +202,10 @@ def map_signal(raw: dict[str, Any]) -> Signal:
         value_f = float(value)
     except ValueError as exc:
         raise SignalMappingError(f"non-numeric metric value: {value!r}") from exc
+    # Reject non-finite values (NaN / +-inf): NaN would silently bypass thresholds and inf could
+    # fabricate a breach or break strict JSON. Drop the point like any other malformed observation.
+    if not math.isfinite(value_f):
+        raise SignalMappingError(f"non-finite metric value: {value!r}")
 
     return Signal(
         metric=str(metric),

@@ -20,32 +20,38 @@ sources uniformly:
 * the flatten/normalize step (Azure Monitor's nested metrics→timeseries→data payload → flat
   ``Signal[]``) is a **pure** function unit-tested with synthetic payloads.
 
-The real SDK metrics query is **not** wired: the installed ``azure-monitor-query`` (2.0.0) ships
-Logs clients only — the metrics client moved to the separate ``azure-monitor-querymetrics`` package
-which is not an install requirement. The real backend therefore fails closed with a descriptive
-``AzureMonitorSdkNotWired`` error (never a misleading ``AttributeError``); it is marked
-``TODO(human)`` but the client is structurally complete, guarded, fail-closed, and unit-testable via
-an injected fake backend.
+This connector exposes **two** read-only edges, both keyless, lazy, guarded and fail-closed:
 
-.. note::
-   Emitted signals carry ``source = SignalSource.system_pulse`` because the shared ``SignalSource``
-   enum (owned by ``system_pulse``) has no ``azure_monitor`` member and must not be forked here.
-   Source provenance is tracked by the module via the injected client key (``"azure_monitor"``).
-   TODO(human): add an ``azure_monitor`` ``SignalSource`` member via the Architect (a shared
-   contract change) so signals self-describe their origin.
+* **Metrics** — a real ``MetricsClient`` query from the ``azure-monitor-querymetrics`` package
+  (the metrics client moved *out* of ``azure-monitor-query`` 2.0.0 into that split package). The
+  SDK is imported **lazily inside the backend edge**; if the optional package is not importable at
+  runtime the edge fails closed with the descriptive ``AzureMonitorSdkNotWired`` class name (never a
+  misleading ``AttributeError``).
+* **Logs** — a real ``LogsQueryClient`` query from ``azure-monitor-query`` (already installed),
+  running **only bounded, aggregated KQL** (counts / averages / percentiles per resource+metric).
+  The KQL is produced by the **pure** :func:`build_logs_kql` transform and never selects a log
+  body / message / free-text column, so **no raw log row ever crosses the boundary** — the logs
+  edge emits only aggregated numeric :class:`Signal`\\ s.
+
+Both flatten steps (Azure Monitor's nested metrics→timeseries→data payload, and the aggregated
+logs table) are **pure** functions unit-tested with synthetic payloads. Every emitted signal is
+stamped ``source = SignalSource.azure_monitor`` so fused signals self-describe their origin.
 """
 from __future__ import annotations
 
 import random
 import time
 from collections.abc import Callable, Sequence
+from datetime import timedelta
 from typing import Any, Protocol, cast, runtime_checkable
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from modules.aiops.connectors.system_pulse import (
     Signal,
     SignalMappingError,
+    SignalSource,
     map_signal,
 )
 from shared.connectors import (
@@ -78,10 +84,38 @@ class AzureMonitorConfig(BaseModel):
     )
     timeout_s: float = Field(default=30.0, gt=0.0)
     credential_scope: str = Field(default="https://management.azure.com/.default")
+    # --- Metrics edge (azure-monitor-querymetrics MetricsClient) ---------------------------
+    # A *regional* metrics data-plane endpoint is required by MetricsClient (queried resources must
+    # live in the same region + subscription). Absent ⇒ the metrics edge fails closed; no secret.
+    metrics_endpoint: str | None = Field(
+        default=None, description="Regional metrics endpoint, e.g. https://westus3.metrics.monitor.azure.com"
+    )
+    metric_namespace: str | None = Field(
+        default=None, description="Metric namespace containing the requested metric names"
+    )
+    metric_granularity_minutes: int = Field(
+        default=5, ge=1, description="Metrics granularity (bin size) in minutes"
+    )
+    metric_lookback_minutes: int = Field(
+        default=15, ge=1, description="Metrics timespan window (lookback) in minutes"
+    )
+    # --- Logs edge (azure-monitor-query LogsQueryClient) -----------------------------------
+    # A Log Analytics *workspace id* (the GUID from the workspace Properties blade — not a secret).
+    # Absent ⇒ the logs edge is disabled and fails closed. The KQL table + every projected column
+    # are FIXED, audited constants (see ``build_logs_kql``) — deliberately NOT config-driven — so no
+    # caller can alias a raw log-body column into an emitted field. Only the query window/bin are
+    # tunable here.
+    workspace_id: str | None = Field(
+        default=None, description="Log Analytics workspace id (GUID) for the logs edge"
+    )
+    log_bin_minutes: int = Field(default=5, ge=1, description="KQL summarize bin size in minutes")
+    log_lookback_hours: float = Field(
+        default=1.0, gt=0.0, description="Logs query timespan window (lookback) in hours"
+    )
     # Bounded retry-with-jitter for transient backend/transport errors (issue #45). Defaults are
     # conservative and never change fail-closed behaviour: after ``retries`` attempts the edge
-    # still fails closed. Only transient errors are retried (see ``_is_transient_backend``); the
-    # not-wired stub, credential errors and malformed payloads fail closed at once.
+    # still fails closed. Only transient errors are retried (see ``_is_transient_backend``); a
+    # guarded-import failure, credential errors and malformed payloads fail closed at once.
     retries: int = Field(default=3, ge=1, description="Max query attempts (>=1)")
     base_delay_s: float = Field(default=0.2, gt=0.0, description="Base backoff delay in seconds")
     max_delay_s: float = Field(default=2.0, gt=0.0, description="Backoff cap in seconds")
@@ -90,6 +124,16 @@ class AzureMonitorConfig(BaseModel):
 # --------------------------------------------------------------------------------------
 # Pure mapping — no I/O, fully unit-testable with synthetic Azure Monitor payloads.
 # --------------------------------------------------------------------------------------
+def _stamp_azure_monitor(signal: Signal) -> Signal:
+    """Re-stamp a mapped signal with Azure Monitor provenance.
+
+    ``map_signal`` (owned by System Pulse) defaults ``source = SignalSource.system_pulse``; every
+    signal this connector emits is re-stamped ``SignalSource.azure_monitor`` so a fused signal
+    self-describes its origin. ``model_copy`` keeps the validated, PII-safe field set intact.
+    """
+    return signal.model_copy(update={"source": SignalSource.azure_monitor})
+
+
 def _pick_aggregation(point: Any) -> Any:
     """Return the first present, non-bool aggregation value on a data point, else ``None``."""
     if not isinstance(point, dict):
@@ -111,8 +155,9 @@ def map_metrics_response(payload: Any) -> list[Signal]:
                       "timeseries": [{"data": [{"timeStamp": "...", "average": 512.0}]}]}]}
 
     Every data point is mapped through System Pulse's ``map_signal`` (which validates the value,
-    normalizes the timestamp to UTC, and drops all non-allowlisted fields), so a malformed point is
-    dropped — never fabricated over — and this function never raises on bad structure.
+    normalizes the timestamp to UTC, and drops all non-allowlisted fields) and then re-stamped with
+    ``SignalSource.azure_monitor``, so a malformed point is dropped — never fabricated over — and
+    this function never raises on bad structure.
     """
     if not isinstance(payload, dict):
         return []
@@ -147,23 +192,156 @@ def map_metrics_response(payload: Any) -> list[Signal]:
                     "resourceId": resource_id,
                 }
                 try:
-                    signals.append(map_signal(raw))
+                    signals.append(_stamp_azure_monitor(map_signal(raw)))
                 except SignalMappingError:
                     continue
     return signals
 
 
+# The ONLY columns the logs edge lifts out of an aggregated KQL row. Anything else a table might
+# carry (a message / body / free-text column) is ignored by construction — this allowlist, plus the
+# body-free ``build_logs_kql`` transform, is what makes the logs path provably raw-log-free.
+_LOG_RECORD_FIELDS: tuple[str, ...] = ("metric", "value", "unit", "timestamp", "resourceId")
+
+
+def map_logs_response(payload: Any) -> list[Signal]:
+    """Flatten one **aggregated** Azure Monitor logs payload into ``Signal[]`` — pure & PII-safe.
+
+    Expects the normalized shape the logs edge produces from the aggregated KQL result::
+
+        {"logRecords": [
+            {"metric": "odb_latency_ms", "value": 512.0, "unit": "aggregated",
+             "timestamp": "2026-01-01T00:00:00Z", "resourceId": "/subscriptions/.../odb-01"}]}
+
+    Only :data:`_LOG_RECORD_FIELDS` are read from each record — any extra column is dropped by
+    construction — then each record is mapped via ``map_signal`` and re-stamped
+    ``SignalSource.azure_monitor``. Because the aggregation (:func:`build_logs_kql`) never projects
+    a body/message column *and* this mapper only reads numeric-aggregate + identifier fields, **no
+    raw log row can ever be emitted**. Malformed records are dropped, never fabricated over.
+    """
+    if not isinstance(payload, dict):
+        return []
+    records = payload.get("logRecords")
+    if not isinstance(records, list):
+        return []
+    signals: list[Signal] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        raw = {
+            "metric": record.get("metric"),
+            "value": record.get("value"),
+            "unit": record.get("unit", "aggregated"),
+            "timestamp": record.get("timestamp"),
+            "resourceId": record.get("resourceId"),
+        }
+        try:
+            signals.append(_stamp_azure_monitor(map_signal(raw)))
+        except SignalMappingError:
+            continue
+    return signals
+
+
+def _kql_verbatim_literal(value: object) -> str:
+    """Render one value as a KQL **verbatim** string literal (``@'...'``) — fail-closed on garbage.
+
+    KQL verbatim literals treat backslash as a **literal** character (unlike ordinary ``'...'``
+    literals, where ``\\`` is an escape). Doubling the single quote (``'`` → ``''``) is then the
+    *only* escape, so a value can never terminate the literal early to break out and inject KQL —
+    closing the ``\\'`` break-out an ordinary literal would allow. Non-``str`` values and values
+    carrying a C0 control char / ``DEL`` (which could still split a single-line literal) are
+    rejected — never silently stripped — so bad config fails closed and is surfaced.
+    """
+    if not isinstance(value, str):
+        raise SignalMappingError(f"kql filter value must be a string: {value!r}")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise SignalMappingError("kql filter value contains a control character")
+    return "@'" + value.replace("'", "''") + "'"
+
+
+def _kql_str_list(values: Sequence[str]) -> str:
+    """Render a KQL string list ``(@'a', @'b')`` of **verbatim** literals — bounds the ``in`` set.
+
+    ``values`` are only ever interpolated as **verbatim quoted string literals** (filter *values*,
+    never identifiers) via :func:`_kql_verbatim_literal`: backslash is literal and the single quote
+    is doubled, so a configured resource id / metric name cannot break out of the literal to inject
+    KQL or select a different column. Malformed values fail closed rather than corrupt the query.
+    """
+    return "(" + ", ".join(_kql_verbatim_literal(v) for v in values) + ")"
+
+
+# --------------------------------------------------------------------------------------
+# Fixed, audited KQL shape. The table and EVERY projected column are hard-coded constants — NEVER
+# taken from config — so no caller can alias a raw log-body/message column into an emitted field or
+# inject an arbitrary KQL identifier. The only config-driven inputs are filter *values*
+# (resource ids / metric names, quote-escaped) and numeric window/bin sizes.
+_LOG_TABLE = "AzureMetrics"  # a numeric platform-metrics table — never a raw-log/body table
+_LOG_VALUE_COLUMN = "Average"  # numeric aggregate source column
+_LOG_METRIC_COLUMN = "MetricName"  # identifier column (a metric name, not free text)
+_LOG_RESOURCE_COLUMN = "_ResourceId"  # identifier column (an Azure resource id)
+_LOG_TIME_COLUMN = "TimeGenerated"  # timestamp column
+
+
+def build_logs_kql(
+    *,
+    resource_ids: Sequence[str],
+    metric_names: Sequence[str],
+    lookback_hours: float,
+    bin_minutes: int,
+) -> str:
+    """Build a **bounded, aggregated** KQL query — a small, pure, reviewable transform.
+
+    The table and every projected column are **fixed, audited constants** (never config-driven), so
+    a reviewer can confirm **no raw log body / message / row ever leaves the boundary**:
+
+    * it filters to the configured ``resource_ids`` (and ``metric_names`` when supplied) — passed
+      only as **verbatim** quote-escaped string *values* — and a bounded ``lookback_hours`` window;
+    * it ``summarize``\\ s **only numeric aggregates** — ``avg`` / ``percentile(95)`` / ``count`` —
+      grouped by resource id, metric name and a ``bin(TimeGenerated, <n>m)`` bucket;
+    * its final ``project`` is a hard-coded allowlist of identifier + numeric-aggregate columns
+      (``resourceId``, ``metric``, ``value``, ``count``, ``timestamp``). It can never select a
+      free-text / body / message column, so the result carries no raw log content.
+
+    The output columns are aliased to match :data:`_LOG_RECORD_FIELDS`, so
+    :func:`_normalize_logs_response` + :func:`map_logs_response` can map rows straight into signals.
+    """
+    lines = [
+        _LOG_TABLE,
+        f"| where {_LOG_TIME_COLUMN} > ago({lookback_hours}h)",
+    ]
+    if resource_ids:
+        lines.append(f"| where {_LOG_RESOURCE_COLUMN} in~ {_kql_str_list(resource_ids)}")
+    if metric_names:
+        lines.append(f"| where {_LOG_METRIC_COLUMN} in~ {_kql_str_list(metric_names)}")
+    lines.extend(
+        [
+            (
+                f"| summarize value = avg({_LOG_VALUE_COLUMN}), "
+                f"p95 = percentile({_LOG_VALUE_COLUMN}, 95), count = count() "
+                f"by resourceId = {_LOG_RESOURCE_COLUMN}, metric = {_LOG_METRIC_COLUMN}, "
+                f"timestamp = bin({_LOG_TIME_COLUMN}, {bin_minutes}m)"
+            ),
+            "| project resourceId, metric, value, count, timestamp",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def to_signals(result: FetchResult) -> list[Signal]:
     """Flatten a fetch result into signals — pure. Unavailable ⇒ ``[]`` (fail closed).
 
-    ``result.raw`` is a list of per-resource Azure Monitor payloads; each is flattened and the
-    results are concatenated. Records that fail mapping are dropped, never guessed at.
+    ``result.raw`` is a list of Azure Monitor payloads — metrics payloads (``{"metrics": [...]}``)
+    and/or aggregated logs payloads (``{"logRecords": [...]}``). Each is dispatched to the matching
+    pure mapper and the results concatenated. Records that fail mapping are dropped, not guessed at.
     """
     if not result.available:
         return []
     signals: list[Signal] = []
     for payload in result.raw:
-        signals.extend(map_metrics_response(payload))
+        if isinstance(payload, dict) and "logRecords" in payload:
+            signals.extend(map_logs_response(payload))
+        else:
+            signals.extend(map_metrics_response(payload))
     return signals
 
 
@@ -184,8 +362,9 @@ def _coerce_backend_raw(payload: Any) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------------------
 @runtime_checkable
 class MetricsBackend(Protocol):
-    """Narrow query seam. The real implementation wraps ``azure-monitor-query``; tests inject a
-    fake that returns synthetic normalized payloads (or raises to exercise fail-closed)."""
+    """Narrow query seam. The real implementation wraps ``azure-monitor-querymetrics``'s
+    ``MetricsClient``; tests inject a fake that returns synthetic normalized payloads (or raises to
+    exercise fail-closed)."""
 
     def query_metrics(
         self,
@@ -231,47 +410,103 @@ def _normalize_sdk_response(resource_id: str, response: Any) -> dict[str, Any]:
 
 
 class AzureMonitorSdkNotWired(RuntimeError):
-    """Raised by the real backend until a metrics query is wired to the installed SDK.
+    """Raised when the optional metrics SDK package cannot be imported at query time.
 
-    Surfaces (via :meth:`AzureMonitorClient.fetch_raw`) as ``error='AzureMonitorSdkNotWired'`` —
-    a descriptive, fail-closed signal — instead of a misleading ``AttributeError`` against a client
-    class that does not exist in the installed ``azure-monitor-query`` release.
+    The metrics edge lazily imports :class:`MetricsClient` from ``azure-monitor-querymetrics`` (the
+    split package that owns the metrics client since ``azure-monitor-query`` 2.0.0 shipped Logs
+    clients only). When that optional package is **not importable** at runtime, the guarded import
+    raises this descriptive error, which surfaces (via :meth:`AzureMonitorClient.fetch_raw`) as
+    ``error='AzureMonitorSdkNotWired'`` — a clear, fail-closed signal — instead of a misleading
+    ``ImportError``/``AttributeError``. Everything else (endpoint/namespace config, the query
+    itself) still fails closed with its own error class name.
     """
 
 
-def query_metrics_via_sdk(
-    *,
-    resource_ids: Sequence[str],
-    metric_names: Sequence[str],
-    credential: Any,
-    timeout_s: float,
-    normalize: Any = None,
-) -> list[dict[str, Any]]:
-    """Wire this to the current Azure Monitor metrics SDK (a ``TODO(human)`` stub for now).
+class UntrustedMetricsEndpoint(ValueError):
+    """Raised when a configured ``metrics_endpoint`` is not a trusted Azure Monitor host.
 
-    The installed ``azure-monitor-query`` (2.0.0) ships **Logs** clients only
-    (``LogsQueryClient`` / ``MonitorQueryLogsClient``); the metrics client + query API were moved
-    out into the separate ``azure-monitor-querymetrics`` package, which is **not** an install
-    requirement here. Rather than importing a ``MetricsQueryClient`` that does not exist — which
-    would raise a misleading ``AttributeError`` and hide the real cause — this backend fails closed
-    with a descriptive error.
-
-    TODO(human): once the AIOps/SRE team confirm the metrics package + client and its keyless query
-    method (timespan window, granularity, aggregations), perform a bounded, read-only query per
-    resource id inside a lazy, guarded import and hand each SDK response to
-    :func:`_normalize_sdk_response` (already structured for the metrics→timeseries→data shape the
-    pure mapper consumes). Never widen scope beyond the configured resource ids; keep it keyless.
+    ``azure-monitor-querymetrics``'s ``MetricsClient`` sends a **bearer Managed-Identity token**
+    (scope ``https://metrics.monitor.azure.com/.default``) to whatever HTTPS host it is constructed
+    with. An attacker-influenced endpoint could therefore harvest a *replayable* Azure token
+    (SSRF / token replay). To prevent that, :func:`_validate_metrics_endpoint` validates the
+    endpoint **before** any SDK import / client construction; a non-trusted endpoint raises this
+    class and **no token is ever minted or sent** — the edge fails closed with the class name only.
     """
-    del resource_ids, metric_names, credential, timeout_s, normalize
-    raise AzureMonitorSdkNotWired(
-        "Azure Monitor metrics backend is not wired: the installed azure-monitor-query ships "
-        "Logs clients only (metrics moved to azure-monitor-querymetrics, not an install "
-        "requirement). Inject a MetricsBackend to run metrics queries."
-    )
+
+
+# Trusted regional Azure Monitor **metrics** data-plane host suffixes, per cloud. The token scope is
+# ``https://metrics.monitor.azure.com/.default`` (and sovereign equivalents), so we only ever hand
+# the credential-bearing client a host under one of these suffixes.
+_TRUSTED_METRICS_HOST_SUFFIXES: tuple[str, ...] = (
+    ".metrics.monitor.azure.com",  # Azure public cloud
+    ".metrics.monitor.azure.us",  # Azure US Government
+    ".metrics.monitor.azure.cn",  # Azure China (21Vianet)
+)
+
+
+def _validate_metrics_endpoint(endpoint: str) -> str:
+    """Validate a metrics endpoint against the trusted Azure Monitor hosts — **pure**, fail-closed.
+
+    Rejects anything that could exfiltrate the Managed-Identity token (SSRF / token replay):
+    requires ``https://``, forbids userinfo and explicit ports, forbids any path/query/fragment,
+    and requires the host to be a real subdomain under a trusted ``*.metrics.monitor.azure.*``
+    suffix. Returns the normalized endpoint on success; raises :class:`UntrustedMetricsEndpoint`
+    otherwise (before any token is minted). Never logs the endpoint value.
+    """
+    parts = urlsplit(endpoint.strip())
+    if parts.scheme != "https":
+        raise UntrustedMetricsEndpoint("metrics endpoint must use https")
+    if parts.username or parts.password:
+        raise UntrustedMetricsEndpoint("metrics endpoint must not carry userinfo")
+    if parts.query or parts.fragment:
+        raise UntrustedMetricsEndpoint("metrics endpoint must not carry a query or fragment")
+    if parts.path not in ("", "/"):
+        raise UntrustedMetricsEndpoint("metrics endpoint must not carry a path")
+    try:
+        # ``parts.port`` raises ValueError on a malformed port; both cases are untrusted.
+        port = parts.port
+    except ValueError as exc:
+        raise UntrustedMetricsEndpoint("metrics endpoint has an invalid port") from exc
+    if port is not None:
+        raise UntrustedMetricsEndpoint("metrics endpoint must not specify a port")
+    host = (parts.hostname or "").lower()
+    for suffix in _TRUSTED_METRICS_HOST_SUFFIXES:
+        # Require at least one real label before the suffix (reject the bare suffix / look-alikes).
+        if host.endswith(suffix) and len(host) > len(suffix):
+            return f"https://{host}"
+    raise UntrustedMetricsEndpoint("metrics endpoint host is not a trusted Azure Monitor host")
 
 
 class _SdkMetricsBackend:
-    """Real backend seam. Currently a fail-closed stub — see :func:`query_metrics_via_sdk`."""
+    """Real metrics backend — lazily wraps ``azure-monitor-querymetrics``'s ``MetricsClient``.
+
+    Read-only, keyless (the injected credential is handed straight to the SDK), and bounded to the
+    configured resource ids. The SDK import is **lazy inside** :meth:`query_metrics` so importing
+    this module never needs the package and ``mypy src`` stays Azure-free. A missing package fails
+    closed via :class:`AzureMonitorSdkNotWired`; missing endpoint/namespace config fails closed too.
+    """
+
+    def __init__(
+        self,
+        config: AzureMonitorConfig,
+        *,
+        client_factory: Callable[[str, Any], Any] | None = None,
+    ) -> None:
+        self._config = config
+        # Test seam: inject a fake ``(endpoint, credential) -> client`` so timeout/SSRF behaviour is
+        # exercised without the real SDK. ``None`` ⇒ lazily import the real ``MetricsClient``.
+        self._client_factory = client_factory
+
+    def _build_client(self, endpoint: str, credential: Any) -> Any:
+        if self._client_factory is not None:
+            return self._client_factory(endpoint, credential)
+        try:
+            from azure.monitor.querymetrics import MetricsClient  # noqa: PLC0415 - lazy edge import
+        except ImportError as exc:  # optional package absent → fail closed, descriptive class name
+            raise AzureMonitorSdkNotWired(
+                "azure-monitor-querymetrics is not installed; the metrics edge is unavailable"
+            ) from exc
+        return MetricsClient(endpoint, credential)
 
     def query_metrics(
         self,
@@ -281,13 +516,153 @@ class _SdkMetricsBackend:
         credential: Any,
         timeout_s: float,
     ) -> list[dict[str, Any]]:
-        return query_metrics_via_sdk(
+        if not self._config.metrics_endpoint or not self._config.metric_namespace:
+            raise ValueError("azure monitor metrics edge needs a regional endpoint + namespace")
+        # Validate the endpoint BEFORE minting/handing over any token (SSRF / token-replay guard).
+        endpoint = _validate_metrics_endpoint(self._config.metrics_endpoint)
+        client = self._build_client(endpoint, credential)
+        try:
+            results = client.query_resources(
+                resource_ids=list(resource_ids),
+                metric_namespace=self._config.metric_namespace,
+                metric_names=list(metric_names),
+                timespan=timedelta(minutes=self._config.metric_lookback_minutes),
+                granularity=timedelta(minutes=self._config.metric_granularity_minutes),
+                aggregations=list(_AGGREGATIONS),
+                timeout=timeout_s,
+            )
+            # Each MetricsQueryResult maps positionally to the resource id we queried it for.
+            return [
+                _normalize_sdk_response(resource_id, result)
+                for resource_id, result in zip(resource_ids, results, strict=False)
+            ]
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
+
+@runtime_checkable
+class LogsBackend(Protocol):
+    """Narrow logs query seam. The real implementation wraps ``azure-monitor-query``'s
+    ``LogsQueryClient``; tests inject a fake that returns synthetic aggregated payloads (or raises
+    to exercise fail-closed)."""
+
+    def query_logs(
+        self,
+        *,
+        workspace_id: str,
+        resource_ids: Sequence[str],
+        metric_names: Sequence[str],
+        credential: Any,
+        timeout_s: float,
+    ) -> list[dict[str, Any]]:
+        ...
+
+
+def _normalize_logs_response(response: Any, *, allowed: Sequence[str]) -> dict[str, Any]:
+    """Convert a ``LogsQueryClient`` result into our normalized ``{"logRecords": [...]}`` payload.
+
+    Reads ``response.tables[*].columns`` / ``rows`` defensively and keeps **only** columns in
+    ``allowed`` (the aggregated identifier + numeric columns the KQL projected) — any other column
+    is dropped here, so no raw log content is normalized in. The pure mapper owns final validation.
+    """
+    allow = set(allowed)
+    records: list[dict[str, Any]] = []
+    for table in getattr(response, "tables", None) or []:
+        columns = [str(c) for c in (getattr(table, "columns", None) or [])]
+        for row in getattr(table, "rows", None) or []:
+            record = {
+                name: value
+                for name, value in zip(columns, row, strict=False)
+                if name in allow
+            }
+            records.append(record)
+    return {"logRecords": records}
+
+
+def _logs_result_to_payload(response: Any, *, success_status: Any) -> dict[str, Any]:
+    """Gate a logs query result on SUCCESS, then normalize — **pure**, fail-closed on anything else.
+
+    ``LogsQueryClient`` can return a ``LogsQueryResult`` (status ``SUCCESS`` with ``.tables``) or a
+    ``LogsQueryPartialResult`` (status ``PARTIAL`` with ``.partial_data`` and **no** ``.tables``).
+    A partial/missing/unexpected status is a **false all-clear** if normalized as empty, so we
+    accept **only** ``success_status``; anything else raises ``ValueError`` (fails the edge closed
+    with the class name only). On success the aggregated table is normalized via
+    :func:`_normalize_logs_response`.
+    """
+    status = getattr(response, "status", None)
+    if status != success_status:
+        raise ValueError("azure monitor logs query did not return a successful status")
+    return _normalize_logs_response(response, allowed=_LOG_RECORD_FIELDS)
+
+
+class _SdkLogsBackend:
+    """Real logs backend — lazily wraps ``azure-monitor-query``'s ``LogsQueryClient``.
+
+    Read-only, keyless, and PII-safe: it runs **only** the bounded, aggregated KQL from
+    :func:`build_logs_kql` (never a raw-row/body projection) against the configured Log Analytics
+    workspace, then normalizes the aggregated table into ``{"logRecords": [...]}``. The SDK import
+    is lazy inside :meth:`query_logs` so this module stays Azure-free at import time.
+    """
+
+    def __init__(
+        self,
+        config: AzureMonitorConfig,
+        *,
+        client_factory: Callable[[Any], Any] | None = None,
+        status_success: Any | None = None,
+    ) -> None:
+        self._config = config
+        # Test seams: inject a fake ``(credential) -> client`` and the SUCCESS sentinel so the
+        # timeout/status-gating behaviour is exercised without the real SDK. ``None`` ⇒ real SDK.
+        self._client_factory = client_factory
+        self._status_success = status_success
+
+    def _build_client(self, credential: Any) -> tuple[Any, Any]:
+        """Return ``(client, success_status)`` from the injected factory or the lazy SDK import."""
+        if self._client_factory is not None:
+            return self._client_factory(credential), self._status_success
+        try:
+            from azure.monitor.query import (  # noqa: PLC0415 - lazy edge import
+                LogsQueryClient,
+                LogsQueryStatus,
+            )
+        except ImportError as exc:  # azure-monitor-query is a base dep, but stay defensive
+            raise AzureMonitorSdkNotWired(
+                "azure-monitor-query is not installed; the logs edge is unavailable"
+            ) from exc
+        return LogsQueryClient(credential), LogsQueryStatus.SUCCESS
+
+    def query_logs(
+        self,
+        *,
+        workspace_id: str,
+        resource_ids: Sequence[str],
+        metric_names: Sequence[str],
+        credential: Any,
+        timeout_s: float,
+    ) -> list[dict[str, Any]]:
+        kql = build_logs_kql(
             resource_ids=resource_ids,
             metric_names=metric_names,
-            credential=credential,
-            timeout_s=timeout_s,
-            normalize=_normalize_sdk_response,
+            lookback_hours=self._config.log_lookback_hours,
+            bin_minutes=self._config.log_bin_minutes,
         )
+        client, success_status = self._build_client(credential)
+        try:
+            response = client.query_workspace(
+                workspace_id,
+                kql,
+                timespan=timedelta(hours=self._config.log_lookback_hours),
+                server_timeout=max(1, int(timeout_s)),
+            )
+            # Accept ONLY a successful status; PARTIAL/missing/unexpected ⇒ fail closed (MED 3).
+            return [_logs_result_to_payload(response, success_status=success_status)]
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
 
 # --------------------------------------------------------------------------------------
@@ -295,7 +670,7 @@ class _SdkMetricsBackend:
 # --------------------------------------------------------------------------------------
 # Transient error *class names* worth a bounded retry. Matched by name (not import) so no vendor
 # SDK is pulled in at module import time; azure-core's ``ServiceRequestError``/``ServiceResponse
-# Error`` and the builtin connection/timeout errors qualify. The not-wired stub
+# Error`` and the builtin connection/timeout errors qualify. A guarded-import failure
 # (``AzureMonitorSdkNotWired``), credential-provider errors and malformed payloads do **not**.
 _TRANSIENT_ERROR_NAMES: frozenset[str] = frozenset(
     {
@@ -320,11 +695,16 @@ def _is_transient_backend(exc: BaseException) -> bool:
 
 
 class AzureMonitorClient:
-    """Thin, read-only Azure Monitor metrics client. Fail-closed; never queries unauthenticated.
+    """Thin, read-only Azure Monitor client (metrics + logs). Fail-closed; never queries unauth'd.
 
-    Inject a ``credential_provider`` (Managed Identity, keyless) and — in tests — a ``backend`` so
-    everything is exercised without the SDK or network. If no credential resolves, :meth:`fetch_raw`
-    fails closed with ``error="NoCredential"`` and performs **no** query.
+    Inject a ``credential_provider`` (Managed Identity, keyless) and — in tests — a ``backend``
+    (metrics) and/or ``logs_backend`` so everything is exercised without the SDK or network. If no
+    credential resolves, :meth:`fetch_raw` fails closed with ``error="NoCredential"`` and performs
+    **no** query.
+
+    Which edges run is driven by config/injection: the **metrics** edge runs when a ``backend`` is
+    injected or ``config.resource_ids`` is non-empty; the **logs** edge runs when a ``logs_backend``
+    is injected or ``config.workspace_id`` is set. Any edge error fails the whole fetch closed.
     """
 
     def __init__(
@@ -333,12 +713,14 @@ class AzureMonitorClient:
         *,
         credential_provider: CredentialProvider | None = None,
         backend: MetricsBackend | None = None,
+        logs_backend: LogsBackend | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
     ) -> None:
         self._config = config
         self._credential_provider = credential_provider
         self._backend = backend
+        self._logs_backend = logs_backend
         # Injected so bounded-retry backoff is deterministic and instant in tests; real by default.
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random()  # noqa: S311 - backoff jitter, not crypto
@@ -354,7 +736,7 @@ class AzureMonitorClient:
         return None
 
     def fetch_raw(self, *, metric_names: Sequence[str] | None = None) -> FetchResult:
-        """The single I/O edge. Read-only metrics query; returns raw payloads or fails closed.
+        """The single I/O edge. Read-only metrics + logs query; returns payloads or fails closed.
 
         Fails closed (``available=False``, error *class* name only — no body, token, or message) on
         an unresolvable/raising credential, or any backend/SDK error. Transient backend/transport
@@ -364,12 +746,44 @@ class AzureMonitorClient:
         return fail_closed(lambda: self._fetch(metric_names=metric_names))
 
     def _fetch(self, *, metric_names: Sequence[str] | None) -> FetchResult:
-        """Resolve the credential, then run the bounded, retried query. May raise; guarded above."""
+        """Resolve the credential, then run each enabled edge under bounded retry. Guarded above."""
         credential = self._resolve_credential()
         if credential is None:
             return FetchResult(available=False, error="NoCredential")
-        backend: MetricsBackend = self._backend or cast(MetricsBackend, _SdkMetricsBackend())
         names = list(metric_names) if metric_names else list(self._config.metric_names)
+        raw: list[dict[str, Any]] = []
+        if self._metrics_enabled():
+            raw.extend(self._run_edge(self._metrics_attempt(credential, names)))
+        if self._logs_enabled():
+            raw.extend(self._run_edge(self._logs_attempt(credential, names)))
+        return FetchResult(available=True, raw=raw)
+
+    def _metrics_enabled(self) -> bool:
+        """Whether to run the metrics edge.
+
+        With an injected ``backend`` (tests) it always runs. Otherwise the **real** metrics edge
+        requires the *complete* metrics config — ``resource_ids`` **and** ``metrics_endpoint``
+        **and** ``metric_namespace`` — so a logs-only deployment that sets ``resource_ids`` merely
+        to bound its KQL does **not** trip the metrics edge (and fail) before logs can run (MED 4).
+        """
+        if self._backend is not None:
+            return True
+        return bool(
+            self._config.resource_ids
+            and self._config.metrics_endpoint
+            and self._config.metric_namespace
+        )
+
+    def _logs_enabled(self) -> bool:
+        """Logs edge runs when a logs backend is injected (tests) or a workspace id is set."""
+        return self._logs_backend is not None or bool(self._config.workspace_id)
+
+    def _metrics_attempt(
+        self, credential: object, names: list[str]
+    ) -> Callable[[], list[dict[str, Any]]]:
+        backend: MetricsBackend = self._backend or cast(
+            MetricsBackend, _SdkMetricsBackend(self._config)
+        )
 
         def _attempt() -> list[dict[str, Any]]:
             raw = backend.query_metrics(
@@ -380,8 +794,32 @@ class AzureMonitorClient:
             )
             return _coerce_backend_raw(raw)
 
-        raw = run_with_retries(
-            _attempt,
+        return _attempt
+
+    def _logs_attempt(
+        self, credential: object, names: list[str]
+    ) -> Callable[[], list[dict[str, Any]]]:
+        backend: LogsBackend = self._logs_backend or cast(
+            LogsBackend, _SdkLogsBackend(self._config)
+        )
+        workspace_id = self._config.workspace_id or ""
+
+        def _attempt() -> list[dict[str, Any]]:
+            raw = backend.query_logs(
+                workspace_id=workspace_id,
+                resource_ids=list(self._config.resource_ids),
+                metric_names=names,
+                credential=credential,
+                timeout_s=self._config.timeout_s,
+            )
+            return _coerce_backend_raw(raw)
+
+        return _attempt
+
+    def _run_edge(self, attempt: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        """Run one edge attempt under the shared bounded retry-with-jitter policy. May raise."""
+        return run_with_retries(
+            attempt,
             attempts=self._config.retries,
             base_delay_s=self._config.base_delay_s,
             max_delay_s=self._config.max_delay_s,
@@ -389,7 +827,6 @@ class AzureMonitorClient:
             rng=self._rng,
             retry_on=_is_transient_backend,
         )
-        return FetchResult(available=True, raw=raw)
 
 
 __all__ = [
@@ -397,8 +834,11 @@ __all__ = [
     "AzureMonitorConfig",
     "AzureMonitorSdkNotWired",
     "CredentialProvider",
+    "LogsBackend",
     "MetricsBackend",
+    "UntrustedMetricsEndpoint",
+    "build_logs_kql",
+    "map_logs_response",
     "map_metrics_response",
-    "query_metrics_via_sdk",
     "to_signals",
 ]
