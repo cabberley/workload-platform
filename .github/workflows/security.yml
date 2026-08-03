@@ -18,6 +18,9 @@ jobs:
   codeql:
     name: CodeQL (python + javascript)
     runs-on: ubuntu-latest
+    # Code scanning upload requires GitHub Advanced Security. On a free PRIVATE repo this
+    # isn't available, so run best-effort; it activates automatically in a GHAS-enabled org.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +37,8 @@ jobs:
     name: dependency review
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Also requires GitHub Advanced Security on private repos; best-effort until enabled.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/dependency-review-action@v4
