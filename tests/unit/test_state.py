@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import importlib.util
 import threading
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from api.app.main import app, get_store, registry
+from modules.dependency_graph.module import DependencyGraphModule
+from modules.discovery.module import DiscoveryModule
 from shared.contracts import (
     DependencyEdge,
     EdgeType,
@@ -25,7 +28,7 @@ from shared.contracts import (
     Severity,
     WorkloadGraph,
 )
-from shared.module_base import Module, ModuleContext
+from shared.module_base import Module, ModuleContext, run_module
 from shared.state import (
     LocalStateStore,
     ReadableState,
@@ -34,8 +37,11 @@ from shared.state import (
     build_state_store,
     compute_drift,
     encode_storage_key,
-    persist_run,
 )
+
+WORKER_SOURCE = (
+    Path(__file__).resolve().parents[2] / "src" / "cli" / "worker.py"
+).read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------------------
@@ -274,11 +280,14 @@ def test_encode_storage_key_distinct_and_stable() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Fix 4 — the module-facing view does not hold/expose the writable store.
+# Fix 4 (+ round-2 re-flag) — the module-facing view exposes no path to a writer.
 # --------------------------------------------------------------------------------------
+_WRITE_METHODS = ("put_estate", "put_graph", "add_findings", "snapshot", "commit_run")
+
+
 def test_module_state_view_is_read_only(store: LocalStateStore) -> None:
     view = ReadOnlyState(store)
-    for writer in ("put_estate", "put_graph", "add_findings", "snapshot"):
+    for writer in _WRITE_METHODS:
         assert not hasattr(view, writer)
     # The footgun: the writable store must not be reachable as an attribute of the view.
     assert not hasattr(view, "_backend")
@@ -292,6 +301,25 @@ def test_module_state_view_is_read_only(store: LocalStateStore) -> None:
     # Structural checks: it is a ReadableState but not a full (writable) StateStore.
     assert isinstance(view, ReadableState)
     assert not isinstance(view, StateStore)
+
+
+def test_read_only_bound_methods_self_has_no_writer(store: LocalStateStore) -> None:
+    # Round-2 re-flag: a captured bound read method must NOT expose a writable backend via its
+    # ``__self__`` (the old code bound directly to the store, so ``_get_estate.__self__`` WAS the
+    # writable store). Now every bound method's ``__self__`` is the private read-only reader.
+    view = ReadOnlyState(store)
+    bound_selves = [
+        getattr(attr, "__self__", None) for attr in vars(view).values()
+    ]
+    assert any(owner is not None for owner in bound_selves)  # they really are bound methods
+    for owner in bound_selves:
+        if owner is None:
+            continue
+        assert owner is not store
+        for writer in _WRITE_METHODS:
+            assert not hasattr(owner, writer)
+    # And the obvious traversal a careless module might try is dead:
+    assert not hasattr(view.get_estate.__self__, "put_estate")
 
 
 def test_read_only_view_reads_through_to_backend(store: LocalStateStore) -> None:
@@ -315,18 +343,53 @@ def test_module_context_defaults_backward_compatible() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Fix 2 — persist_run pure helper (findings/estate/graph).
+# Fix 2/3 — commit_run: atomic persist with is-not-None (clear vs untouch) semantics.
 # --------------------------------------------------------------------------------------
-def test_persist_run_writes_all_present_outputs(store: LocalStateStore) -> None:
+def test_commit_run_writes_all_present_outputs(store: LocalStateStore) -> None:
     result = ModuleRunResult(
         module="synthetic", ok=True, estate=_nodes(), graph=_graph(),
         findings=[_finding("q1", "quality_checks", passed=False)],
     )
-    counts = persist_run(store, "epic", result)
+    counts = store.commit_run("epic", result)
     assert counts == {"estate": 2, "graph": 1, "findings": 1}
     assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1", "lb-web"]
     assert store.get_graph("epic") is not None
     assert [f.id for f in store.get_findings("epic")] == ["q1"]
+
+
+def test_commit_run_empty_estate_clears_state(store: LocalStateStore) -> None:
+    store.put_estate("epic", _nodes())
+    # An explicit empty estate (not None) CLEARS stale state — is-not-None, not truthiness.
+    store.commit_run("epic", ModuleRunResult(module="discovery", estate=[]))
+    assert store.get_estate("epic") == []
+
+
+def test_commit_run_none_estate_leaves_state_untouched(store: LocalStateStore) -> None:
+    store.put_estate("epic", _nodes())
+    # estate defaults to None => "this run did not touch the estate" => existing state preserved.
+    store.commit_run(
+        "epic",
+        ModuleRunResult(module="quality_checks",
+                        findings=[_finding("q1", "quality_checks", passed=False)]),
+    )
+    assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1", "lb-web"]
+    assert [f.id for f in store.get_findings("epic")] == ["q1"]
+
+
+def test_commit_run_is_all_or_nothing(store: LocalStateStore, monkeypatch) -> None:
+    # Seed a known estate, then force the graph write to fail mid-commit. Because commit_run runs
+    # in ONE transaction, the estate write must roll back — no partial mutation.
+    store.put_estate("epic", [_nodes()[0]])
+
+    def boom(_conn, _workload, _graph) -> None:
+        raise RuntimeError("graph write failed")
+
+    monkeypatch.setattr(store, "_write_graph", boom)
+    result = ModuleRunResult(module="discovery", estate=_nodes(), graph=_graph())
+    with pytest.raises(RuntimeError, match="graph write failed"):
+        store.commit_run("epic", result)
+    # Estate is unchanged from before the failed commit (rolled back).
+    assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1"]
 
 
 # --------------------------------------------------------------------------------------
@@ -355,6 +418,65 @@ def test_azure_backend_without_extra_raises_actionable_error(monkeypatch) -> Non
     monkeypatch.setenv("WORKLOADS_STATE_BLOB_ENDPOINT", "https://x.blob.core.windows.net")
     with pytest.raises(RuntimeError, match=r"pip install \.\[azure\]"):
         build_state_store()
+
+
+# --------------------------------------------------------------------------------------
+# Fix 1 — single-writer: run_module is COMPUTE-ONLY and the worker never writes state.
+# --------------------------------------------------------------------------------------
+def test_run_module_is_compute_only_and_does_not_persist(store: LocalStateStore) -> None:
+    module = _SyntheticModule()
+    result = run_module(module, scope={"workload": "epic"}, state=ReadOnlyState(store))
+    # It computed the synthetic outputs...
+    assert result.estate is not None and len(result.estate) == 2
+    assert result.graph is not None
+    # ...but wrote nothing: compute is separated from persistence (the API is the only writer).
+    assert store.list_workloads() == []
+
+
+def test_worker_source_does_not_write_state() -> None:
+    # The worker must not import/construct a StateStore or call any persist/commit path — it POSTs
+    # results to the API (the single writer) instead. Guarding on source keeps the invariant real.
+    assert "StateStore" not in WORKER_SOURCE
+    assert "build_state_store" not in WORKER_SOURCE
+    assert "persist_run" not in WORKER_SOURCE
+    assert "commit_run" not in WORKER_SOURCE
+    assert "put_estate" not in WORKER_SOURCE
+    # It computes then hands off over HTTP.
+    assert "run_module" in WORKER_SOURCE
+    assert "httpx" in WORKER_SOURCE
+    assert "/api/workloads/" in WORKER_SOURCE
+
+
+def test_only_src_api_calls_the_write_surface() -> None:
+    # Repo-wide guard: persist/commit/put_* are only *called* from inside src/api (the writer).
+    # state.py defines them; module code and the worker must not invoke them.
+    src = Path(__file__).resolve().parents[2] / "src"
+    offenders: list[str] = []
+    for path in src.rglob("*.py"):
+        rel = path.relative_to(src).as_posix()
+        if rel.startswith("api/") or rel == "shared/state.py":
+            continue  # the API is the writer; state.py defines the surface
+        text = path.read_text(encoding="utf-8")
+        for needle in (".commit_run(", ".put_estate(", ".put_graph(", ".add_findings("):
+            if needle in text:
+                offenders.append(f"{rel}:{needle}")
+    assert offenders == []
+
+
+# --------------------------------------------------------------------------------------
+# Fix 2 — the real modules surface estate / graph on their result (so the API can persist).
+# --------------------------------------------------------------------------------------
+def test_discovery_module_emits_estate() -> None:
+    result = run_module(DiscoveryModule(), scope={"workload": "epic"})
+    # estate is a list (present, is-not-None) — populated with real ARG nodes in issue #2.
+    assert result.estate is not None
+    assert isinstance(result.estate, list)
+
+
+def test_dependency_graph_module_emits_graph() -> None:
+    result = run_module(DependencyGraphModule(), scope={"workload": "epic"})
+    assert result.graph is not None
+    assert isinstance(result.graph, WorkloadGraph)
 
 
 # --------------------------------------------------------------------------------------

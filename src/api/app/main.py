@@ -19,13 +19,12 @@ from shared.contracts import (
     ResourceNode,
     WorkloadGraph,
 )
-from shared.module_base import ModuleContext, build_default_registry
+from shared.module_base import build_default_registry, run_module
 from shared.state import (
     ReadOnlyState,
     StateStore,
     build_state_store,
     compute_drift,
-    persist_run,
 )
 
 app = FastAPI(
@@ -73,35 +72,36 @@ class RunRequest(BaseModel):
 
 
 @app.post("/api/modules/{name}/run")
-def run_module(name: str, req: RunRequest, store: StoreDep) -> ModuleRunResult:
-    """Run a single module by name (also how the ACA Job worker invokes work).
+def run_module_endpoint(name: str, req: RunRequest, store: StoreDep) -> ModuleRunResult:
+    """Run a single module by name (also how the ACA Job worker's compute is exercised in-process).
 
-    The module is handed a **read-only** state view; it cannot write shared state. When the scope
-    carries a ``workload``, the API (the single writer) persists the run's outputs immediately —
-    findings always, plus estate/graph when the run produced them.
+    Compute and write are separated: :func:`~shared.module_base.run_module` computes the result
+    with a **read-only** state view (it cannot write shared state); then — because this is the API,
+    the single writer — the endpoint commits the run atomically when the scope carries a
+    ``workload`` (findings always, plus estate/graph when the run produced them).
     """
     try:
         module = registry.get(name)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    ctx = ModuleContext(state=ReadOnlyState(store))
-    result = module.run(ctx, scope=req.scope)
+    result = run_module(module, scope=req.scope, state=ReadOnlyState(store))
     workload = req.scope.get("workload")
     if workload:
-        persist_run(store, workload, result)
+        store.commit_run(workload, result)  # API is the single writer
     return result
 
 
 # --------------------------------------------------------------------------------------
 # Submit endpoints — modules/workers hand results to the API, which persists them (writer).
 # The request body is a fully typed `ModuleRunResult`, so FastAPI validates the ENTIRE payload
-# before the endpoint runs: a bad graph rejects the whole submit and nothing is written (no
-# partial mutation).
+# before the endpoint runs: a bad graph rejects the whole submit and nothing is written. The
+# commit itself is atomic (single transaction / manifest commit point), so even a mid-write error
+# leaves state unchanged.
 # --------------------------------------------------------------------------------------
 @app.post("/api/workloads/{workload}/results")
 def submit_results(workload: str, result: ModuleRunResult, store: StoreDep) -> dict[str, object]:
-    """Accept a validated ``ModuleRunResult`` and persist estate/graph/findings as applicable."""
-    return {"workload": workload, "persisted": persist_run(store, workload, result)}
+    """Accept a validated ``ModuleRunResult`` and persist estate/graph/findings atomically."""
+    return {"workload": workload, "persisted": store.commit_run(workload, result)}
 
 
 @app.post("/api/workloads/{workload}/estate")

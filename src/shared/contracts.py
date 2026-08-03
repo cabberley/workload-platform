@@ -187,13 +187,19 @@ class ModuleRunResult(BaseModel):
     module: str
     ok: bool = True
     findings: list[Finding] = Field(default_factory=list)
-    estate: list[ResourceNode] = Field(
-        default_factory=list,
-        description="Estate nodes produced by this run (persisted by the API single writer)",
+    estate: list[ResourceNode] | None = Field(
+        default=None,
+        description=(
+            "Estate nodes produced by this run (persisted by the API single writer). "
+            "None = this run did not touch the estate; an empty list explicitly CLEARS it."
+        ),
     )
     graph: WorkloadGraph | None = Field(
         default=None,
-        description="Dependency graph produced by this run (persisted by the API single writer)",
+        description=(
+            "Dependency graph produced by this run (persisted by the API single writer). "
+            "None = this run did not touch the graph."
+        ),
     )
     response: AgentResponse | None = None
     extra: dict[str, Any] = Field(default_factory=dict)

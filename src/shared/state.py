@@ -25,7 +25,7 @@ import json
 import os
 import sqlite3
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -51,7 +51,6 @@ __all__ = [
     "build_state_store",
     "compute_drift",
     "encode_storage_key",
-    "persist_run",
 ]
 
 _ENV_BACKEND = "WORKLOADS_STATE_BACKEND"
@@ -125,36 +124,77 @@ class StateStore(ReadableState, Protocol):
         """Upsert ``findings`` into the current set for ``workload`` (keyed by finding id)."""
         ...
 
+    def commit_run(self, workload: str, result: ModuleRunResult) -> dict[str, int]:
+        """Persist a whole module run **atomically** (all-or-nothing).
+
+        Estate and graph use ``is not None`` semantics: ``None`` leaves existing state untouched,
+        an empty value CLEARS it. Findings are upserted. On any error nothing is written.
+        Returns the count of items written per kind.
+        """
+        ...
+
     def snapshot(self, workload: str) -> str:
         """Freeze the current findings into a point-in-time snapshot; return its id."""
         ...
 
 
 # --------------------------------------------------------------------------------------
-# Read-only view — the object handed to modules. It captures ONLY the read callables and keeps
-# no reference to the writable store, so there is no ``.put_*``/``.snapshot`` reachable from a
-# module holding this view.
+# Read-only view — the object handed to modules.
 #
-# NOTE: perfect in-process immutability is impossible in Python, and it is not the real boundary.
+# NOTE: perfect in-process immutability is impossible in Python, and it is NOT the real boundary.
 # In production the isolation boundary is the *process* boundary: modules deploy as their own ACA
-# apps and reach state only through the API over HTTP — they never hold a store reference. This
-# wrapper simply removes the in-process footgun (no `ctx.state._backend.put_estate(...)`).
+# apps and reach state only through the API over HTTP — they never hold a store reference. The
+# wrapper below is an ACCIDENTAL-USE guard: it removes the obvious footguns (no ``.put_*`` on the
+# view, and no bound read method whose ``__self__`` exposes a writer).
 # --------------------------------------------------------------------------------------
-class ReadOnlyState:
-    """Read-only projection over a :class:`StateStore` — the only state passed to modules.
+class _StateReader:
+    """Dedicated read-only view over a backend, exposing ONLY the read methods.
 
-    Captures the backend's read methods as bound callables and stores no reference to the backend
-    object, so the writable store is not reachable as an attribute of this view. Exposes exactly
-    the ``ReadableState`` surface and nothing else.
+    The writable backend is held name-mangled/private, so a bound read method's ``__self__`` (this
+    object) has no ``put_*``/``add_findings``/``snapshot``/``commit_run`` to reach. This is an
+    accidental-use guard, not a security sandbox — the real isolation boundary is the process
+    boundary (see the module note above).
     """
 
     def __init__(self, backend: ReadableState) -> None:
-        self._list_workloads = backend.list_workloads
-        self._get_estate = backend.get_estate
-        self._get_graph = backend.get_graph
-        self._get_findings = backend.get_findings
-        self._get_previous_findings = backend.get_previous_findings
-        self._get_previous_node_ids = backend.get_previous_node_ids
+        self.__backend = backend
+
+    def list_workloads(self) -> list[str]:
+        return self.__backend.list_workloads()
+
+    def get_estate(self, workload: str) -> list[ResourceNode]:
+        return self.__backend.get_estate(workload)
+
+    def get_graph(self, workload: str) -> WorkloadGraph | None:
+        return self.__backend.get_graph(workload)
+
+    def get_findings(self, workload: str, module: str | None = None) -> list[Finding]:
+        return self.__backend.get_findings(workload, module)
+
+    def get_previous_findings(self, workload: str) -> list[Finding]:
+        return self.__backend.get_previous_findings(workload)
+
+    def get_previous_node_ids(self, workload: str) -> list[str]:
+        return self.__backend.get_previous_node_ids(workload)
+
+
+class ReadOnlyState:
+    """Read-only projection handed to modules — the only state a module ever sees.
+
+    Reads are served by a private :class:`_StateReader`; this object captures only that reader's
+    bound read methods. Consequently neither ``ReadOnlyState`` nor any of its bound read methods'
+    ``__self__`` exposes a write method or the writable store (accidental-use guard — the real
+    boundary is the process boundary).
+    """
+
+    def __init__(self, backend: ReadableState) -> None:
+        reader = _StateReader(backend)
+        self._list_workloads = reader.list_workloads
+        self._get_estate = reader.get_estate
+        self._get_graph = reader.get_graph
+        self._get_findings = reader.get_findings
+        self._get_previous_findings = reader.get_previous_findings
+        self._get_previous_node_ids = reader.get_previous_node_ids
 
     def list_workloads(self) -> list[str]:
         return self._list_workloads()
@@ -216,6 +256,53 @@ class LocalStateStore:
             for stmt in _SCHEMA:
                 conn.execute(stmt)
 
+    @contextlib.contextmanager
+    def _transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """Yield a connection wrapped in a single explicit transaction (commit/rollback/close).
+
+        ``immediate=True`` issues ``BEGIN IMMEDIATE`` so a write lock is taken up front: reads and
+        the write that follow are point-in-time atomic (a concurrent writer cannot interleave).
+        Any exception rolls the whole transaction back — nothing is partially written.
+        """
+        conn = self._connect()
+        conn.isolation_level = None  # take manual control of transaction boundaries
+        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    # -- read helpers (operate on a caller-provided connection so they compose in a txn) -----
+    @staticmethod
+    def _read_estate(conn: sqlite3.Connection, workload: str) -> list[ResourceNode]:
+        row = conn.execute(
+            "SELECT data FROM estate WHERE workload = ?", (workload,)
+        ).fetchone()
+        if row is None:
+            return []
+        return [ResourceNode.model_validate(item) for item in json.loads(row["data"])]
+
+    @staticmethod
+    def _read_findings(
+        conn: sqlite3.Connection, workload: str, module: str | None = None
+    ) -> list[Finding]:
+        if module is None:
+            rows = conn.execute(
+                "SELECT data FROM findings WHERE workload = ? ORDER BY module, finding_id",
+                (workload,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT data FROM findings WHERE workload = ? AND module = ?"
+                " ORDER BY finding_id",
+                (workload, module),
+            ).fetchall()
+        return [Finding.model_validate_json(row["data"]) for row in rows]
+
     # -- reads ---------------------------------------------------------------------------
     def list_workloads(self) -> list[str]:
         query = (
@@ -230,12 +317,7 @@ class LocalStateStore:
 
     def get_estate(self, workload: str) -> list[ResourceNode]:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT data FROM estate WHERE workload = ?", (workload,)
-            ).fetchone()
-        if row is None:
-            return []
-        return [ResourceNode.model_validate(item) for item in json.loads(row["data"])]
+            return self._read_estate(conn, workload)
 
     def get_graph(self, workload: str) -> WorkloadGraph | None:
         with self._connect() as conn:
@@ -248,19 +330,7 @@ class LocalStateStore:
 
     def get_findings(self, workload: str, module: str | None = None) -> list[Finding]:
         with self._connect() as conn:
-            if module is None:
-                rows = conn.execute(
-                    "SELECT data FROM findings WHERE workload = ?"
-                    " ORDER BY module, finding_id",
-                    (workload,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT data FROM findings WHERE workload = ? AND module = ?"
-                    " ORDER BY finding_id",
-                    (workload, module),
-                ).fetchall()
-        return [Finding.model_validate_json(row["data"]) for row in rows]
+            return self._read_findings(conn, workload, module)
 
     def get_previous_findings(self, workload: str) -> list[Finding]:
         snap = self._latest_snapshot(workload)
@@ -285,58 +355,99 @@ class LocalStateStore:
         payload: dict[str, Any] = json.loads(row["data"])
         return payload
 
-    # -- writes (API core only) ----------------------------------------------------------
-    def put_estate(self, workload: str, nodes: list[ResourceNode]) -> None:
+    # -- write helpers (operate on a caller-provided connection so they compose in a txn) ----
+    @staticmethod
+    def _write_estate(
+        conn: sqlite3.Connection, workload: str, nodes: list[ResourceNode]
+    ) -> None:
         payload = json.dumps([node.model_dump(mode="json") for node in nodes])
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO estate (workload, data, updated_at) VALUES (?, ?, ?)"
-                " ON CONFLICT(workload) DO UPDATE SET"
-                " data = excluded.data, updated_at = excluded.updated_at",
-                (workload, payload, _now_iso()),
-            )
+        conn.execute(
+            "INSERT INTO estate (workload, data, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(workload) DO UPDATE SET"
+            " data = excluded.data, updated_at = excluded.updated_at",
+            (workload, payload, _now_iso()),
+        )
 
-    def put_graph(self, workload: str, graph: WorkloadGraph) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO graph (workload, data, updated_at) VALUES (?, ?, ?)"
-                " ON CONFLICT(workload) DO UPDATE SET"
-                " data = excluded.data, updated_at = excluded.updated_at",
-                (workload, graph.model_dump_json(), _now_iso()),
-            )
+    @staticmethod
+    def _write_graph(
+        conn: sqlite3.Connection, workload: str, graph: WorkloadGraph
+    ) -> None:
+        conn.execute(
+            "INSERT INTO graph (workload, data, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(workload) DO UPDATE SET"
+            " data = excluded.data, updated_at = excluded.updated_at",
+            (workload, graph.model_dump_json(), _now_iso()),
+        )
 
-    def add_findings(self, workload: str, findings: list[Finding]) -> None:
+    @staticmethod
+    def _write_findings(
+        conn: sqlite3.Connection, workload: str, findings: list[Finding]
+    ) -> None:
         now = _now_iso()
         rows = [
             (workload, finding.id, finding.module, finding.model_dump_json(), now)
             for finding in findings
         ]
-        with self._connect() as conn:
-            conn.executemany(
-                "INSERT INTO findings (workload, finding_id, module, data, updated_at)"
-                " VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT(workload, finding_id) DO UPDATE SET"
-                " module = excluded.module, data = excluded.data,"
-                " updated_at = excluded.updated_at",
-                rows,
-            )
+        conn.executemany(
+            "INSERT INTO findings (workload, finding_id, module, data, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(workload, finding_id) DO UPDATE SET"
+            " module = excluded.module, data = excluded.data,"
+            " updated_at = excluded.updated_at",
+            rows,
+        )
+
+    # -- writes (API core only) ----------------------------------------------------------
+    def put_estate(self, workload: str, nodes: list[ResourceNode]) -> None:
+        with self._transaction() as conn:
+            self._write_estate(conn, workload, nodes)
+
+    def put_graph(self, workload: str, graph: WorkloadGraph) -> None:
+        with self._transaction() as conn:
+            self._write_graph(conn, workload, graph)
+
+    def add_findings(self, workload: str, findings: list[Finding]) -> None:
+        with self._transaction() as conn:
+            self._write_findings(conn, workload, findings)
+
+    def commit_run(self, workload: str, result: ModuleRunResult) -> dict[str, int]:
+        """Persist a whole run in ONE sqlite transaction — all-or-nothing.
+
+        Estate/graph use ``is not None`` (an explicit empty estate clears stale state); findings
+        are upserted. If any write raises, the transaction rolls back and nothing is committed, so
+        a valid-estate + bad-graph submit can never leave estate mutated.
+        """
+        counts = {"estate": 0, "graph": 0, "findings": 0}
+        with self._transaction() as conn:
+            if result.estate is not None:
+                self._write_estate(conn, workload, result.estate)
+                counts["estate"] = len(result.estate)
+            if result.graph is not None:
+                self._write_graph(conn, workload, result.graph)
+                counts["graph"] = 1
+            if result.findings:
+                self._write_findings(conn, workload, result.findings)
+                counts["findings"] = len(result.findings)
+        return counts
 
     def snapshot(self, workload: str) -> str:
-        """Freeze current findings + estate node ids into a snapshot; return its id.
+        """Freeze current findings + estate node ids into a point-in-time snapshot; return its id.
 
-        The sequence is allocated atomically by the ``AUTOINCREMENT`` primary key on a single
+        The read of findings/estate AND the snapshot ``INSERT`` run inside a single
+        ``BEGIN IMMEDIATE`` transaction, so a concurrent update cannot produce a mixed snapshot.
+        The sequence is allocated atomically by the ``AUTOINCREMENT`` primary key on that single
         ``INSERT`` — never a read-modify-write of ``MAX(seq)`` — so concurrent callers can never
         compute the same id or overwrite each other's snapshot.
         """
-        findings = self.get_findings(workload)
-        node_ids = [node.id for node in self.get_estate(workload)]
-        payload = json.dumps(
-            {
-                "findings": [finding.model_dump(mode="json") for finding in findings],
-                "nodes": node_ids,
-            }
-        )
-        with self._connect() as conn:
+        with self._transaction(immediate=True) as conn:
+            findings = self._read_findings(conn, workload)
+            node_ids = [node.id for node in self._read_estate(conn, workload)]
+            payload = json.dumps(
+                {
+                    "findings": [finding.model_dump(mode="json") for finding in findings],
+                    "nodes": node_ids,
+                }
+            )
             cursor = conn.execute(
                 "INSERT INTO snapshots (workload, data, created_at) VALUES (?, ?, ?)",
                 (workload, payload, _now_iso()),
@@ -410,16 +521,29 @@ class AzureStateStore:
     def _table(self, name: str) -> TableClient:
         return self._tables.get_table_client(name)
 
-    def _touch_workload(self, workload: str) -> None:
-        # RowKey is the injection-proof encoded key; the raw name is kept as a property so
-        # ``list_workloads`` can return it verbatim.
-        self._table(_AZ_INDEX_TABLE).upsert_entity(
-            {
-                "PartitionKey": _AZ_INDEX_PARTITION,
-                "RowKey": encode_storage_key(workload),
-                "workload": workload,
-            }
-        )
+    def _manifest_entity(self, workload: str) -> dict[str, Any] | None:
+        """Raw read of the per-workload manifest/pointer entity (may be absent)."""
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            entity = self._table(_AZ_INDEX_TABLE).get_entity(
+                _AZ_INDEX_PARTITION, encode_storage_key(workload)
+            )
+        except ResourceNotFoundError:
+            return None
+        return dict(entity)
+
+    def _manifest(self, workload: str) -> dict[str, Any] | None:
+        """Read the manifest but only expose it once it is marked ``complete``.
+
+        Readers resolve current estate/graph via this manifest, so a commit that fails before the
+        manifest is (re)written LAST is never visible — the previous complete manifest still points
+        at the previous blob versions.
+        """
+        entity = self._manifest_entity(workload)
+        if entity is None or not entity.get("complete"):
+            return None
+        return entity
 
     def _read_blob(self, name: str) -> str | None:
         from azure.core.exceptions import ResourceNotFoundError
@@ -433,21 +557,103 @@ class AzureStateStore:
     def _write_blob(self, name: str, data: str) -> None:
         self._container.upload_blob(name, data.encode("utf-8"), overwrite=True)
 
+    def _upsert_findings(self, workload: str, findings: list[Finding]) -> None:
+        table = self._table(_AZ_FINDINGS_TABLE)
+        partition = encode_storage_key(workload)
+        entities = [
+            {
+                "PartitionKey": partition,
+                "RowKey": encode_storage_key(finding.id),
+                "module": finding.module,
+                "data": finding.model_dump_json(),
+            }
+            for finding in findings
+        ]
+        for start in range(0, len(entities), _BATCH_LIMIT):
+            chunk = entities[start : start + _BATCH_LIMIT]
+            table.submit_transaction([("upsert", entity) for entity in chunk])
+
+    def _commit(
+        self,
+        workload: str,
+        *,
+        estate: list[ResourceNode] | None,
+        graph: WorkloadGraph | None,
+        findings: list[Finding],
+    ) -> dict[str, int]:
+        """All-or-nothing commit: write payload blobs FIRST, manifest LAST (the commit point).
+
+        Estate/graph blobs are versioned, so a new write never overwrites the version the current
+        (complete) manifest points at. Findings are upserted. Only after every blob/finding write
+        succeeds do we replace the ONE manifest entity (``complete=True``) — the atomic commit
+        point readers resolve through, so a mid-write failure is never visible. ``estate``/``graph``
+        of ``None`` leave the existing pointer untouched; an empty estate list clears the estate.
+        """
+        partition = encode_storage_key(workload)
+        manifest = self._manifest_entity(workload)
+        prev_version = int(manifest["version"]) if manifest else 0
+        estate_blob = str(manifest["estate_blob"]) if manifest else ""
+        graph_blob = str(manifest["graph_blob"]) if manifest else ""
+
+        counts = {"estate": 0, "graph": 0, "findings": 0}
+        version = prev_version + 1 if (estate is not None or graph is not None) else prev_version
+
+        if estate is not None:
+            estate_blob = f"estate/{partition}/{version:06d}.json"
+            self._write_blob(
+                estate_blob, json.dumps([node.model_dump(mode="json") for node in estate])
+            )
+            counts["estate"] = len(estate)
+        if graph is not None:
+            graph_blob = f"graph/{partition}/{version:06d}.json"
+            self._write_blob(graph_blob, graph.model_dump_json())
+            counts["graph"] = 1
+        if findings:
+            self._upsert_findings(workload, findings)
+            counts["findings"] = len(findings)
+
+        # Commit point — replace the single manifest entity LAST.
+        self._table(_AZ_INDEX_TABLE).upsert_entity(
+            {
+                "PartitionKey": _AZ_INDEX_PARTITION,
+                "RowKey": partition,
+                "workload": workload,
+                "estate_blob": estate_blob,
+                "graph_blob": graph_blob,
+                "version": version,
+                "complete": True,
+                "committed_at": _now_iso(),
+            }
+        )
+        return counts
+
     # -- reads ---------------------------------------------------------------------------
     def list_workloads(self) -> list[str]:
         entities = self._table(_AZ_INDEX_TABLE).query_entities(
             "PartitionKey eq @pk", parameters={"pk": _AZ_INDEX_PARTITION}
         )
-        return sorted({str(entity["workload"]) for entity in entities})
+        return sorted({str(entity["workload"]) for entity in entities if entity.get("complete")})
 
     def get_estate(self, workload: str) -> list[ResourceNode]:
-        raw = self._read_blob(f"estate/{encode_storage_key(workload)}.json")
+        manifest = self._manifest(workload)
+        if manifest is None:
+            return []
+        blob = str(manifest.get("estate_blob") or "")
+        if not blob:
+            return []
+        raw = self._read_blob(blob)
         if raw is None:
             return []
         return [ResourceNode.model_validate(item) for item in json.loads(raw)]
 
     def get_graph(self, workload: str) -> WorkloadGraph | None:
-        raw = self._read_blob(f"graph/{encode_storage_key(workload)}.json")
+        manifest = self._manifest(workload)
+        if manifest is None:
+            return None
+        blob = str(manifest.get("graph_blob") or "")
+        if not blob:
+            return None
+        raw = self._read_blob(blob)
         if raw is None:
             return None
         return WorkloadGraph.model_validate_json(raw)
@@ -478,11 +684,15 @@ class AzureStateStore:
         return [str(node_id) for node_id in snap.get("nodes", [])]
 
     def _latest_snapshot(self, workload: str) -> dict[str, Any] | None:
-        entities = list(
-            self._table(_AZ_SNAPSHOTS_TABLE).query_entities(
+        # Only ``complete`` snapshots are visible (a snapshot whose blob upload never finished is
+        # never exposed), so readers can never observe a dangling latest-pointer.
+        entities = [
+            entity
+            for entity in self._table(_AZ_SNAPSHOTS_TABLE).query_entities(
                 "PartitionKey eq @pk", parameters={"pk": encode_storage_key(workload)}
             )
-        )
+            if entity.get("complete")
+        ]
         if not entities:
             return None
         latest = max(entities, key=lambda entity: str(entity["RowKey"]))
@@ -494,39 +704,31 @@ class AzureStateStore:
 
     # -- writes (API core only) ----------------------------------------------------------
     def put_estate(self, workload: str, nodes: list[ResourceNode]) -> None:
-        payload = json.dumps([node.model_dump(mode="json") for node in nodes])
-        self._write_blob(f"estate/{encode_storage_key(workload)}.json", payload)
-        self._touch_workload(workload)
+        self._commit(workload, estate=nodes, graph=None, findings=[])
 
     def put_graph(self, workload: str, graph: WorkloadGraph) -> None:
-        self._write_blob(f"graph/{encode_storage_key(workload)}.json", graph.model_dump_json())
-        self._touch_workload(workload)
+        self._commit(workload, estate=None, graph=graph, findings=[])
 
     def add_findings(self, workload: str, findings: list[Finding]) -> None:
-        table = self._table(_AZ_FINDINGS_TABLE)
-        partition = encode_storage_key(workload)
-        entities = [
-            {
-                "PartitionKey": partition,
-                "RowKey": encode_storage_key(finding.id),
-                "module": finding.module,
-                "data": finding.model_dump_json(),
-            }
-            for finding in findings
-        ]
-        for start in range(0, len(entities), _BATCH_LIMIT):
-            chunk = entities[start : start + _BATCH_LIMIT]
-            table.submit_transaction([("upsert", entity) for entity in chunk])
-        self._touch_workload(workload)
+        self._commit(workload, estate=None, graph=None, findings=findings)
+
+    def commit_run(self, workload: str, result: ModuleRunResult) -> dict[str, int]:
+        """Persist a whole run atomically (blobs first, manifest last). See :meth:`_commit`."""
+        return self._commit(
+            workload, estate=result.estate, graph=result.graph, findings=result.findings
+        )
 
     def snapshot(self, workload: str) -> str:
-        """Freeze current findings + estate node ids into a snapshot; return its id.
+        """Freeze current findings + estate node ids into a point-in-time snapshot; return its id.
 
-        The sequence RowKey is claimed with a conditional ``create_entity`` (fails if it already
-        exists); on conflict we bump the sequence and retry, so two concurrent snapshots can never
-        collide or overwrite one another. The blob is written only after the RowKey is claimed.
+        Two-phase so the pointer is only EXPOSED after the blob exists AND ids stay collision-free:
+        (1) claim the sequence RowKey with a conditional ``create_entity`` marked ``complete=False``
+        (retry with a bumped sequence on conflict, so two concurrent snapshots can't collide);
+        (2) upload the snapshot blob, THEN mark the pointer ``complete=True``. Readers list only
+        ``complete`` snapshots, so a failure before the blob finishes leaves no dangling pointer.
         """
         from azure.core.exceptions import ResourceExistsError
+        from azure.data.tables import UpdateMode
 
         table = self._table(_AZ_SNAPSHOTS_TABLE)
         partition = encode_storage_key(workload)
@@ -545,20 +747,28 @@ class AzureStateStore:
         while True:
             snapshot_id = f"snap::{workload}::{seq:06d}"
             blob_name = f"snapshots/{partition}/{seq:06d}.json"
+            row_key = f"{seq:06d}"
             try:
+                # Phase 1 — claim the sequence (invisible: complete=False).
                 table.create_entity(
                     {
                         "PartitionKey": partition,
-                        "RowKey": f"{seq:06d}",
+                        "RowKey": row_key,
                         "snapshot_id": snapshot_id,
                         "blob": blob_name,
+                        "complete": False,
                         "created_at": _now_iso(),
                     }
                 )
             except ResourceExistsError:
                 seq += 1
                 continue
+            # Phase 2 — upload the blob, THEN expose the snapshot by marking it complete.
             self._write_blob(blob_name, payload)
+            table.update_entity(
+                {"PartitionKey": partition, "RowKey": row_key, "complete": True},
+                mode=UpdateMode.MERGE,
+            )
             return snapshot_id
 
 
@@ -576,26 +786,6 @@ def build_state_store() -> StateStore:
     if backend == "azure":
         return AzureStateStore.from_env()
     raise ValueError(f"Unknown {_ENV_BACKEND}={backend!r}; expected 'local' or 'azure'")
-
-
-def persist_run(store: StateStore, workload: str, result: ModuleRunResult) -> dict[str, int]:
-    """Persist a module run's outputs on the single-writer path: estate, graph, findings.
-
-    The caller is the writer (the API core, or the CLI worker acting as a single-shot writer).
-    ``result`` is an already-validated ``ModuleRunResult``, so this performs writes only — there
-    is no validation here and therefore no partial-mutation-on-invalid-input hazard.
-    """
-    counts = {"estate": 0, "graph": 0, "findings": 0}
-    if result.estate:
-        store.put_estate(workload, result.estate)
-        counts["estate"] = len(result.estate)
-    if result.graph is not None:
-        store.put_graph(workload, result.graph)
-        counts["graph"] = 1
-    if result.findings:
-        store.add_findings(workload, result.findings)
-        counts["findings"] = len(result.findings)
-    return counts
 
 
 def compute_drift(

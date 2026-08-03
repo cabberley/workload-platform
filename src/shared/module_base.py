@@ -57,6 +57,23 @@ class Module(ABC):
         return {"module": self.name, "status": "ok"}
 
 
+def run_module(
+    module: Module,
+    *,
+    scope: dict[str, str] | None = None,
+    state: ReadableState | None = None,
+) -> ModuleRunResult:
+    """**Compute-only**: run ``module`` and return its ``ModuleRunResult``. Never persists.
+
+    Persistence is the exclusive job of the API core (the single writer); this helper only does
+    the compute half so the split is explicit. Both the API ``/run`` endpoint (which then commits)
+    and the ACA worker (which then POSTs the result to the API) call this — neither writes state
+    from inside the compute step. Modules receive a read-only ``state`` view (or ``None``).
+    """
+    ctx = ModuleContext(state=state)
+    return module.run(ctx, scope=scope)
+
+
 class ModuleRegistry:
     """Discovers and holds the enabled modules; used by the API core and worker."""
 
