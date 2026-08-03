@@ -24,7 +24,6 @@ param registrySku string = 'Basic'
 
 @description('Storage queues the module KEDA triggers reference (mirrors src/modules/*/manifest.yaml).')
 param queueNames array = [
-  'discovery'    // discovery module (azure-queue trigger)
   'dependency'   // dependency_graph module (azure-queue trigger)
   'assessments'  // quality_checks module (azure-queue trigger)
   'telemetry'    // aiops module (azure-queue trigger)

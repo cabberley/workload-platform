@@ -17,7 +17,10 @@ param imageTag string
 @description('Module name, e.g. discovery')
 param moduleName string
 param image string = 'worker'
+@description('Event jobs: minimum concurrent executions. Not applicable to Schedule jobs.')
 param minExecutions int = 0
+
+@description('Event jobs: maximum concurrent executions. For Schedule jobs this maps to ACA `parallelism` (replicas launched per scheduled run).')
 param maxExecutions int = 10
 param cpu string = '0.5'
 param memoryGi string = '1.0Gi'
@@ -66,6 +69,10 @@ resource job 'Microsoft.App/jobs@2025-01-01' = {
       ]
       scheduleTriggerConfig: triggerType == 'Schedule' ? {
         cronExpression: cronExpression
+        // Schedule jobs honor parallelism/replicaCompletionCount — NOT min/max executions (those are
+        // an Event-scale concept). A scheduled single-pass module runs ONE replica per fire, so both
+        // are 1; the manifest's maxReplicas is not applicable to schedule cadence (a future sharded
+        // discovery could raise this). min/maxExecutions are intentionally unused here.
         parallelism: 1
         replicaCompletionCount: 1
       } : null

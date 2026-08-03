@@ -6,6 +6,9 @@ consumes: []
 produces: [drift]
 scaleProfile:
   kind: job
+  # Schedule job: runs a single replica per scheduled fire. minReplicas/maxReplicas are not
+  # applicable to schedule cadence (jobs are scale-to-zero between runs) and are kept for schema
+  # consistency only; the deployed job uses parallelism/replicaCompletionCount = 1.
   minReplicas: 0
   maxReplicas: 5
   triggers:

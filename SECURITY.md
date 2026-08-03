@@ -46,6 +46,31 @@ The Bicep emits **no keys or connection strings** as outputs. Do **not** place a
 or Azure credentials, in GitHub secrets
 or in the workflow.
 
+### Release identity — required least‑privilege roles
+
+The six variables above are **not sufficient on their own**: the federated OIDC principal
+(`AZURE_CLIENT_ID`) must be **granted Azure RBAC ahead of the first release**, or a fresh deploy
+will fail. Grant the **narrowest** roles that cover what each job does, scoped as tightly as
+possible (prefer the target resource group; subscription scope only where a role can't be RG‑scoped):
+
+| Capability the release needs | Role (least privilege) | Suggested scope |
+|------------------------------|------------------------|-----------------|
+| Create the resource group (`bootstrap`) — skip if the RG is pre‑created | **Contributor** (RG create is subscription‑level) | Subscription |
+| Create the Azure Container Registry (`bootstrap`) | **Contributor** | Resource group |
+| Push images to ACR data plane (`build-images`) | **AcrPush** | The ACR |
+| Create/update the RBAC role assignments the Bicep declares (AcrPull, Storage Queue Data Contributor, Key Vault Secrets User) | **Role Based Access Control Administrator** (`Microsoft.Authorization/roleAssignments/write`) | Resource group |
+| Create/update Container Apps, Jobs, and the managed environment (`deploy-infra`) | **Container Apps Contributor** (or resource‑group **Contributor**) | Resource group |
+
+Notes:
+- If the resource group is created out‑of‑band, drop the subscription‑scoped **Contributor** and
+  grant everything at the **resource group** scope for tighter least privilege.
+- **Role Based Access Control Administrator** is required because the Bicep creates role
+  assignments; plain Contributor cannot write `roleAssignments`. Constrain it to the RG (and, where
+  supported, condition it to only the specific role definitions above).
+- These grants are for the **deployment identity** only. Runtime stays keyless via the user‑assigned
+  Managed Identity and the AcrPull / Storage Queue Data Contributor / Key Vault Secrets User
+  assignments the Bicep creates.
+
 ## Fail‑closed behavior
 
 - Unknown or invalid **pack signature** → refuse to execute.

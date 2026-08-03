@@ -24,6 +24,8 @@ _MANIFEST = ModuleManifest(
     produces=["drift", "Finding[]"],
     scaleProfile=ScaleProfile(
         kind=ModuleKind.job,
+        # Schedule job: minReplicas is N/A (schedule jobs scale to zero between runs); maxReplicas
+        # maps to the ACA job `parallelism` (replicas launched per scheduled run). See infra/bicep.
         minReplicas=0,
         maxReplicas=5,
         triggers=[ScaleTrigger(type="cron", metadata={"schedule": "0 3 * * *"})],

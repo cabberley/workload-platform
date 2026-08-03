@@ -97,18 +97,18 @@ module serviceApps 'modules/module-app.bicep' = [for m in serviceModules: {
 // ======================================================================================
 // Job modules (kind: job) — ACA Jobs, scale-to-zero, each with its own trigger.
 // Mirrors src/modules/{discovery,quality_checks,reassessments,dependency_graph}/manifest.yaml.
-//   discovery       : min 0 max 10 cpu 0.5 mem 1.0Gi  triggers cron(0 */6 * * *) + azure-queue(discovery)
-//   quality_checks  : min 0 max 30 cpu 0.5 mem 1.0Gi  triggers azure-queue(assessments)
-//   reassessments   : min 0 max 5  cpu 0.5 mem 1.0Gi  triggers cron(0 3 * * *)
-//   dependency_graph: min 0 max 10 cpu 0.5 mem 1.0Gi  triggers azure-queue(dependency)
+//   discovery       : job(schedule) parallelism 10 cpu 0.5 mem 1.0Gi  triggers cron(0 */6 * * *) + api-invoked
+//   quality_checks  : job(event) exec 0->30 cpu 0.5 mem 1.0Gi  triggers azure-queue(assessments)
+//   reassessments   : job(schedule) parallelism 5  cpu 0.5 mem 1.0Gi  triggers cron(0 3 * * *)
+//   dependency_graph: job(event) exec 0->10 cpu 0.5 mem 1.0Gi  triggers azure-queue(dependency)
 //
-// A single ACA Job has ONE trigger type. Queue-only jobs use Event + a keyless azure-queue scaler.
-// Cron jobs use the native Schedule trigger with the exact cronExpression (a KEDA cron scaler does
-// NOT mean "run once on schedule").
+// Schedule jobs use the native cron trigger; maxExecutions maps to ACA `parallelism` (see
+// module-job.bicep). Event (queue-only) jobs use a keyless azure-queue KEDA scaler.
 //
-// TODO(human): discovery declares BOTH a cron and an azure-queue trigger. It is deployed here as a
-// native Schedule job for its periodic 0 */6 cadence; on-demand/event runs (off the `discovery`
-// queue) are to be triggered by the API core starting the Job (or enqueuing) — wire that later.
+// TODO(human): discovery declares a cron trigger AND an `api-invoked` (on-demand) trigger. The
+// periodic 0 */6 cadence is the native Schedule below; on-demand runs are started by the API core
+// invoking this Job (control-plane `job start`) — wire that API path later. There is deliberately
+// no azure-queue trigger for discovery, so nothing is silently dropped.
 // ======================================================================================
 var jobModules = [
   {
