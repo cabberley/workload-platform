@@ -395,6 +395,78 @@ def test_ops_null_runbook_is_valid() -> None:
     assert validate_pack(pack) == []
 
 
+# --- Ops: issue #52 additive advisory `remediations` (routing consumers unaffected) -----------
+
+def test_ops_remediation_only_pack_is_valid() -> None:
+    # A remediation-only Ops pack (no default/routes) must validate — the broadened anyOf admits it.
+    pack = _load(_SHIPPED["ops"])
+    pack["body"] = {"remediations": {
+        "odb": [{"description": "Check failover."}],
+        "web": [{"description": "Check probes.", "runbook": "https://aka.ms/x",
+                 "escalateSeverity": "high"}],
+    }}
+    assert validate_pack(pack) == []
+
+
+def test_ops_routing_only_pack_still_valid_alerts_unaffected() -> None:
+    # The existing routing-only shape (no remediations) must remain valid unchanged.
+    pack = _load(_SHIPPED["ops"])
+    pack["body"] = {"routes": {"high": "email", "critical": "page"}}
+    assert validate_pack(pack) == []
+
+
+def test_ops_routing_and_remediation_together_is_valid() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"*": [{"description": "Catch-all advisory."}]}
+    assert validate_pack(pack) == []
+
+
+def test_ops_shipped_synthetic_remediation_pack_validates() -> None:
+    pack = _load(CONTENT / "ops" / "synthetic-remediation-advisory.json")
+    assert validate_pack(pack) == []
+
+
+def test_synthetic_remediation_pack_scoped_to_fake_workload_only() -> None:
+    # MED 3: the clearly-fake pack must NOT resolve for any real workload (e.g. 'epic') — it is
+    # scoped to a synthetic, non-real target so fake advice can never surface in a real deployment.
+    from packs_engine.engine import PacksEngine
+    from shared.contracts import PackType
+
+    engine = PacksEngine(CONTENT)
+    epic_ids = {p.manifest.id for p in engine.load_for_workload("epic", PackType.ops)}
+    demo_ids = {
+        p.manifest.id
+        for p in engine.load_for_workload("acme-remediation-demo", PackType.ops)
+    }
+    assert "synthetic-remediation-advisory" not in epic_ids
+    assert "synthetic-remediation-advisory" in demo_ids
+
+
+def test_ops_remediation_executable_field_rejected() -> None:
+    # additionalProperties:false on a step means an executable-looking field fails closed.
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": [{"description": "ok", "command": "rm -rf /"}]}
+    assert validate_pack(pack)
+
+
+def test_ops_remediation_missing_description_rejected() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": [{"runbook": "https://aka.ms/x"}]}
+    assert validate_pack(pack)
+
+
+def test_ops_remediation_oversized_step_list_rejected() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": [{"description": f"s{i}"} for i in range(21)]}
+    assert validate_pack(pack)
+
+
+def test_ops_remediation_empty_category_list_rejected() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": []}
+    assert validate_pack(pack)
+
+
 # --- Structural fail-closed cases -------------------------------------------------------------
 
 def test_unknown_pack_type_rejected() -> None:

@@ -22,6 +22,13 @@ from modules.aiops.rca import (
     correlate_rca,
     correlate_root_cause,
 )
+from modules.aiops.remediation import (
+    RemediationTable,
+    extract_root_cause_node_id,
+    node_category,
+    parse_remediation_table,
+    propose_remediation,
+)
 from shared.blast_radius import blast_radius
 from shared.contracts import (
     AgentResponse,
@@ -650,6 +657,78 @@ def _resolve_workloads(state: ReadableState | None, scope: dict[str, str]) -> li
     return list(state.list_workloads())
 
 
+class _OpsPackLike(Protocol):
+    """Structural view of a verified Ops pack: manifest (provenance) + a body with remediations."""
+
+    @property
+    def manifest(self) -> _PackManifestLike: ...
+
+    @property
+    def body(self) -> dict[str, Any]: ...
+
+
+class _OpsPacksEngineLike(Protocol):
+    """The narrow packs-engine slice for loading verified Ops packs (same trust gate as telemetry).
+
+    ``load_for_workload`` verifies each pack's hash/signature **before** returning it (fail-closed)
+    and filters by ``PackManifest.targets``. We load Ops packs the same verified way the Alerts
+    module does WITHOUT importing that module (module isolation).
+    """
+
+    def load_for_workload(self, workload: str, pack_type: PackType) -> list[_OpsPackLike]: ...
+
+
+def load_ops_remediations(
+    packs: object | None, workload: str
+) -> tuple[list[RemediationTable], list[str]]:
+    """Load verified **Ops Packs** for ``workload`` and parse their advisory ``remediations``.
+
+    Fail-closed (guardrail 4): if the packs engine is absent, or an Ops pack fails verification, we
+    return no tables (⇒ the pure lookup advises support) and surface a note — we never act on an
+    unverified pack. Malformed/oversized remediation sections are rejected by the pure parser and
+    surfaced, never silently accepted. Advisory only — nothing here mutates infrastructure.
+    """
+    if packs is None:
+        return [], []
+    source = cast(_OpsPacksEngineLike, packs)
+    try:
+        loaded = source.load_for_workload(workload, PackType.ops)
+    except Exception:  # unverifiable/unavailable Ops packs -> fail closed, no remediation
+        return [], [
+            f"{workload}: Ops pack(s) failed verification — no remediation, advise support "
+            "(fail-closed)"
+        ]
+    tables: list[RemediationTable] = []
+    notes: list[str] = []
+    for pack in loaded:
+        table, pack_notes = parse_remediation_table(
+            pack.manifest.id, pack.manifest.version, pack.body
+        )
+        notes.extend(pack_notes)
+        if table is not None:
+            tables.append(table)
+    return tables, notes
+
+
+def enrich_rca_with_remediation(
+    rca: AgentResponse,
+    graph: WorkloadGraph | None,
+    tables: list[RemediationTable],
+) -> AgentResponse:
+    """Attach advisory Ops-pack remediation to an RCA, resolving root-cause category at the edge.
+
+    The category is derived from the RCA's asserted root-cause node (its classified Discovery
+    ``role``, via :func:`node_category`); the confidence/verification/no-match gates live in the
+    pure :func:`propose_remediation`. Below the floor RCA asserts no root cause ⇒ no node ⇒ support.
+    """
+    node_id = extract_root_cause_node_id(rca)
+    node = None
+    if node_id and graph is not None:
+        node = next((n for n in graph.nodes if n.id == node_id), None)
+    category = node_category(node)
+    return propose_remediation(rca, root_cause_category=category, tables=tables)
+
+
 class AiopsModule(Module):
     @property
     def manifest(self) -> ModuleManifest:
@@ -719,7 +798,20 @@ class AiopsModule(Module):
             # Graph-wide, multi-detection correlation (issue #50): one correlated RCA per workload's
             # active detection set. Single-finding sets preserve the original single-node semantics.
             if workload_detections:
-                rca_responses.append(correlate_root_cause(workload_detections, graph))
+                rca = correlate_root_cause(workload_detections, graph)
+                # Advisory-only remediation (issue #52): enrich the confidence-gated RCA with steps
+                # sourced from verified Ops packs, or advise "call support" (fail-closed). Pack
+                # loading/verification stays at this edge; the mapping is pure. NO infra-mutation.
+                # TODO(human): remediation Ops packs MUST be signature-enforced once the Key Vault
+                # signing key is provisioned (#37/#44). load_ops_remediations already uses the same
+                # verified load_for_workload path as Alerts and fails closed the moment a verifier/
+                # secret is configured; today the default runtime PacksEngine has no verifier, so
+                # local unsigned packs still load (the tracked pre-existing signing gap, out of
+                # scope for #52 — do NOT force enforcement here or CI/dev/packs_studio break).
+                ops_tables, ops_notes = load_ops_remediations(ctx.packs, workload)
+                notes.extend(ops_notes)
+                rca = enrich_rca_with_remediation(rca, graph, ops_tables)
+                rca_responses.append(rca)
             detections.extend(workload_detections)
 
         # Accurate accounting (partial outages preserved): ``sourcesAvailable`` = sources that
@@ -766,8 +858,11 @@ __all__ = [
     "correlate_rca",
     "correlate_root_cause",
     "detect_metric_breach",
+    "enrich_rca_with_remediation",
     "fuse_detections",
+    "load_ops_remediations",
     "load_telemetry_rules",
     "load_windowed_detectors",
+    "propose_remediation",
     "run_windowed_detectors",
 ]
