@@ -1,58 +1,75 @@
 import { useEffect, useState } from "react";
-
-type ModuleManifest = {
-  name: string;
-  displayName: string;
-  kind: "service" | "job";
-  enabled: boolean;
-  scaleProfile: { minReplicas: number; maxReplicas: number };
-};
+import { fetchModules, fetchWorkloads } from "./api/client";
+import type { ModuleManifest } from "./api/types";
+import { useAsync } from "./hooks/useAsync";
+import { WorkloadSelector } from "./panels/WorkloadSelector";
+import { WorkloadView } from "./panels/WorkloadView";
+import { ModulesTable } from "./panels/ModulesTable";
+import { GrafanaPanel } from "./panels/GrafanaPanel";
+import { card } from "./styles";
 
 /**
- * Minimal console: lists the platform's modules and their independent scale ranges.
- * Reads the API read model only (no state writes from the SPA).
+ * In-boundary console. Reads the API read models only (no state writes from the SPA):
+ *  - module list + independent scale ranges
+ *  - a workload's dependency graph, per-node health, and SPOFs ranked by blast radius
+ *  - an optional, config-driven telemetry panel slot
  */
 export function App() {
+  const workloadsState = useAsync<string[]>(fetchWorkloads, []);
+  const [selected, setSelected] = useState<string | null>(null);
+
   const [modules, setModules] = useState<ModuleManifest[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [modulesError, setModulesError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/modules")
-      .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
+    fetchModules()
       .then(setModules)
-      .catch((e) => setError(String(e)));
+      .catch((e: unknown) => setModulesError(e instanceof Error ? e.message : String(e)));
   }, []);
 
+  // Default to the first workload once the list arrives.
+  useEffect(() => {
+    if (selected === null && workloadsState.status === "success" && workloadsState.data.length > 0) {
+      setSelected(workloadsState.data[0]);
+    }
+  }, [selected, workloadsState]);
+
   return (
-    <main style={{ fontFamily: "system-ui, sans-serif", padding: 24, maxWidth: 880 }}>
-      <h1>Workloads Platform</h1>
-      <p>In-boundary discovery, quality, dependency &amp; blast radius, AIOps and alerts.</p>
-      {error && <p style={{ color: "crimson" }}>API unavailable: {error}</p>}
-      <table style={{ borderCollapse: "collapse", width: "100%" }}>
-        <thead>
-          <tr>
-            <th style={th}>Module</th>
-            <th style={th}>Kind</th>
-            <th style={th}>Scale (min→max)</th>
-            <th style={th}>Enabled</th>
-          </tr>
-        </thead>
-        <tbody>
-          {modules.map((m) => (
-            <tr key={m.name}>
-              <td style={td}>{m.displayName}</td>
-              <td style={td}>{m.kind}</td>
-              <td style={td}>
-                {m.scaleProfile.minReplicas} → {m.scaleProfile.maxReplicas}
-              </td>
-              <td style={td}>{m.enabled ? "yes" : "no"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <main
+      style={{ fontFamily: "system-ui, sans-serif", padding: 24, maxWidth: 1280, margin: "0 auto" }}
+    >
+      <h1 style={{ marginBottom: 4 }}>Workloads Platform</h1>
+      <p style={{ color: "#5f6368", marginTop: 0 }}>
+        In-boundary discovery, quality, dependency &amp; blast radius, AIOps and alerts —
+        read-only console.
+      </p>
+
+      <section style={{ ...card, marginBottom: 20 }}>
+        <WorkloadSelector state={workloadsState} selected={selected} onSelect={setSelected} />
+      </section>
+
+      {selected ? (
+        // `key={selected}` remounts the subtree on selection change so every useAsync hook resets
+        // to `loading` synchronously — React discards the previous workload's graph/health/SPOF/drift
+        // state. This guarantees no render can paint one workload's success under another's heading
+        // (fail-closed: a selection change never shows a stale green/all-clear view).
+        <WorkloadView key={selected} workload={selected} />
+      ) : (
+        workloadsState.status === "success" &&
+        workloadsState.data.length > 0 && (
+          <p style={{ color: "#5f6368" }}>Select a workload to view its dependency graph.</p>
+        )
+      )}
+
+      <div style={{ display: "grid", gap: 20, marginTop: 24 }}>
+        <GrafanaPanel />
+
+        <section style={card}>
+          <h2 style={{ marginTop: 0, fontSize: 18 }}>Platform modules</h2>
+          {modulesError && <p style={{ color: "crimson" }}>API unavailable: {modulesError}</p>}
+          <ModulesTable modules={modules} />
+        </section>
+      </div>
     </main>
   );
 }
-
-const th: React.CSSProperties = { textAlign: "left", borderBottom: "2px solid #ddd", padding: 8 };
-const td: React.CSSProperties = { borderBottom: "1px solid #eee", padding: 8 };
