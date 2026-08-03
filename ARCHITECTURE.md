@@ -157,12 +157,40 @@ Both Microsoft and the customer can see and **pin which pack version runs agains
 |---------|--------|------|
 | API | **FastAPI + Pydantic** | Typed contracts = agent‑friendly |
 | Modules/worker | Python, run as **ACA Jobs/apps** | one entrypoint `cli.worker` |
-| Web | **React + Vite + TypeScript** | read models + graph/blast‑radius views |
+| Web | **React + Vite + TypeScript**, responsive‑first | one app serves phone → desktop; PWA‑installable |
 | Telemetry store | **Azure Log Analytics** (KQL) first | Fabric/Data Explorer optional at scale |
 | Dashboards | **Azure Managed Grafana** + workbooks | graph/blast‑radius visual |
 | Compute | **Azure Container Apps** (+ Jobs) | native KEDA scale, scale‑to‑zero |
 | Identity | **Managed Identity** everywhere | keyless |
 | IaC | **Bicep** via **azd** | per‑module templates |
 | Packs registry | signed artifacts | SHA‑256 + HMAC verified |
+
+### Web experience (responsive‑first)
+
+**React + Vite + TypeScript is the right base for *both* mobile and desktop — provided we design
+responsive‑first, not desktop‑first.** The framework choice buys us tooling and type safety; the UX
+comes from the layout discipline below.
+
+- **One responsive app, not two.** A single SPA renders the read models, dependency graph and
+  blast‑radius views across **phone, tablet and desktop** — no separate mobile build. Vite
+  code‑splitting + lazy routes keep the mobile bundle small and first paint fast on cellular.
+- **Responsive layout system.** **MUI (Material UI)** is the default component library — chosen for
+  a multi‑agent build: semantic **typed** components keep independently‑authored modules consistent,
+  ARIA/roles are built in (meets the WCAG AA DoD), and `Grid` / `useMediaQuery` give responsive
+  breakpoints out of the box. One central theme → correct `meta viewport`, ≥44 px touch targets, no
+  hover‑only actions, mobile nav (drawer / bottom bar). Desktop gets density; mobile gets focus.
+  *(Tailwind + shadcn/ui is the sanctioned alternative if a lighter, fully‑custom look is needed.)*
+- **Graph & blast‑radius on small screens.** The graph degrades gracefully — pan/zoom + focus mode
+  on phones, full canvas on desktop — so an **on‑call engineer can triage blast radius from a
+  handset**.
+- **PWA** (`vite-plugin-pwa`): installable, with an offline read cache of the last assessment —
+  native‑feeling without an app‑store build. Wrap with **Capacitor** later only if store presence is
+  actually required.
+- **In‑boundary & keyless holds on the client too.** The SPA is served from inside the customer
+  boundary and signs users in with **Entra ID (MSAL)** — no secrets in the browser; the FastAPI core
+  continues to use **Managed Identity** for all Azure calls. No PHI/PII persists locally beyond an
+  ephemeral, opt‑in read cache.
+- **Accessibility & verification.** Target **WCAG AA**; verify on real devices and DevTools device
+  emulation as part of the UX Engineer's Definition of Done.
 
 See `docs/adr/` for the rationale trail; see the Blueprint (`docs/README.md`) for full depth.
