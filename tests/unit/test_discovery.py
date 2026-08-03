@@ -145,7 +145,11 @@ def test_rows_to_nodes_skips_and_reports_malformed():
 # Pack flattening + pure classify (tier/role/tag-miss).
 # --------------------------------------------------------------------------------------
 def test_definitions_from_packs_inherits_pack_workload():
-    defs = definitions_from_packs(_workload_packs())
+    # Scope to the epic-core pack only: the platform ships multiple workload packs (Epic +
+    # the synthetic bespoke multi-tier example), so this asserts epic-core's OWN definitions
+    # inherit its pack-level ``workload`` rather than assuming a single workload pack exists.
+    epic_packs = [p for p in _workload_packs() if p.manifest.id == "epic-core"]
+    defs = definitions_from_packs(epic_packs)
     assert defs, "epic-core workload pack should yield definitions"
     assert all(d.get("workload") == "epic" for d in defs)
     assert any(d.get("role") == "odb" and d.get("tier") == "database" for d in defs)
