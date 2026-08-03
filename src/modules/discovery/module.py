@@ -71,7 +71,9 @@ class DiscoveryModule(Module):
 
     def run(self, ctx: ModuleContext, *, scope: dict[str, str] | None = None) -> ModuleRunResult:
         scope = scope or {}
-        # Edge I/O (ARG/Kuiper) is injected via ctx in real runs; skeleton returns an empty estate.
+        # Edge I/O (ARG/Kuiper) is injected via ctx in real runs; the skeleton computes an empty
+        # estate. The classified nodes are surfaced on ``estate`` so the API (single writer) can
+        # persist them; real ARG classification arrives in issue #2.
         resources: list[ResourceNode] = []
         definitions: list[dict] = []
         classified = classify(resources, definitions)
@@ -84,4 +86,5 @@ class DiscoveryModule(Module):
             nextActions=["build-dependency-graph"],
         )
         return ModuleRunResult(module=self.name, ok=True, response=response,
+                               estate=classified,
                                extra={"nodeCount": len(classified)})

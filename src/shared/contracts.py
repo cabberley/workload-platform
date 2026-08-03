@@ -177,10 +177,56 @@ class WorkloadGraph(BaseModel):
 
 
 class ModuleRunResult(BaseModel):
-    """Uniform envelope a module returns to the API core."""
+    """Uniform envelope a module returns to the API core.
+
+    ``estate`` and ``graph`` are optional typed carriers so a run's outputs can be handed to the
+    API (the single writer) for persistence without the module writing state itself. Modules
+    populate them in their own issues (#2/#3/#4); the core just persists whatever is present.
+    """
 
     module: str
     ok: bool = True
     findings: list[Finding] = Field(default_factory=list)
+    estate: list[ResourceNode] | None = Field(
+        default=None,
+        description=(
+            "Estate nodes produced by this run (persisted by the API single writer). "
+            "None = this run did not touch the estate; an empty list explicitly CLEARS it."
+        ),
+    )
+    graph: WorkloadGraph | None = Field(
+        default=None,
+        description=(
+            "Dependency graph produced by this run (persisted by the API single writer). "
+            "None = this run did not touch the graph."
+        ),
+    )
     response: AgentResponse | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class DriftReport(BaseModel):
+    """Drift read model: current findings vs the previous snapshot (drives #5 reassessments).
+
+    A finding is "failing" when ``passed is False`` (fail-closed — unknown is not a failure).
+    Estate drift is expressed as node-id deltas between the last snapshot and now.
+    """
+
+    workload: str
+    newFailures: list[Finding] = Field(
+        default_factory=list, description="Failing now, not failing in the previous snapshot"
+    )
+    recovered: list[Finding] = Field(
+        default_factory=list, description="Failing in the previous snapshot, no longer failing"
+    )
+    stillFailing: list[Finding] = Field(
+        default_factory=list, description="Failing in both the previous snapshot and now"
+    )
+    addedNodes: list[str] = Field(
+        default_factory=list,
+        description="Estate node ids present now but absent from the previous snapshot",
+    )
+    removedNodes: list[str] = Field(
+        default_factory=list,
+        description="Estate node ids present in the previous snapshot but gone now",
+    )

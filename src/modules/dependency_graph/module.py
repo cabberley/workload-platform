@@ -94,6 +94,8 @@ class DependencyGraphModule(Module):
 
     def run(self, ctx: ModuleContext, *, scope: dict[str, str] | None = None) -> ModuleRunResult:
         scope = scope or {}
+        # Auto-derived + pack edges arrive in issue #4; the skeleton builds an empty graph and
+        # surfaces it on ``graph`` so the API (single writer) can persist it.
         graph = WorkloadGraph(nodes=[], edges=[])
         findings = spof_findings(graph)
         top = rank_spofs(graph)[:5]
@@ -107,6 +109,7 @@ class DependencyGraphModule(Module):
             nextActions=["route-findings"] if findings else [],
         )
         return ModuleRunResult(module=self.name, ok=True, findings=findings, response=response,
+                               graph=graph,
                                extra={"topSpofs": top})
 
 
