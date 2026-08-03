@@ -1,0 +1,15 @@
+name: quality_checks
+displayName: Quality Checks
+kind: job
+enabled: true
+consumes: [rule]
+produces: [Finding]
+scaleProfile:
+  kind: job
+  minReplicas: 0
+  maxReplicas: 30
+  triggers:
+    - type: azure-queue
+      metadata: { queueName: "assessments" }
+  cpu: 0.5
+  memoryGi: 1.0

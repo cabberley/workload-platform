@@ -1,0 +1,24 @@
+name: pack-validate
+
+# Validate content packs on any change under content/: schema, then signature.
+on:
+  pull_request:
+    paths: ["content/**", "scripts/validate_packs.py", "src/packs_engine/**"]
+  push:
+    branches: [main]
+    paths: ["content/**"]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e .[dev]
+      - name: Validate pack schema + signature
+        env:
+          PYTHONPATH: src
+        run: python scripts/validate_packs.py content

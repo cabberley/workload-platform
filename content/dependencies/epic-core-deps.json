@@ -1,0 +1,17 @@
+{
+  "manifest": {
+    "id": "epic-core-deps",
+    "type": "dependency",
+    "name": "Epic core dependencies",
+    "version": "1.0.0",
+    "targets": ["epic"],
+    "author": "microsoft"
+  },
+  "body": {
+    "edges": [
+      { "source": "role:ecp", "target": "role:odb", "type": "depends_on", "redundant": false },
+      { "source": "role:web", "target": "role:ecp", "type": "depends_on", "redundant": true },
+      { "source": "role:web", "target": "role:lb",  "type": "load_balances", "redundant": true }
+    ]
+  }
+}

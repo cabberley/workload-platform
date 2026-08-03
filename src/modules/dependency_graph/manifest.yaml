@@ -1,0 +1,15 @@
+name: dependency_graph
+displayName: Dependency & Blast Radius
+kind: job
+enabled: true
+consumes: [dependency]
+produces: [WorkloadGraph, spofs]
+scaleProfile:
+  kind: job
+  minReplicas: 0
+  maxReplicas: 10
+  triggers:
+    - type: azure-queue
+      metadata: { queueName: "dependency" }
+  cpu: 0.5
+  memoryGi: 1.0

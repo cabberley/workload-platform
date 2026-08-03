@@ -1,0 +1,21 @@
+{
+  "manifest": {
+    "id": "default-notify",
+    "type": "ops",
+    "name": "Default notification policy",
+    "version": "1.0.0",
+    "targets": [],
+    "author": "microsoft"
+  },
+  "body": {
+    "default": "ticket",
+    "routes": {
+      "info": "none",
+      "low": "ticket",
+      "medium": "ticket",
+      "high": "email",
+      "critical": "page"
+    },
+    "runbook": "https://aka.ms/workloads-platform/runbook"
+  }
+}

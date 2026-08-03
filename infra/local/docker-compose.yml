@@ -1,0 +1,27 @@
+# Local all-up stack for development. CI smoke-tests /api/health against this.
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONPATH: /app/src
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.web
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+  # Example one-shot worker run (a module as it runs in an ACA Job). Not started by default.
+  discovery:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    command: ["--module", "discovery"]
+    profiles: ["workers"]

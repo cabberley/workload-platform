@@ -1,0 +1,20 @@
+{
+  "manifest": {
+    "id": "epic-core",
+    "type": "workload",
+    "name": "Epic on Azure — core estate",
+    "version": "1.0.0",
+    "targets": ["epic"],
+    "author": "microsoft"
+  },
+  "body": {
+    "workload": "epic",
+    "definitions": [
+      { "resourceType": "Microsoft.Compute/virtualMachines", "tagKey": "epic-role", "tagValue": "odb", "tier": "database", "role": "odb" },
+      { "resourceType": "Microsoft.Compute/virtualMachines", "tagKey": "epic-role", "tagValue": "ecp", "tier": "application", "role": "ecp" },
+      { "resourceType": "Microsoft.Compute/virtualMachines", "tagKey": "epic-role", "tagValue": "web", "tier": "presentation", "role": "web" },
+      { "resourceType": "Microsoft.Network/loadBalancers", "tier": "presentation", "role": "lb" },
+      { "resourceType": "Microsoft.Network/applicationGateways", "tier": "presentation", "role": "appgw" }
+    ]
+  }
+}

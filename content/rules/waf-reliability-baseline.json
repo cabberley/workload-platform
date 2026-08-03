@@ -1,0 +1,30 @@
+{
+  "manifest": {
+    "id": "waf-reliability-baseline",
+    "type": "rule",
+    "name": "WAF Reliability baseline",
+    "version": "1.0.0",
+    "targets": [],
+    "author": "microsoft"
+  },
+  "body": {
+    "rules": [
+      {
+        "id": "rel-01-zone-redundancy",
+        "title": "VMs carry an availability-zone tag",
+        "resourceType": "Microsoft.Compute/virtualMachines",
+        "requiredTag": "availability-zone",
+        "severity": "high",
+        "description": "WAF Reliability: critical tiers should be zone-aware for resilience."
+      },
+      {
+        "id": "rel-02-backup",
+        "title": "VMs are marked for backup",
+        "resourceType": "Microsoft.Compute/virtualMachines",
+        "requiredTag": "backup-policy",
+        "severity": "medium",
+        "description": "WAF Reliability: protected workloads should declare a backup policy."
+      }
+    ]
+  }
+}

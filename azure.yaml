@@ -1,0 +1,29 @@
+# azd project manifest — deploys the platform in-boundary (customer subscription).
+# Each module is a separately-scalable Azure Container App / ACA Job; Bicep in infra/bicep
+# stamps one deployment per enabled module from its manifest scaleProfile.
+name: workloads-platform
+metadata:
+  template: workloads-platform@0.1.0
+
+infra:
+  provider: bicep
+  path: infra/bicep
+  module: main
+
+services:
+  api:
+    project: src
+    language: py
+    host: containerapp
+    docker:
+      path: ../infra/docker/Dockerfile.api
+      context: ../
+  web:
+    project: src/web
+    language: js
+    host: containerapp
+    docker:
+      path: ../../infra/docker/Dockerfile.web
+      context: ../../
+  # Module workers are deployed as ACA Jobs by Bicep (see infra/bicep/modules).
+  # They share the worker image built from Dockerfile.worker.

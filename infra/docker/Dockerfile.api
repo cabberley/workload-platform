@@ -1,0 +1,15 @@
+# API image — FastAPI control plane.
+FROM python:3.11-slim AS base
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app/src
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY content ./content
+RUN pip install --no-cache-dir -e .
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD python -c "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/api/health'); sys.exit(0)" || exit 1
+
+CMD ["uvicorn", "api.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "src"]

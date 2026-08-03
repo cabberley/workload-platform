@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Node / web
+node_modules/
+src/web/dist/
+src/web/.vite/
+*.log
+npm-debug.log*
+
+# Azure / azd / IaC
+.azure/
+*.azurecredentials
+azd-*.env
+
+# Packs — signed outputs and local exports (source stays; built artifacts don't)
+content/**/dist/
+*.pack
+*.pack.sig
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Secrets — never commit
+*.pem
+*.key
+*.pfx
+secrets.*
+local.settings.json
+
+# Bicep build output
+infra/bicep/**/*.json
+!infra/bicep/**/*.parameters.json

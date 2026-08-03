@@ -1,0 +1,22 @@
+# CODEOWNERS — small senior core owns everything by default; agents propose, humans approve.
+# Replace @chabberl with the second core reviewer where noted.
+
+*                               @chabberl
+
+# Contracts & architecture (Architect)
+/src/shared/                    @chabberl
+/ARCHITECTURE.md                @chabberl
+/docs/adr/                      @chabberl
+
+# Platform / infra / scaling / workflows (Platform)
+/infra/                         @chabberl
+/.github/                       @chabberl
+/azure.yaml                     @chabberl
+
+# Security & release
+/SECURITY.md                    @chabberl
+/.github/workflows/security.yml @chabberl
+/.github/workflows/release.yml  @chabberl
+
+# Content packs (Pack Author)
+/content/                       @chabberl

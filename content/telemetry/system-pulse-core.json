@@ -1,0 +1,21 @@
+{
+  "manifest": {
+    "id": "system-pulse-core",
+    "type": "telemetry",
+    "name": "Epic System Pulse — core signals",
+    "version": "1.0.0",
+    "targets": ["epic"],
+    "author": "microsoft"
+  },
+  "body": {
+    "signals": [
+      { "name": "odb_latency_ms", "op": "gt", "threshold": 500, "severity": "high", "nodeId": "role:odb" },
+      { "name": "ecp_queue_depth", "op": "gt", "threshold": 1000, "severity": "medium", "nodeId": "role:ecp" },
+      { "name": "web_5xx_rate", "op": "gt", "threshold": 0.05, "severity": "high", "nodeId": "role:web" }
+    ],
+    "logAnalysis": {
+      "enabled": true,
+      "note": "AI log analysis is advisory; detections are confidence-gated and cite evidence."
+    }
+  }
+}

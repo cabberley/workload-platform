@@ -1,0 +1,15 @@
+name: alerts
+displayName: Alerts & Notifications
+kind: service
+enabled: true
+consumes: [ops]
+produces: [notifications]
+scaleProfile:
+  kind: service
+  minReplicas: 1
+  maxReplicas: 10
+  triggers:
+    - type: azure-queue
+      metadata: { queueName: "findings" }
+  cpu: 0.5
+  memoryGi: 1.0

@@ -1,0 +1,13 @@
+# Worker image — runs a single module as an ACA Job (python -m cli.worker --module <name>).
+FROM python:3.11-slim AS base
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app/src
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY content ./content
+RUN pip install --no-cache-dir -e .
+
+# Overridden by the ACA Job (args: --module <name>); discovery is a safe default.
+ENTRYPOINT ["python", "-m", "cli.worker"]
+CMD ["--module", "discovery"]

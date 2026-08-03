@@ -1,0 +1,17 @@
+name: discovery
+displayName: Discovery
+kind: job
+enabled: true
+consumes: [workload]
+produces: [estate]
+scaleProfile:
+  kind: job
+  minReplicas: 0
+  maxReplicas: 10
+  triggers:
+    - type: cron
+      metadata: { schedule: "0 */6 * * *" }
+    - type: azure-queue
+      metadata: { queueName: "discovery" }
+  cpu: 0.5
+  memoryGi: 1.0

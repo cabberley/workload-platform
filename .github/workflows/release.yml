@@ -1,0 +1,127 @@
+name: release
+
+# When a GitHub Release is published:
+#   1. Build the three container images (api · worker · web) and push to Azure Container Registry.
+#   2. Deploy the Bicep infrastructure (infra/bicep/main.bicep) to the target Azure subscription,
+#      wiring the just-built image tags. Each module is stamped as its own scalable ACA app/Job.
+#
+# Auth is keyless via OIDC federation (no cloud secrets in GitHub). Configure these
+# repository/environment values first:
+#   Secrets:   (none required for cloud auth — uses OIDC)
+#   Variables: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#              AZURE_RESOURCE_GROUP, AZURE_LOCATION, ACR_NAME
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build/deploy"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+  id-token: write   # required for OIDC login to Azure
+  packages: write
+
+env:
+  IMAGE_TAG: ${{ github.event.release.tag_name || github.sha }}
+
+jobs:
+  build-images:
+    name: build & push images
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - image: api
+            dockerfile: infra/docker/Dockerfile.api
+            context: .
+          - image: worker
+            dockerfile: infra/docker/Dockerfile.worker
+            context: .
+          - image: web
+            dockerfile: infra/docker/Dockerfile.web
+            context: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Azure login (OIDC, keyless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ vars.ACR_NAME }}.azurecr.io/workloads-platform/${{ matrix.image }}:${{ env.IMAGE_TAG }}
+            ${{ vars.ACR_NAME }}.azurecr.io/workloads-platform/${{ matrix.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-infra:
+    name: deploy Bicep to Azure subscription
+    needs: [build-images]
+    runs-on: ubuntu-latest
+    environment: production   # gate deployments behind an approval if desired
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Azure login (OIDC, keyless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group
+        run: |
+          az group create \
+            --name "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --location "${{ vars.AZURE_LOCATION }}"
+
+      - name: What-if (preview changes)
+        run: |
+          az deployment group what-if \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/bicep/main.bicep \
+            --parameters \
+              location="${{ vars.AZURE_LOCATION }}" \
+              containerRegistry="${{ vars.ACR_NAME }}" \
+              imageTag="${{ env.IMAGE_TAG }}"
+
+      - name: Deploy
+        run: |
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "wp-${{ env.IMAGE_TAG }}" \
+            --template-file infra/bicep/main.bicep \
+            --parameters \
+              location="${{ vars.AZURE_LOCATION }}" \
+              containerRegistry="${{ vars.ACR_NAME }}" \
+              imageTag="${{ env.IMAGE_TAG }}"
+
+      - name: Output endpoints
+        run: |
+          az deployment group show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "wp-${{ env.IMAGE_TAG }}" \
+            --query properties.outputs -o json

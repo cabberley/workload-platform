@@ -1,0 +1,17 @@
+name: aiops
+displayName: AIOps (System Pulse + Azure Monitor)
+kind: service
+enabled: true
+consumes: [telemetry]
+produces: [detections, rca]
+scaleProfile:
+  kind: service
+  minReplicas: 1
+  maxReplicas: 20
+  triggers:
+    - type: azure-queue
+      metadata: { queueName: "telemetry" }
+    - type: cpu
+      metadata: { type: "Utilization", value: "70" }
+  cpu: 1.0
+  memoryGi: 2.0
