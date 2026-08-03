@@ -7,6 +7,17 @@ auto-applied (fail-closed; humans dispose). Escalates to "call support" when con
 """
 from __future__ import annotations
 
+import math
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, Protocol, cast
+
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+
+from modules.aiops.connectors.azure_monitor import to_signals as azure_monitor_to_signals
+from modules.aiops.connectors.system_pulse import FetchResult, Signal
+from modules.aiops.connectors.system_pulse import to_signals as system_pulse_to_signals
+from shared.blast_radius import blast_radius
 from shared.contracts import (
     AgentResponse,
     Finding,
@@ -14,12 +25,15 @@ from shared.contracts import (
     ModuleManifest,
     ModuleRunResult,
     PackType,
+    ResourceNode,
     ScaleProfile,
     ScaleTrigger,
     Severity,
     SourceReference,
+    WorkloadGraph,
 )
 from shared.module_base import Module, ModuleContext
+from shared.state import ReadableState
 
 _MANIFEST = ModuleManifest(
     name="aiops",
@@ -96,6 +110,428 @@ def correlate_rca(finding: Finding, blast_radius_of: dict[str, int]) -> AgentRes
     )
 
 
+# Well-known telemetry source keys in the edge-client registry (``ctx.clients``). Each present
+# source yields ``Signal``-shaped observations; an absent/unavailable source is surfaced, never
+# fabricated over. Adding a source is a registry-key + adapter change, not a contract change.
+_WELL_KNOWN_SOURCES: tuple[str, ...] = ("system_pulse", "azure_monitor")
+
+_ROLE_SELECTOR_PREFIX = "role:"
+
+
+class _PackManifestLike(Protocol):
+    """Structural view of the pack manifest fields we need for provenance."""
+
+    id: str
+    version: str
+
+
+class _TelemetryPackLike(Protocol):
+    """Structural view of a verified telemetry pack: manifest (provenance) + a signals body."""
+
+    @property
+    def manifest(self) -> _PackManifestLike: ...
+
+    @property
+    def body(self) -> dict[str, Any]: ...
+
+
+class _PacksEngineLike(Protocol):
+    """The narrow slice of the packs engine this module depends on (the signature trust gate).
+
+    ``load_for_workload`` verifies each pack's hash/signature **before** returning it (fail-closed)
+    and filters by ``PackManifest.targets`` so an epic telemetry pack never runs against a sap
+    workload. Casting ``ctx.packs`` to this local Protocol keeps ``shared`` decoupled.
+    """
+
+    def load_for_workload(
+        self, workload: str, pack_type: PackType
+    ) -> list[_TelemetryPackLike]: ...
+
+
+class _SignalFetcher(Protocol):
+    """Structural view of a telemetry edge client: one read-only, fail-closed fetch method.
+
+    Both :class:`SystemPulseClient` and :class:`AzureMonitorClient` satisfy this shape and return
+    the shared :class:`FetchResult`, so the module treats every source uniformly.
+    """
+
+    def fetch_raw(self, *, metric_names: Sequence[str] | None = None) -> FetchResult: ...
+
+
+class TelemetryRuleSpec(BaseModel):
+    """Typed, defensively-validated shape of one detection rule from a Telemetry Pack body.
+
+    Structural validation here means a malformed pack signal (bad ``op``, non-numeric
+    ``threshold``, invalid ``severity``, non-scalar shape) is surfaced and skipped rather than
+    crashing the run or silently passing (fail-closed). Unknown keys are ignored (forward-compat).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    op: Literal["gt", "lt"]
+    threshold: float
+    severity: Severity
+    nodeId: str
+
+    @field_validator("name", "nodeId", mode="before")
+    @classmethod
+    def _must_be_str(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            raise ValueError("must be a string")
+        return value
+
+    @field_validator("threshold", mode="before")
+    @classmethod
+    def _must_be_numeric(cls, value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("threshold must be a non-bool number")
+        # Reject NaN / ±inf: a non-finite threshold cannot define a meaningful breach and would
+        # otherwise fabricate detections (e.g. value < +inf is always true) — fail closed.
+        if not math.isfinite(float(value)):
+            raise ValueError("threshold must be finite")
+        return value
+
+
+def _role_from_selector(selector: str) -> str | None:
+    """Resolve a ``role:<name>`` selector to a lowercased role, or ``None`` if not a role selector.
+
+    Telemetry pack ``nodeId`` values are role selectors (like dependency packs). We re-derive this
+    tiny resolver locally rather than importing another module (module isolation).
+    """
+    if not selector.startswith(_ROLE_SELECTOR_PREFIX):
+        return None
+    role = selector[len(_ROLE_SELECTOR_PREFIX):].strip().lower()
+    return role or None
+
+
+def _parse_signal_rule(
+    raw: Any, pack_id: str, pack_version: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate one raw pack signal into a stamped detection rule. Returns ``(rule, note)``.
+
+    Fail-closed: non-mapping entries, structurally-invalid signals, and non-role selectors are
+    skipped with a surfaced note — never raised, never silently passed.
+    """
+    if not isinstance(raw, dict):
+        return None, f"pack {pack_id}: non-mapping signal entry skipped"
+    try:
+        spec = TelemetryRuleSpec.model_validate(raw)
+    except ValidationError as exc:
+        sig_id = raw.get("name", "?")
+        return None, (
+            f"pack {pack_id}: signal {sig_id!r} failed validation "
+            f"({exc.error_count()}) — skipped"
+        )
+    role = _role_from_selector(spec.nodeId)
+    if role is None:
+        return None, (
+            f"pack {pack_id}: signal {spec.name!r} has non-role selector "
+            f"{spec.nodeId!r} — skipped"
+        )
+    rule = {
+        "name": spec.name,
+        "op": spec.op,
+        "threshold": spec.threshold,
+        "severity": spec.severity.value,
+        "role": role,
+        "packId": pack_id,
+        "packVersion": pack_version,
+    }
+    return rule, None
+
+
+def load_telemetry_rules(
+    packs: object | None, workload: str
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Load target-aware Telemetry Packs for ``workload`` and return ``(rules, notes)``.
+
+    Only packs whose ``manifest.targets`` include ``workload`` are loaded (the engine filters), so
+    an epic telemetry pack never detects against a sap estate. Each rule keeps its ``packId`` /
+    ``packVersion`` provenance. Malformed bodies/signals are skipped and surfaced — never raised.
+    """
+    if packs is None:
+        return [], []
+    engine = cast(_PacksEngineLike, packs)
+    rules: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for pack in engine.load_for_workload(workload, PackType.telemetry):
+        body = pack.body
+        raw_signals = body.get("signals") if isinstance(body, dict) else None
+        if not isinstance(raw_signals, list):
+            if isinstance(body, dict) and "signals" in body:
+                notes.append(f"pack {pack.manifest.id}: 'signals' is not a list — skipped")
+            continue
+        for raw in raw_signals:
+            rule, note = _parse_signal_rule(raw, pack.manifest.id, pack.manifest.version)
+            if note is not None:
+                notes.append(note)
+            if rule is not None:
+                rules.append(rule)
+    return rules, notes
+
+
+def _fetch_source_signals(
+    key: str, client: object, metric_names: Sequence[str]
+) -> tuple[bool, list[Signal]]:
+    """Fetch ``Signal``-shaped observations from one well-known edge client. Fail-closed.
+
+    Returns ``(available, signals)``. A source that is unavailable (or unknown) yields
+    ``(False, [])`` so the caller can surface it in ``sourcesUnavailable`` without fabricating data.
+    """
+    fetcher = cast(_SignalFetcher, client)
+    result = fetcher.fetch_raw(metric_names=list(metric_names) or None)
+    if not result.available:
+        return False, []
+    if key == "system_pulse":
+        return True, system_pulse_to_signals(result)
+    if key == "azure_monitor":
+        return True, azure_monitor_to_signals(result)
+    return False, []
+
+
+def _observe_signals(
+    clients: Mapping[str, object], metric_names: Sequence[str]
+) -> tuple[list[Signal], set[str], set[str]]:
+    """Collect observations from every well-known telemetry source present in ``clients``.
+
+    Returns ``(signals, available, unavailable)`` where ``available`` is the set of well-known
+    source keys that were present and returned data, and ``unavailable`` is the set that were
+    absent or returned unavailable — both surfaced upstream, never silently conflated.
+    """
+    signals: list[Signal] = []
+    available: set[str] = set()
+    unavailable: set[str] = set()
+    for key in _WELL_KNOWN_SOURCES:
+        client = clients.get(key)
+        if client is None:
+            unavailable.add(key)
+            continue
+        is_available, source_signals = _fetch_source_signals(key, client, metric_names)
+        if not is_available:
+            unavailable.add(key)
+            continue
+        available.add(key)
+        signals.extend(source_signals)
+    return signals, available, unavailable
+
+
+def _role_nodes(estate: list[ResourceNode]) -> dict[str, list[ResourceNode]]:
+    """Map a lowercased ``role`` to the estate nodes carrying it (selector resolution)."""
+    index: dict[str, list[ResourceNode]] = defaultdict(list)
+    for node in estate:
+        if node.role:
+            index[node.role.lower()].append(node)
+    return index
+
+
+def fuse_detections(
+    rules: list[dict[str, Any]],
+    signals: list[Signal],
+    estate: list[ResourceNode],
+) -> list[Finding]:
+    """Fuse pack **rules** × observed **signals** into detection findings — pure and **order-free**.
+
+    For each rule, resolve its ``role:`` selector to estate nodes; for each observed signal whose
+    ``metric`` matches the rule and whose ``resourceId`` maps (case-insensitively — Azure resource
+    ids are case-insensitive) to a selected estate node, run the pure ``detect_metric_breach`` with
+    the rule's threshold and the node's **canonical** id. Thresholds stay pack-driven, observations
+    stay edge-driven; malformed inputs yield no fabricated detection.
+
+    Collision merge (fully order-independent): several rules/packs and/or several observations can
+    breach the same ``(metric, node)``; they would all produce the same ``detect::<metric>::<node>``
+    id and clobber each other. We emit exactly ONE deterministic detection per ``(metric, node)``:
+
+      * **winning rule** = highest severity, then most-conservative threshold, stable
+        ``(packId, packVersion)`` tie-break;
+      * **cited observation** = the most-extreme breach of the winning rule (max exceedance beyond
+        threshold for ``gt``, min value below threshold for ``lt``), tie-broken by earliest
+        observation timestamp, then highest value, then ``resourceId`` — so the SAME observation is
+        cited regardless of the order signals arrive in;
+      * **every** contributing pack is cited in the finding's evidence (no provenance lost).
+
+    The returned list is sorted by finding id (``detect::<metric>::<node>``) so the output order is
+    independent of rule/signal input order.
+    """
+    role_nodes = _role_nodes(estate)
+    by_metric: dict[str, list[Signal]] = defaultdict(list)
+    for signal in signals:
+        by_metric[signal.metric].append(signal)
+
+    # Group breaching (rule, signal) candidates by (metric name, canonical estate node id).
+    groups: dict[tuple[str, str], list[tuple[dict[str, Any], Signal]]] = defaultdict(list)
+    for rule in rules:
+        nodes = role_nodes.get(rule["role"], [])
+        if not nodes:
+            continue
+        canonical = {node.id.casefold(): node.id for node in nodes}
+        for signal in by_metric.get(rule["name"], ()):
+            node_id = canonical.get(signal.resourceId.casefold())
+            if node_id is None:
+                continue
+            if detect_metric_breach(_breach_input(rule, signal, node_id)) is None:
+                continue
+            groups[(rule["name"], node_id)].append((rule, signal))
+
+    detections = [
+        _merge_candidates(node_id, candidates) for (_metric, node_id), candidates in groups.items()
+    ]
+    detections.sort(key=lambda finding: finding.id)
+    return detections
+
+
+def _breach_input(rule: dict[str, Any], signal: Signal, node_id: str) -> dict[str, Any]:
+    """Build the ``detect_metric_breach`` input for one rule × observation on a canonical node."""
+    return {
+        "name": rule["name"],
+        "value": signal.value,
+        "op": rule["op"],
+        "threshold": rule["threshold"],
+        "nodeId": node_id,  # canonical estate id, not the raw signal casing
+        "severity": rule["severity"],
+    }
+
+
+_SEVERITY_ORDER: tuple[Severity, ...] = (
+    Severity.info,
+    Severity.low,
+    Severity.medium,
+    Severity.high,
+    Severity.critical,
+)
+
+
+def _severity_rank(value: str) -> int:
+    """Rank a severity string; unknown values sort lowest (fail-closed, never crashes)."""
+    try:
+        return _SEVERITY_ORDER.index(Severity(value))
+    except (ValueError, TypeError):
+        return -1
+
+
+def _conservativeness(rule: dict[str, Any]) -> float:
+    """How eagerly a rule trips: for ``gt`` a lower threshold is more conservative, for ``lt`` a
+    higher one is. Higher return value ⇒ more conservative ⇒ preferred winner."""
+    threshold = float(rule["threshold"])
+    return -threshold if rule["op"] == "gt" else threshold
+
+
+def _winner_rule(rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pick the deterministic winning rule.
+
+    Priority (highest first): severity, then most-conservative threshold, then pack provenance
+    ``(packId, packVersion)``. Those keep the semantics. The final keys ``(op, threshold, name)``
+    form a total order over the rule identity so two rules can never compare equal unless they are
+    truly identical — this breaks the residual tie between e.g. same-pack ``gt 0`` and ``lt 0``
+    rules whose severity and conservativeness scores coincide, making the winner input-order-free.
+    """
+    best = max((_severity_rank(r["severity"]), _conservativeness(r)) for r in rules)
+    tied = [r for r in rules if (_severity_rank(r["severity"]), _conservativeness(r)) == best]
+    tied.sort(
+        key=lambda r: (
+            str(r.get("packId") or ""),
+            str(r.get("packVersion") or ""),
+            str(r["op"]),
+            float(r["threshold"]),
+            str(r["name"]),
+        )
+    )
+    return tied[0]
+
+
+def _cited_observation(rule: dict[str, Any], signals: list[Signal]) -> Signal:
+    """Pick the deterministic observation to cite: the most-extreme breach of ``rule``.
+
+    Exceedance = ``value - threshold`` for ``gt`` and ``threshold - value`` for ``lt`` (larger ⇒
+    more extreme). Ties break by earliest observation timestamp, then highest value, then
+    ``resourceId`` — so the same observation is always cited regardless of input order.
+    """
+    threshold = float(rule["threshold"])
+    op = rule["op"]
+
+    def exceedance(signal: Signal) -> float:
+        return signal.value - threshold if op == "gt" else threshold - signal.value
+
+    most_extreme = max(exceedance(signal) for signal in signals)
+    tied = [signal for signal in signals if exceedance(signal) == most_extreme]
+    tied.sort(key=lambda signal: (signal.timestamp, -signal.value, signal.resourceId))
+    return tied[0]
+
+
+def _merge_candidates(
+    node_id: str, candidates: list[tuple[dict[str, Any], Signal]]
+) -> Finding:
+    """Merge same-``(metric, node)`` breaching candidates into one deterministic detection.
+
+    Deterministic in both the winning rule and the cited observation (see :func:`fuse_detections`),
+    so the emitted finding — including its evidence value — is identical under any input order.
+    Every contributing pack is cited in the finding's evidence (provenance is never lost).
+    """
+    distinct_rules: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for rule, _signal in candidates:
+        if id(rule) not in seen:
+            seen.add(id(rule))
+            distinct_rules.append(rule)
+    winner_rule = _winner_rule(distinct_rules)
+    # Observations that breach the winning rule specifically (non-empty by construction).
+    winner_signals = [signal for rule, signal in candidates if rule is winner_rule]
+    cited = _cited_observation(winner_rule, winner_signals)
+
+    finding = detect_metric_breach(_breach_input(winner_rule, cited, node_id))
+    assert finding is not None  # `cited` breaches `winner_rule` by construction
+
+    contributing = sorted(
+        {
+            (str(rule.get("packId") or ""), str(rule.get("packVersion") or ""))
+            for rule, _signal in candidates
+        }
+    )
+    pack_refs = [
+        SourceReference(kind="pack", id=pack_id, detail=f"version {version}")
+        for pack_id, version in contributing
+        if pack_id
+    ]
+    finding.evidence = list(finding.evidence) + pack_refs
+    finding.packId = winner_rule["packId"]
+    finding.packVersion = winner_rule["packVersion"]
+    if len(contributing) > 1:
+        finding.detail = (
+            f"{finding.detail} Merged from {len(contributing)} telemetry packs; "
+            f"highest-severity rule wins, all sources cited."
+        )
+    return finding
+
+
+def _blast_radius_map(graph: WorkloadGraph | None) -> dict[str, int]:
+    """Blast radius per node id for RCA. ``None`` graph ⇒ empty map ⇒ low-confidence path."""
+    if graph is None:
+        return {}
+    return {node.id: blast_radius(graph, node.id) for node in graph.nodes}
+
+
+def _collect_pack_sources(
+    rules: list[dict[str, Any]],
+    into: dict[tuple[str | None, str | None], SourceReference],
+) -> None:
+    """Accumulate a distinct ``SourceReference`` per Telemetry Pack (id@version) into ``into``."""
+    for rule in rules:
+        key = (rule.get("packId"), rule.get("packVersion"))
+        if key[0] is None or key in into:
+            continue
+        into[key] = SourceReference(kind="pack", id=str(key[0]), detail=f"version {key[1]}")
+
+
+def _resolve_workloads(state: ReadableState | None, scope: dict[str, str]) -> list[str]:
+    """Resolve the workload(s) to inspect: an explicit ``scope['workload']`` wins, else every known
+    workload. Fail-closed to ``[]`` when there is no readable state (guardrail 4)."""
+    if scoped := scope.get("workload"):
+        return [scoped]
+    if state is None:
+        return []
+    return list(state.list_workloads())
+
+
 class AiopsModule(Module):
     @property
     def manifest(self) -> ModuleManifest:
@@ -103,14 +539,92 @@ class AiopsModule(Module):
 
     def run(self, ctx: ModuleContext, *, scope: dict[str, str] | None = None) -> ModuleRunResult:
         scope = scope or {}
-        signals: list[dict] = []
-        findings = [f for f in (detect_metric_breach(s) for s in signals) if f is not None]
+        state = ctx.state
+        workloads = _resolve_workloads(state, scope)
+
+        detections: list[Finding] = []
+        rca_responses: list[AgentResponse] = []
+        notes: list[str] = []
+        sources_available: set[str] = set()
+        sources_unavailable: set[str] = set()
+        sources_observed = False
+        pack_sources: dict[tuple[str | None, str | None], SourceReference] = {}
+
+        if state is None:
+            notes.append("state unavailable — no workloads resolved (fail-closed)")
+
+        for workload in workloads:
+            if state is None:
+                continue  # fail-closed: no readable estate/graph → detect nothing
+            if ctx.packs is None:
+                notes.append(f"{workload}: packs engine unavailable — skipped")
+                continue
+
+            rules, rule_notes = load_telemetry_rules(ctx.packs, workload)
+            notes.extend(rule_notes)
+            _collect_pack_sources(rules, pack_sources)
+            if not rules:
+                continue  # no telemetry thresholds for this workload
+
+            metric_names = sorted({str(rule["name"]) for rule in rules})
+            signals, available, unavailable = _observe_signals(ctx.clients, metric_names)
+            sources_observed = True
+            sources_available.update(available)
+            sources_unavailable.update(unavailable)
+            if not signals:
+                notes.append(f"{workload}: no telemetry observed from any source")
+                continue
+
+            workload_detections = fuse_detections(rules, signals, state.get_estate(workload))
+            blast_of = _blast_radius_map(state.get_graph(workload))
+            for finding in workload_detections:
+                if finding.nodeId is not None:
+                    finding.blastRadius = blast_of.get(finding.nodeId, 0)
+                rca_responses.append(correlate_rca(finding, blast_of))
+            detections.extend(workload_detections)
+
+        # Accurate accounting (partial outages preserved): ``sourcesAvailable`` = sources that
+        # returned data for at least one observed workload; ``sourcesUnavailable`` = sources absent
+        # or that failed for at least one observed workload — we do NOT subtract available, so a
+        # source that succeeded for one workload and failed for another stays visible in both.
+        # ``sourcesPartial`` = the intersection: succeeded somewhere AND failed somewhere, so an
+        # operator can act on an intermittent/partial outage. If nothing was observed at all (no
+        # state/packs/rules) every well-known source is reported unavailable.
+        if not sources_observed:
+            sources_unavailable = set(_WELL_KNOWN_SOURCES)
+        sources_partial = sources_available & sources_unavailable
         response = AgentResponse(
             agentName="aiops",
             taskType="proactive-detect",
-            inputSummary=f"scope={scope or 'all'}; signals={len(signals)}",
-            findings=[f"{len(findings)} detection(s)"],
+            inputSummary=(
+                f"scope={scope or 'all'}; workloads={len(workloads)}; "
+                f"sources={len(sources_available)}; detections={len(detections)}"
+            ),
+            findings=[f"{len(detections)} detection(s)"],
+            risks=[f.title for f in detections],
+            # Advisory only: detections are routed to auto-RCA; a human disposes remediation.
+            recommendations=["route detections to auto-rca"] if detections else [],
+            sourceReferences=list(pack_sources.values()),
             confidence=1.0,
-            nextActions=["auto-rca"] if findings else [],
+            nextActions=["auto-rca"] if detections else [],
         )
-        return ModuleRunResult(module=self.name, ok=True, findings=findings, response=response)
+        extra: dict[str, Any] = {
+            "rca": [r.model_dump(mode="json") for r in rca_responses],
+            "surfacedNotes": notes,
+            "sourcesAvailable": sorted(sources_available),
+            "sourcesUnavailable": sorted(sources_unavailable),
+            "sourcesPartial": sorted(sources_partial),
+            "packSources": [ref.model_dump(mode="json") for ref in pack_sources.values()],
+        }
+        return ModuleRunResult(
+            module=self.name, ok=True, findings=detections, response=response, extra=extra
+        )
+
+
+__all__ = [
+    "AiopsModule",
+    "correlate_rca",
+    "detect_metric_breach",
+    "fuse_detections",
+    "load_telemetry_rules",
+]
