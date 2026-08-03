@@ -6,12 +6,17 @@ consumes: [workload]
 produces: [estate]
 scaleProfile:
   kind: job
+  # Schedule job: runs a single replica per scheduled fire. minReplicas/maxReplicas are not
+  # applicable to schedule cadence (jobs are scale-to-zero between runs) and are kept for schema
+  # consistency only; the deployed job uses parallelism/replicaCompletionCount = 1.
   minReplicas: 0
   maxReplicas: 10
   triggers:
     - type: cron
       metadata: { schedule: "0 */6 * * *" }
-    - type: azure-queue
-      metadata: { queueName: "discovery" }
+    # On-demand runs are started by the API core invoking the job (control-plane `job start`),
+    # NOT a KEDA queue scaler — so there is no azure-queue trigger to deploy.
+    - type: api-invoked
+      metadata: {}
   cpu: 0.5
   memoryGi: 1.0

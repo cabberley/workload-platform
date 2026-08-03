@@ -26,11 +26,14 @@ _MANIFEST = ModuleManifest(
     produces=["estate", "ResourceNode[]"],
     scaleProfile=ScaleProfile(
         kind=ModuleKind.job,
+        # Schedule job: minReplicas is N/A (schedule jobs scale to zero between runs); maxReplicas
+        # maps to the ACA job `parallelism` (replicas launched per scheduled run). See infra/bicep.
         minReplicas=0,
         maxReplicas=10,
         triggers=[
             ScaleTrigger(type="cron", metadata={"schedule": "0 */6 * * *"}),
-            ScaleTrigger(type="azure-queue", metadata={"queueName": "discovery"}),
+            # On-demand runs are API-invoked (control-plane `job start`), not a KEDA queue scaler.
+            ScaleTrigger(type="api-invoked", metadata={}),
         ],
         cpu=0.5,
         memoryGi=1.0,
