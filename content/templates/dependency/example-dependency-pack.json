@@ -1,0 +1,26 @@
+{
+  "manifest": {
+    "id": "example-dependency-pack",
+    "type": "dependency",
+    "name": "Example Dependency pack — REPLACE ME",
+    "version": "0.1.0",
+    "targets": [],
+    "author": "your-org"
+  },
+  "body": {
+    "edges": [
+      {
+        "source": "role:example-app",
+        "target": "role:example-db",
+        "type": "depends_on",
+        "redundant": false
+      },
+      {
+        "source": "role:example-web",
+        "target": "role:example-app",
+        "type": "depends_on",
+        "redundant": true
+      }
+    ]
+  }
+}

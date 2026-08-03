@@ -1,0 +1,29 @@
+{
+  "manifest": {
+    "id": "example-workload-pack",
+    "type": "workload",
+    "name": "Example Workload pack — REPLACE ME",
+    "version": "0.1.0",
+    "targets": [],
+    "author": "your-org"
+  },
+  "body": {
+    "workload": "example-workload",
+    "definitions": [
+      {
+        "resourceType": "Example.ResourceProvider/replaceMeType",
+        "tagKey": "example-role",
+        "tagValue": "db",
+        "tier": "database",
+        "role": "db"
+      },
+      {
+        "resourceType": "Example.ResourceProvider/replaceMeType",
+        "tagKey": "example-role",
+        "tagValue": "app",
+        "tier": "application",
+        "role": "app"
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "manifest": {
+    "id": "multi-tier-web-app",
+    "type": "dependency",
+    "name": "Generic multi-tier web application dependencies",
+    "version": "1.0.0",
+    "targets": ["multi-tier-demo"],
+    "author": "microsoft"
+  },
+  "body": {
+    "edges": [
+      { "source": "role:web", "target": "role:lb",  "type": "load_balances", "redundant": true },
+      { "source": "role:web", "target": "role:app", "type": "depends_on",    "redundant": true },
+      { "source": "role:app", "target": "role:db",  "type": "depends_on",    "redundant": false }
+    ]
+  }
+}
