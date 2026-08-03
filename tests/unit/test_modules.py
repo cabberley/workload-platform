@@ -3,7 +3,7 @@ from modules.alerts.module import route, weight_by_blast_radius
 from modules.discovery.module import classify
 from modules.quality_checks.module import evaluate_rule
 from shared.contracts import Finding, ResourceNode, Severity
-from shared.module_base import ModuleContext, build_default_registry
+from shared.module_base import Module, ModuleContext, build_default_registry, run_module
 
 
 def test_registry_has_six_modules():
@@ -54,3 +54,28 @@ def test_alerts_escalate_by_blast_radius():
     decision = route(f, {"routes": {"critical": "page"}, "default": "ticket"})
     assert decision["channel"] == "page"
     assert decision["severity"] == "critical"
+
+
+def test_context_clients_registry_defaults_empty_and_carries_injected():
+    # Edge-client registry: empty by default, keyed lookup when injected (DI seam for #2/#4/#7).
+    assert ModuleContext().clients == {}
+    fake = object()
+    ctx = ModuleContext(clients={"resource_graph": fake})
+    assert ctx.clients["resource_graph"] is fake
+
+
+def test_run_module_passes_clients_through_to_the_module():
+    seen: dict[str, object] = {}
+
+    class ClientProbe(Module):
+        @property
+        def manifest(self):  # type: ignore[override]
+            return build_default_registry().get("discovery").manifest
+
+        def run(self, ctx, *, scope=None):
+            seen.update(ctx.clients)
+            return build_default_registry().get("discovery").run(ctx, scope=scope)
+
+    fake = object()
+    run_module(ClientProbe(), scope={}, clients={"network": fake})
+    assert seen["network"] is fake

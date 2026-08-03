@@ -10,6 +10,7 @@ Modules must not import one another; they talk through the API core and packs.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 
 from shared.contracts import ModuleManifest, ModuleRunResult
 from shared.state import ReadableState
@@ -23,13 +24,21 @@ class ModuleContext:
 
     ``state`` is a **read-only** ``ReadableState`` view: modules never write shared state
     directly. They submit their ``ModuleRunResult`` to the API core, which is the single writer.
+
+    ``clients`` is an **edge-client registry** keyed by well-known names (e.g. ``"resource_graph"``,
+    ``"network"``, ``"notifier"``). The worker/API injects concrete, keyless Azure/edge clients at
+    the process boundary; a module looks its client up by name and casts to its own local Protocol,
+    so ``shared`` stays decoupled from module-specific client types and pure logic never does I/O.
+    In unit tests, inject fakes via ``ModuleContext(clients={"resource_graph": FakeArg()})``.
     """
 
     def __init__(self, *, packs: object | None = None, state: ReadableState | None = None,
-                 config: dict[str, str] | None = None) -> None:
+                 config: dict[str, str] | None = None,
+                 clients: Mapping[str, object] | None = None) -> None:
         self.packs = packs
         self.state = state
         self.config = config or {}
+        self.clients: Mapping[str, object] = clients or {}
 
 
 class Module(ABC):
@@ -62,15 +71,17 @@ def run_module(
     *,
     scope: dict[str, str] | None = None,
     state: ReadableState | None = None,
+    clients: Mapping[str, object] | None = None,
 ) -> ModuleRunResult:
     """**Compute-only**: run ``module`` and return its ``ModuleRunResult``. Never persists.
 
     Persistence is the exclusive job of the API core (the single writer); this helper only does
     the compute half so the split is explicit. Both the API ``/run`` endpoint (which then commits)
     and the ACA worker (which then POSTs the result to the API) call this — neither writes state
-    from inside the compute step. Modules receive a read-only ``state`` view (or ``None``).
+    from inside the compute step. Modules receive a read-only ``state`` view (or ``None``) and the
+    edge-client registry ``clients`` injected at the process boundary (or ``None``).
     """
-    ctx = ModuleContext(state=state)
+    ctx = ModuleContext(state=state, clients=clients)
     return module.run(ctx, scope=scope)
 
 
