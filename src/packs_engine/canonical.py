@@ -20,9 +20,10 @@ purposes and are intentionally not interchangeable — do not conflate them.
 Included: every field of the pack dict (manifest and body, recursively), EXCEPT the
 volatile integrity fields listed in :data:`EXCLUDED_MANIFEST_FIELDS`.
 
-Excluded (from ``manifest``): ``sha256`` and ``signature``. These are computed/attached
-at signing time and say nothing about *which version* the content is; excluding them
-keeps the digest stable whether the pack is unsigned, signed, or re-signed.
+Excluded (from ``manifest``): ``sha256``, ``signature`` and ``pack_signature``. These are
+computed/attached at signing time (the last being the detached asymmetric signature envelope from
+issue #35) and say nothing about *which version* the content is; excluding them keeps the digest
+stable whether the pack is unsigned, signed, or re-signed.
 
 Determinism is guaranteed by: recursively sorting all mapping keys, compact separators
 (no insignificant whitespace), ``ensure_ascii=False`` with a UTF-8 encode, and rejecting
@@ -36,7 +37,7 @@ import math
 from typing import Any
 
 # Volatile integrity fields on ``manifest`` excluded from version identity.
-EXCLUDED_MANIFEST_FIELDS: frozenset[str] = frozenset({"sha256", "signature"})
+EXCLUDED_MANIFEST_FIELDS: frozenset[str] = frozenset({"sha256", "signature", "pack_signature"})
 
 
 def _normalize(value: Any) -> Any:

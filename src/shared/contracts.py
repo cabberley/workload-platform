@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def _utcnow() -> datetime:
@@ -53,6 +53,33 @@ class PackType(StrEnum):
     ops = "ops"
 
 
+class PackSignature(BaseModel):
+    """Detached, asymmetric signature envelope over a pack's *canonical bytes* (issue #35).
+
+    Self-describing and provenance-bearing so verification needs no external state: it names the
+    ``algorithm``, carries the base64 detached ``signature`` over
+    :func:`packs_engine.canonical.canonical_bytes`, a ``key_id`` hint identifying the signing key
+    (never a secret), and the ``canonical_digest`` (SHA-256 hex over the same canonical bytes) it
+    covers — binding the signature to a specific pack version identity so a tampered pack is
+    rejected fail-closed.
+
+    This is **deliberately distinct** from the legacy HMAC :attr:`PackManifest.signature` (a
+    symmetric hex MAC over the body-only sha256): the two mechanisms are independent gates and are
+    never conflated. Like ``sha256``/``signature``, this envelope is a *volatile integrity* field
+    excluded from version identity (see ``EXCLUDED_MANIFEST_FIELDS``) so signing a pack does not
+    change its version.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    algorithm: str = Field(description="Signature algorithm identifier, e.g. 'ed25519'")
+    signature: str = Field(description="Base64 detached signature over canonical_bytes(pack)")
+    key_id: str = Field(description="Key id / hint identifying the signing key (never a secret)")
+    canonical_digest: str = Field(
+        description="SHA-256 hex over canonical_bytes(pack) this signature covers (identity bind)"
+    )
+
+
 class PackManifest(BaseModel):
     """Metadata + integrity for a signed content pack."""
 
@@ -64,7 +91,14 @@ class PackManifest(BaseModel):
         default_factory=list, description="Workload kinds this applies to (epic, sap, bespoke, ...)"
     )
     sha256: str | None = Field(default=None, description="Content hash; verified before execute")
-    signature: str | None = Field(default=None, description="HMAC signature over sha256")
+    signature: str | None = Field(default=None, description="Legacy HMAC signature over sha256")
+    pack_signature: PackSignature | None = Field(
+        default=None,
+        description=(
+            "Detached asymmetric signature over canonical bytes (issue #35). Independent of and "
+            "kept separate from the legacy HMAC `signature`; excluded from version identity."
+        ),
+    )
     author: str = "microsoft"
 
 
