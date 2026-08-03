@@ -87,6 +87,21 @@ def _telemetry_pack(
     )
 
 
+def _ops_pack(
+    *,
+    pack_id: str = "synthetic-remediation-advisory",
+    version: str = "1.0.0",
+    targets: list[str] | None = None,
+    remediations: dict[str, Any],
+) -> tuple[_FakeManifest, dict[str, Any], PackType]:
+    """A synthetic Ops pack carrying an advisory ``remediations`` table (issue #52)."""
+    return (
+        _FakeManifest(pack_id, version, targets if targets is not None else []),
+        {"remediations": remediations},
+        PackType.ops,
+    )
+
+
 class FakeState:
     """Read-only ``ReadableState`` over one synthetic workload. Records any write attempt."""
 
@@ -331,12 +346,57 @@ def test_run_fusion_happy_path_detection_and_rca() -> None:
     rca = result.extra["rca"]
     assert len(rca) == 1
     assert rca[0]["confidence"] >= RCA_CONFIDENCE_FLOOR
-    assert rca[0]["nextActions"] == ["propose-remediation"]
+    # Issue #52: with NO Ops remediation pack present, a confident RCA is enriched fail-closed —
+    # absent/unverified remediation content ⇒ advise "call support", never a guessed remediation.
+    assert rca[0]["nextActions"] == ["recommend-contact-support"]
     assert result.extra["sourcesUnavailable"] == ["azure_monitor"]
     assert result.extra["packSources"][0]["id"] == "system-pulse-core"
 
 
-def test_run_no_breach_yields_no_detection() -> None:
+def test_run_confident_rca_enriched_with_ops_remediation() -> None:
+    # Issue #52 end-to-end: a confident RCA on the odb node (classified role 'odb' ⇒ category 'odb')
+    # is enriched with the matching Ops-pack advisory steps, each citing pack id + version.
+    packs = FakePacksTargetAware(
+        [
+            _telemetry_pack(signals=[
+                {"name": "odb_latency_ms", "op": "gt", "threshold": 500,
+                 "severity": "high", "nodeId": "role:odb"},
+            ]),
+            _ops_pack(remediations={
+                "odb": [
+                    {"description": "Check the odb failover status.",
+                     "runbook": "https://aka.ms/odb", "escalateSeverity": "high"},
+                ],
+                "*": [{"description": "Capture diagnostics and contact support."}],
+            }),
+        ]
+    )
+    state = FakeState(workload="epic", estate=_odb_estate(), graph=_graph_with_dependent())
+    clients = {"system_pulse": _pulse_source(_sp_raw("odb_latency_ms", 512.0, _ODB_NODE))}
+    result = AiopsModule().run(ModuleContext(packs=packs, state=state, clients=clients))
+
+    rca = result.extra["rca"][0]
+    assert rca["taskType"] == "guided-remediation"
+    # Advisory steps become the next human actions — NOT the internal 'propose-remediation' token,
+    # and NOT 'call support' (a match was found at/above the floor).
+    assert rca["nextActions"] == ["Check the odb failover status."]
+    assert rca["confidence"] >= RCA_CONFIDENCE_FLOOR
+    # Provenance: the source Ops pack id + version is cited.
+    pack_cites = {
+        (r["id"], r["detail"]) for r in rca["sourceReferences"] if r["kind"] == "pack"
+    }
+    assert ("synthetic-remediation-advisory", "version 1.0.0") in pack_cites
+    # The advisory text is present in recommendations.
+    assert any("odb failover" in rec for rec in rca["recommendations"])
+    # MED 4: resource id stays in sourceReferences provenance only — never in advisory free text.
+    assert any(
+        r["kind"] == "resource" and _ODB_NODE in r["id"] for r in rca["sourceReferences"]
+    )
+    assert all("/subscriptions/" not in rec for rec in rca["recommendations"])
+    assert all("/subscriptions/" not in act for act in rca["nextActions"])
+
+
+
     packs = FakePacksTargetAware(
         [_telemetry_pack(signals=[
             {"name": "odb_latency_ms", "op": "gt", "threshold": 500,
