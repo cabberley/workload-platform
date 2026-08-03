@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aegis.microsoft.com/packs/dependency.schema.json",
+  "title": "Dependency Pack body",
+  "description": "Typed dependency edges merged into the workload graph by the Dependency & Blast Radius module.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["edges"],
+  "properties": {
+    "edges": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "target"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "pattern": "^(role|id|type):.+",
+            "description": "Namespaced endpoint: role:<name> | id:<resourceId> | type:<azureType> (dependency_graph/module.py:_resolve_ref)."
+          },
+          "target": {
+            "type": "string",
+            "pattern": "^(role|id|type):.+",
+            "description": "Namespaced endpoint: role:<name> | id:<resourceId> | type:<azureType> (dependency_graph/module.py:_resolve_ref)."
+          },
+          "type": {
+            "anyOf": [
+              { "type": "null" },
+              {
+                "type": "string",
+                "enum": ["depends_on", "load_balances", "replicates_to", "routes_to"]
+              }
+            ],
+            "description": "null/absent is coerced to depends_on (dependency_graph/module.py:_coerce_edge_type); a NON-null value must be a valid EdgeType."
+          },
+          "redundant": {
+            "type": ["boolean", "null"],
+            "description": "null/absent is coerced to False via bool(raw.get('redundant', False)); True if source has redundant peers for target (loss degrades, not downs)."
+          }
+        }
+      }
+    }
+  }
+}
