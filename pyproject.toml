@@ -41,6 +41,7 @@ azure = [
 
 [project.scripts]
 wp-worker = "cli.worker:main"
+wp-packs = "cli.packs_studio:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
