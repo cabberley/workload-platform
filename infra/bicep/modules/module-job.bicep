@@ -37,6 +37,9 @@ param storageName string = ''
 @description('azure-queue KEDA trigger: queue name ("" = none). queueLength uses KEDA default (5).')
 param queueName string = ''
 
+@description('Internal base URL of the API core (single writer) the worker reads state from and submits results to, e.g. https://wp-api.internal.<env>.azurecontainerapps.io. Threaded from the API container-app\'s internal ingress FQDN by main.bicep so it is correct by construction (never a hardcoded host).')
+param apiBaseUrl string = ''
+
 // Assemble this job's KEDA scale rules from its declared triggers (FLAT shape, keyless queue auth).
 var queueRules = empty(queueName) ? [] : [
   {
@@ -51,6 +54,19 @@ var queueRules = empty(queueName) ? [] : [
   }
 ]
 var scaleRules = queueRules
+
+// Worker env: identity + which module to run. WP_API_BASE_URL points the compute-only worker at
+// the API's INTERNAL ingress (the single writer) for both read-back (ApiStateReader) and result
+// submission; it is threaded from the API container-app FQDN by main.bicep. It is only appended
+// when supplied, so this module never bakes in a hostname.
+var baseEnv = [
+  { name: 'AZURE_CLIENT_ID', value: identityClientId }
+  { name: 'WP_MODULE', value: moduleName }
+]
+var apiEnv = empty(apiBaseUrl) ? [] : [
+  { name: 'WP_API_BASE_URL', value: apiBaseUrl }
+]
+var containerEnv = concat(baseEnv, apiEnv)
 
 resource job 'Microsoft.App/jobs@2025-01-01' = {
   name: 'wp-${moduleName}'
@@ -94,10 +110,7 @@ resource job 'Microsoft.App/jobs@2025-01-01' = {
           resources: { cpu: json(cpu), memory: memoryGi }
           args: ['--module', moduleName]
           command: ['python', '-m', 'cli.worker']
-          env: [
-            { name: 'AZURE_CLIENT_ID', value: identityClientId }
-            { name: 'WP_MODULE', value: moduleName }
-          ]
+          env: containerEnv
         }
       ]
     }

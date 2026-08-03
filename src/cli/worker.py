@@ -18,10 +18,12 @@ import sys
 
 import httpx
 
+from cli.state_client import DEFAULT_API_BASE_URL, ApiStateReader
+from cli.wiring import build_client_registry, build_packs_engine
 from shared.module_base import build_default_registry, run_module
 
-# Internal, in-boundary base URL of the API service (compose/ACA service name). Override per env.
-DEFAULT_API_BASE_URL = "http://api:8000"
+# `DEFAULT_API_BASE_URL` is defined in `cli.state_client` (the read client) and re-exported here so
+# the worker's compute (read via HTTP) and write-back (POST results) agree on the API base URL.
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,13 +55,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"available: {', '.join(registry.names())}", file=sys.stderr)
         return 2
 
-    # COMPUTE ONLY — no writable state store here. The module is run with no writable state; it
-    # returns a ModuleRunResult. The API is the ONLY code path that commits it.
-    result = run_module(module, scope=scope)
+    # COMPUTE ONLY — the worker never constructs a writable store. It builds the composition-root
+    # dependencies at the process boundary and injects them: the verified packs engine, the keyless
+    # edge-client registry, and a READ-ONLY `ApiStateReader` (HTTP reads, no write methods) so
+    # prior state can be read without ever mutating it. The module returns a ModuleRunResult; the
+    # API is the ONLY code path that commits it.
+    base_url = os.environ.get("WP_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/")
+    packs = build_packs_engine()
+    clients = build_client_registry()
+    state = ApiStateReader(base_url=base_url)
+    result = run_module(module, scope=scope, state=state, packs=packs, clients=clients)
 
     workload = scope.get("workload")
     if workload:
-        base_url = os.environ.get("WP_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/")
         # TODO(human): authenticate worker->API (Entra/mTLS) — M4. Keyless/internal for MVP.
         response = httpx.post(
             f"{base_url}/api/workloads/{workload}/results",
