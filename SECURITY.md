@@ -22,6 +22,30 @@ Trust is the product. These rules are **non‑negotiable** and are enforced by
 - Secrets that must exist at runtime live in **Key Vault**, referenced by identity.
 - CI uses **OIDC federation** to Azure — no long‑lived cloud credentials in GitHub secrets.
 
+### Keyless release variables (OIDC)
+
+The `release` workflow authenticates to Azure with **OIDC federation** and consumes only
+**non‑secret repository/environment variables** — never cloud credentials:
+
+| Variable | Purpose |
+|----------|---------|
+| `AZURE_CLIENT_ID` | Federated identity client id used for OIDC login (no secret) |
+| `AZURE_TENANT_ID` | Entra tenant id |
+| `AZURE_SUBSCRIPTION_ID` | Target subscription |
+| `AZURE_RESOURCE_GROUP` | Target resource group |
+| `AZURE_LOCATION` | Azure region |
+| `ACR_NAME` | Container Registry name (without `.azurecr.io`) |
+
+Deployment stays keyless end‑to‑end: images are pulled with **AcrPull**, queues are read/written
+with **Storage Queue Data Contributor** (KEDA queue scalers authenticate with the same
+user‑assigned identity — no connection strings), and runtime secrets are read with **Key Vault
+Secrets User** — all via the shared user‑assigned Managed Identity. The Storage account has
+**shared‑key access disabled**, and the Container Apps environment ships logs to **Azure Monitor**
+(routed to Log Analytics via a diagnostic setting) so **no Log Analytics shared key is ever read**.
+The Bicep emits **no keys or connection strings** as outputs. Do **not** place any of these values,
+or Azure credentials, in GitHub secrets
+or in the workflow.
+
 ## Fail‑closed behavior
 
 - Unknown or invalid **pack signature** → refuse to execute.

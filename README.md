@@ -67,6 +67,65 @@ triggers, resources). Modules are deployed as **separate Azure Container Apps** 
 zero when idle. See [`ARCHITECTURE.md`](ARCHITECTURE.md#independent-scaling) and
 `infra/bicep/modules/`.
 
+### Per-module deploy model (Bicep ⇄ manifest)
+
+`infra/bicep/main.bicep` stamps one deployment per module, **mirroring** each
+`src/modules/<name>/manifest.yaml` `scaleProfile` (the manifest is the source of truth). Service
+modules become their own Azure Container App (running the persistent `python -m cli.serve`
+entrypoint, which stays alive and dispatches the module named by `WP_MODULE`); job modules become
+their own Container Apps Job (running `python -m cli.worker`, run-once). Queue triggers are keyless
+KEDA `azure-queue` scalers that authenticate with the shared user-assigned Managed Identity (no
+connection strings; `queueLength` is left at KEDA's default of 5). The values below are exactly what
+the Bicep stamps:
+
+| Module | Kind | min → max | Trigger(s) as stamped |
+|--------|------|-----------|-----------------------|
+| `discovery` | job (Schedule) | 0 → 10 | native cron (`0 */6 * * *`); on-demand `discovery`-queue runs deferred (see note) |
+| `quality_checks` | job (Event) | 0 → 30 | KEDA `azure-queue` (`assessments`) |
+| `reassessments` | job (Schedule) | 0 → 5 | native cron (`0 3 * * *`) |
+| `dependency_graph` | job (Event) | 0 → 10 | KEDA `azure-queue` (`dependency`) |
+| `aiops` | service | 1 → 20 | KEDA `azure-queue` (`telemetry`) + `cpu` (Utilization 70) |
+| `alerts` | service | 1 → 10 | KEDA `azure-queue` (`findings`) |
+
+`discovery`'s manifest declares **both** a cron and an `azure-queue` trigger, but a single ACA Job
+has one trigger type. It is deployed as a native **Schedule** job for its periodic 0 */6 cadence;
+on-demand/event runs off the `discovery` queue are triggered by the API core starting the Job (to be
+wired in a later issue — see the `TODO(human)` in `main.bicep`). A KEDA `cron` scaler is *not* used
+to fake a single recurring fire (it holds a desired execution across the window).
+
+The API core and web are deployed alongside the modules but are **not** modules: the API core is
+the single writer and stays modest (1 → 3, http-concurrency scaling). The shared platform
+(`infra/bicep/modules/core.bicep`) provisions the Azure Container Registry, Log Analytics + the
+Container Apps managed environment (app logs go to Azure Monitor and are routed to Log Analytics via
+a diagnostic setting — **no shared key is read**), a Storage account (shared-key access disabled)
+with the queues the triggers reference (`discovery`, `dependency`, `assessments`, `telemetry`,
+`findings`), a Key Vault, the user-assigned Managed Identity, and its keyless role assignments
+(AcrPull, Storage Queue Data Contributor, Key Vault Secrets User). No keys or connection strings are
+emitted as outputs.
+
+## Release & deployment (keyless OIDC)
+
+The [`release`](.github/workflows/release.yml) workflow runs three jobs — `bootstrap` (ensures the
+resource group + ACR exist, so a fresh environment doesn't fail on the first push), `build-images`
+(builds/pushes `api` / `worker` / `web` to ACR), then `deploy-infra` (deploys
+`infra/bicep/main.bicep` with the just-built tags) — all authenticated by **OIDC federation** (no
+cloud secrets in GitHub). Configure these **variables** first (repository-scoped, or scoped to the
+`production` environment that all three jobs use); none are secrets:
+
+| Variable | Purpose |
+|----------|---------|
+| `AZURE_CLIENT_ID` | App/Managed Identity client id federated for OIDC login |
+| `AZURE_TENANT_ID` | Entra tenant id for the login |
+| `AZURE_SUBSCRIPTION_ID` | Target subscription for the deployment |
+| `AZURE_RESOURCE_GROUP` | Resource group the deployment targets (created if absent) |
+| `AZURE_LOCATION` | Azure region for the resource group and resources |
+| `ACR_NAME` | Azure Container Registry name (without `.azurecr.io`) images push/pull from |
+
+All three jobs run in the `production` environment, so the federated credential for
+`AZURE_CLIENT_ID` must trust that environment (and the release event), and the six variables must be
+visible to every job (repository-scoped or `production`-environment-scoped). Cloud auth uses OIDC
+only — do **not** add Azure credentials to GitHub secrets.
+
 ## Getting started (developers)
 
 ```bash

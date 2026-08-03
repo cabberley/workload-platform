@@ -1,5 +1,12 @@
-// module-job.bicep — deploy a `kind: job` module as its own Azure Container Apps Job with its own
-// event/cron scale rule (scale-to-zero). One per job module => modules scale independently.
+// module-job.bicep — deploy a `kind: job` module as its OWN Azure Container Apps Job with its OWN
+// trigger (scale-to-zero). One per job module => modules scale independently.
+//
+//   * triggerType Schedule => native cron cadence (exact cronExpression), no KEDA rules.
+//   * triggerType Event    => KEDA-driven; a keyless azure-queue scaler authenticates with the
+//                             user-assigned Managed Identity (api-version 2025-01-01).
+//
+// NOTE: Job scale rules are FLAT KEDA rules ({ name, type, metadata, identity }) — they are NOT
+// nested under a `custom` wrapper (that wrapper is the Container App shape).
 param location string
 param environmentId string
 param identityId string
@@ -17,12 +24,32 @@ param memoryGi string = '1.0Gi'
 
 @description('Trigger type: Schedule | Event | Manual')
 param triggerType string = 'Event'
+
+@description('Native Schedule cronExpression (used when triggerType == Schedule)')
 param cronExpression string = '0 */6 * * *'
 
-@description('KEDA scale rules for event-triggered jobs (queue, etc.)')
-param scaleRules array = []
+@description('Storage account name backing keyless azure-queue KEDA scalers')
+param storageName string = ''
 
-resource job 'Microsoft.App/jobs@2024-03-01' = {
+@description('azure-queue KEDA trigger: queue name ("" = none). queueLength uses KEDA default (5).')
+param queueName string = ''
+
+// Assemble this job's KEDA scale rules from its declared triggers (FLAT shape, keyless queue auth).
+var queueRules = empty(queueName) ? [] : [
+  {
+    name: 'queue-${queueName}'
+    type: 'azure-queue'
+    identity: identityId
+    metadata: {
+      accountName: storageName
+      queueName: queueName
+      cloud: 'AzurePublicCloud'
+    }
+  }
+]
+var scaleRules = queueRules
+
+resource job 'Microsoft.App/jobs@2025-01-01' = {
   name: 'wp-${moduleName}'
   location: location
   identity: {
