@@ -44,6 +44,43 @@ def test_build_client_registry_includes_system_pulse_when_base_url_configured():
     assert "system_pulse" in registry
 
 
+def test_wired_system_pulse_fail_closed_increments_process_metric():
+    """MED 3: the composition root wires a registry-backed fail-closed observer into System Pulse.
+
+    A real fail-closed fetch (an HTTP error) increments ``connector_fail_closed_total{module=
+    "aiops"}`` on the SAME process registry the API exposes at ``/api/metrics``. Azure-free: we
+    drive the connector's edge with a fake httpx transport, no network, no secret.
+    """
+    import httpx
+
+    from shared.observability import METRIC_CONNECTOR_FAIL_CLOSED, process_metrics
+
+    registry = build_client_registry(
+        config={ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid"}
+    )
+    client = registry["system_pulse"]
+    # Force the edge to fail closed: a fake transport that errors + a resolvable fake token.
+    client._client = httpx.Client(
+        transport=httpx.MockTransport(lambda _req: httpx.Response(503, text="unavailable"))
+    )
+    client._credential_provider = lambda: "fake-read-token"
+
+    proc = process_metrics()
+    before = next(
+        (s.value for s in proc.snapshot().counters if s.name == METRIC_CONNECTOR_FAIL_CLOSED),
+        0,
+    )
+    result = client.fetch_raw()
+    assert result.available is False  # still fails closed
+
+    after = next(
+        s.value
+        for s in proc.snapshot().counters
+        if s.name == METRIC_CONNECTOR_FAIL_CLOSED and s.labels == {"module": "aiops"}
+    )
+    assert after == before + 1
+
+
 def test_build_client_registry_network_absent_without_sdk_even_if_subscription_set():
     # azure-mgmt-network is intentionally not an install requirement; a subscription id alone must
     # not produce a client — the guarded import fails closed and omits the key.

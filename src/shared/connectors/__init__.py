@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from shared.connectors.base import (
     CredentialProvider,
+    FailClosedObserver,
     FetchResult,
     TokenProvider,
     fail_closed,
@@ -32,6 +33,7 @@ from shared.connectors.base import (
 
 __all__ = [
     "CredentialProvider",
+    "FailClosedObserver",
     "FetchResult",
     "TokenProvider",
     "fail_closed",

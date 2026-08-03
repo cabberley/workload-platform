@@ -31,6 +31,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from shared.connectors import (
+    FailClosedObserver,
     FetchResult,
     TokenProvider,
     fail_closed,
@@ -292,12 +293,17 @@ class SystemPulseClient:
         *,
         client: httpx.Client | None = None,
         credential_provider: TokenProvider | None = None,
+        fail_closed_observer: FailClosedObserver | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
     ) -> None:
         self._config = config
         self._client = client
         self._credential_provider = credential_provider
+        # Optional, keyless observer (issue #60): invoked when a fetch fails closed so the event
+        # can be counted at the composition root, without this connector importing any registry.
+        # Default None ⇒ no-op; an observer error never breaks fail-closed (guarded in fail_closed).
+        self._fail_closed_observer = fail_closed_observer
         # Injected so bounded-retry backoff is deterministic and instant in tests; real by default.
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random()  # noqa: S311 - backoff jitter, not crypto
@@ -314,7 +320,10 @@ class SystemPulseClient:
         closed; HTTP status errors and malformed payloads fail closed at once. When no credential
         resolves, **no** HTTP request is made.
         """
-        return fail_closed(lambda: self._fetch(metric_names=metric_names))
+        return fail_closed(
+            lambda: self._fetch(metric_names=metric_names),
+            observer=self._fail_closed_observer,
+        )
 
     def _fetch(self, *, metric_names: Sequence[str] | None) -> FetchResult:
         """Resolve the credential and perform the bounded, retried read. May raise; guarded above.

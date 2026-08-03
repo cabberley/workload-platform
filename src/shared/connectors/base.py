@@ -9,6 +9,7 @@ import os
 import random
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +23,14 @@ _T = TypeVar("_T")
 # free. Either returns ``None`` when it cannot mint a credential — the connector then fails closed.
 TokenProvider = Callable[[], str | None]
 CredentialProvider = Callable[[], object | None]
+
+# An injectable, keyless observer seam for connector fail-closed events (issue #60). A zero-arg
+# callback the composition root/API can wire (e.g. ``lambda: metrics.record_connector_fail_closed(
+# "aiops")``) so a connector failing closed can be *counted* WITHOUT the connector importing the
+# metrics registry or any module reaching into another. Default ``None`` ⇒ no-op (nothing observed,
+# no dependency added). It carries NO data — only the fact that a fail-closed conversion happened —
+# so no body, token, or PII can ride along.
+FailClosedObserver = Callable[[], None]
 
 
 class FetchResult(BaseModel):
@@ -105,7 +114,9 @@ def run_with_retries(
     raise AssertionError("unreachable: run_with_retries exited without return or raise")
 
 
-def fail_closed(fn: Callable[[], FetchResult]) -> FetchResult:
+def fail_closed(
+    fn: Callable[[], FetchResult], *, observer: FailClosedObserver | None = None
+) -> FetchResult:
     """Run an edge callable, converting **any** exception into a fail-closed :class:`FetchResult`.
 
     A successful call is passed through unchanged (including a deliberate ``available=False``
@@ -113,8 +124,16 @@ def fail_closed(fn: Callable[[], FetchResult]) -> FetchResult:
     ``FetchResult(available=False, error=type(exc).__name__)`` — the error **class name only**, so
     no body, message, or token ever crosses the boundary. This is the single home for the
     ``except Exception`` block both connectors used to duplicate.
+
+    ``observer`` is an optional, injectable seam (issue #60): when a fail-closed conversion happens
+    it is invoked so the event can be *counted* (e.g. a metrics counter) without this shared base
+    importing any registry or module. It is guarded so a broken observer never turns a fail-closed
+    edge into a crash. Default ``None`` ⇒ no-op.
     """
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001 - every edge failure must fail closed, class name only
+        if observer is not None:
+            with suppress(Exception):  # observing must never break the fail-closed path
+                observer()
         return FetchResult(available=False, error=type(exc).__name__)

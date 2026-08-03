@@ -6,6 +6,7 @@ codename *Aegis*). This repository implements that blueprint as a buildable scaf
 - **`ARCHITECTURE.md`** (repo root) — binding architecture; how modules scale independently.
 - **`../AGENTS.md`** — the multi-agent build model and roles.
 - **`adr/`** — Architecture Decision Records; one decision per file.
+- **`observability.md`** — platform self-observability: health/readiness, internal metrics, tracing seams.
 - **Blueprint** — kept outside the repo (no customer/proprietary content in git). Key docs:
   - 01 Executive Summary · 02 Solution Architecture · 03 Module Specifications
   - 06 Packs & Content Model · 08 Runtime Agents + Copilot build skills

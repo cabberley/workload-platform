@@ -28,6 +28,7 @@ from typing import Any, cast
 import httpx
 
 from packs_engine.engine import PacksEngine
+from shared.observability import connector_fail_closed_observer
 
 # Env var *names* the composition root reads. Values are supplied at runtime by identity / Key
 # Vault — only the names live in code (keyless).
@@ -180,7 +181,10 @@ def _add_system_pulse(registry: dict[str, object], cfg: Mapping[str, str]) -> No
         from modules.aiops.connectors.system_pulse import SystemPulseClient, SystemPulseConfig
 
         registry["system_pulse"] = SystemPulseClient(
-            SystemPulseConfig(base_url=base_url, token_env=SYSTEM_PULSE_TOKEN_ENV)
+            SystemPulseConfig(base_url=base_url, token_env=SYSTEM_PULSE_TOKEN_ENV),
+            # Keyless observer (issue #60): a real fail-closed fetch increments
+            # connector_fail_closed_total{module="aiops"} on the process registry the API exposes.
+            fail_closed_observer=connector_fail_closed_observer("aiops"),
         )
     except Exception:  # noqa: BLE001 - fail closed: omit the connector, never crash wiring
         return
@@ -224,6 +228,9 @@ def _add_azure_monitor(
                 metric_namespace=metric_namespace,
             ),
             credential_provider=lambda: credential,
+            # Keyless observer (issue #60): a real fail-closed fetch increments
+            # connector_fail_closed_total{module="aiops"} on the process registry the API exposes.
+            fail_closed_observer=connector_fail_closed_observer("aiops"),
         )
     except Exception:  # noqa: BLE001 - fail closed: omit the connector, never crash wiring
         return
