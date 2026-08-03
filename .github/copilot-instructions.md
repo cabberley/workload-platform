@@ -41,6 +41,9 @@ Full depth is in the Blueprint — see `docs/README.md`. `ARCHITECTURE.md` is bi
 - **Python 3.11+, fully typed.** All contracts are **Pydantic** models in `src/shared/contracts.py`.
 - **Pure logic ⟂ I/O.** Detection, scoring, and blast‑radius math are **pure functions** with unit
   tests. Azure SDK calls sit at module edges behind thin clients. This keeps tests Azure‑free.
+- **Connectors** are read‑only, keyless, fail‑closed edge clients. Build them on the shared base in
+  `src/shared/connectors` (fetch envelope, credential resolution, bounded retry‑with‑jitter,
+  fail‑closed wrapper) — don't re‑derive that machinery. See `docs/connectors.md`.
 - **Modules are isolated.** A module under `src/modules/*` must **not import another module**. They
   communicate via the API core and packs. Each implements `Module` from `src/shared/module_base.py`
   and ships a `manifest.yaml` with a real `scaleProfile`.

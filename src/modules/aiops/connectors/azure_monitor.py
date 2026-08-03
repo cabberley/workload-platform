@@ -36,22 +36,30 @@ an injected fake backend.
 """
 from __future__ import annotations
 
+import random
+import time
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from modules.aiops.connectors.system_pulse import (
-    FetchResult,
     Signal,
     SignalMappingError,
     map_signal,
 )
+from shared.connectors import (
+    CredentialProvider,
+    FetchResult,
+    fail_closed,
+    run_with_retries,
+)
 
-# A credential provider mints a keyless ``TokenCredential`` (e.g. a closure over
-# ``DefaultAzureCredential(...)``) or returns ``None`` if it cannot. Kept as an injected callable
+# ``CredentialProvider`` and ``FetchResult`` now live in the shared connector base (issue #45).
+# ``CredentialProvider`` is re-exported here (see ``__all__``) for backward compatibility. A
+# credential provider mints a keyless ``TokenCredential`` (e.g. a closure over
+# ``DefaultAzureCredential(...)``) or returns ``None`` if it cannot; kept as an injected callable
 # so ``azure-identity`` stays an edge-only, non-top-level concern and tests stay Azure-free.
-CredentialProvider = Callable[[], object | None]
 
 # Aggregation columns Azure Monitor returns per data point, in the order we prefer to read them.
 _AGGREGATIONS: tuple[str, ...] = ("average", "total", "maximum", "minimum", "count")
@@ -70,6 +78,13 @@ class AzureMonitorConfig(BaseModel):
     )
     timeout_s: float = Field(default=30.0, gt=0.0)
     credential_scope: str = Field(default="https://management.azure.com/.default")
+    # Bounded retry-with-jitter for transient backend/transport errors (issue #45). Defaults are
+    # conservative and never change fail-closed behaviour: after ``retries`` attempts the edge
+    # still fails closed. Only transient errors are retried (see ``_is_transient_backend``); the
+    # not-wired stub, credential errors and malformed payloads fail closed at once.
+    retries: int = Field(default=3, ge=1, description="Max query attempts (>=1)")
+    base_delay_s: float = Field(default=0.2, gt=0.0, description="Base backoff delay in seconds")
+    max_delay_s: float = Field(default=2.0, gt=0.0, description="Backoff cap in seconds")
 
 
 # --------------------------------------------------------------------------------------
@@ -278,6 +293,32 @@ class _SdkMetricsBackend:
 # --------------------------------------------------------------------------------------
 # Network edge — the ONLY place that performs I/O.
 # --------------------------------------------------------------------------------------
+# Transient error *class names* worth a bounded retry. Matched by name (not import) so no vendor
+# SDK is pulled in at module import time; azure-core's ``ServiceRequestError``/``ServiceResponse
+# Error`` and the builtin connection/timeout errors qualify. The not-wired stub
+# (``AzureMonitorSdkNotWired``), credential-provider errors and malformed payloads do **not**.
+_TRANSIENT_ERROR_NAMES: frozenset[str] = frozenset(
+    {
+        "ServiceRequestError",
+        "ServiceResponseError",
+        "ServiceRequestTimeoutError",
+        "ConnectionError",
+        "ConnectionResetError",
+        "TimeoutError",
+    }
+)
+
+
+def _is_transient_backend(exc: BaseException) -> bool:
+    """Retry only transient backend/transport failures, matched by exception class name.
+
+    The match walks the exception's MRO so a *subclass* of an allowlisted transient error is also
+    retried — e.g. azure-core's ``ServiceResponseTimeoutError`` (a subclass of ``ServiceResponse
+    Error``). Kept name-based so no vendor SDK is imported at module import time.
+    """
+    return any(klass.__name__ in _TRANSIENT_ERROR_NAMES for klass in type(exc).__mro__)
+
+
 class AzureMonitorClient:
     """Thin, read-only Azure Monitor metrics client. Fail-closed; never queries unauthenticated.
 
@@ -292,10 +333,15 @@ class AzureMonitorClient:
         *,
         credential_provider: CredentialProvider | None = None,
         backend: MetricsBackend | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: random.Random | None = None,
     ) -> None:
         self._config = config
         self._credential_provider = credential_provider
         self._backend = backend
+        # Injected so bounded-retry backoff is deterministic and instant in tests; real by default.
+        self._sleep = sleep
+        self._rng = rng if rng is not None else random.Random()  # noqa: S311 - backoff jitter, not crypto
 
     def _resolve_credential(self) -> object | None:
         """Resolve a keyless credential from the injected provider, or ``None``.
@@ -311,24 +357,39 @@ class AzureMonitorClient:
         """The single I/O edge. Read-only metrics query; returns raw payloads or fails closed.
 
         Fails closed (``available=False``, error *class* name only — no body, token, or message) on
-        an unresolvable/raising credential, or any backend/SDK error. When no credential resolves,
-        **no** query is made.
+        an unresolvable/raising credential, or any backend/SDK error. Transient backend/transport
+        errors are retried (bounded, with jitter) before failing closed. When no credential
+        resolves, **no** query is made.
         """
-        try:
-            credential = self._resolve_credential()
-            if credential is None:
-                return FetchResult(available=False, error="NoCredential")
-            backend: MetricsBackend = self._backend or cast(MetricsBackend, _SdkMetricsBackend())
-            names = list(metric_names) if metric_names else list(self._config.metric_names)
+        return fail_closed(lambda: self._fetch(metric_names=metric_names))
+
+    def _fetch(self, *, metric_names: Sequence[str] | None) -> FetchResult:
+        """Resolve the credential, then run the bounded, retried query. May raise; guarded above."""
+        credential = self._resolve_credential()
+        if credential is None:
+            return FetchResult(available=False, error="NoCredential")
+        backend: MetricsBackend = self._backend or cast(MetricsBackend, _SdkMetricsBackend())
+        names = list(metric_names) if metric_names else list(self._config.metric_names)
+
+        def _attempt() -> list[dict[str, Any]]:
             raw = backend.query_metrics(
                 resource_ids=list(self._config.resource_ids),
                 metric_names=names,
                 credential=credential,
                 timeout_s=self._config.timeout_s,
             )
-            return FetchResult(available=True, raw=_coerce_backend_raw(raw))
-        except Exception as exc:  # noqa: BLE001 - every failure (incl. provider) must fail closed
-            return FetchResult(available=False, error=type(exc).__name__)
+            return _coerce_backend_raw(raw)
+
+        raw = run_with_retries(
+            _attempt,
+            attempts=self._config.retries,
+            base_delay_s=self._config.base_delay_s,
+            max_delay_s=self._config.max_delay_s,
+            sleep=self._sleep,
+            rng=self._rng,
+            retry_on=_is_transient_backend,
+        )
+        return FetchResult(available=True, raw=raw)
 
 
 __all__ = [
