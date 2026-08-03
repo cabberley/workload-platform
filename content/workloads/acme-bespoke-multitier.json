@@ -1,0 +1,19 @@
+{
+  "manifest": {
+    "id": "acme-bespoke-multitier",
+    "type": "workload",
+    "name": "ACME Bespoke — generic multi-tier workload (synthetic)",
+    "version": "1.0.0",
+    "targets": ["multi-tier-demo"],
+    "author": "microsoft"
+  },
+  "body": {
+    "workload": "multi-tier-demo",
+    "definitions": [
+      { "resourceType": "Microsoft.Compute/virtualMachines", "tagKey": "acme-tier", "tagValue": "web", "tier": "presentation", "role": "web" },
+      { "resourceType": "Microsoft.Compute/virtualMachines", "tagKey": "acme-tier", "tagValue": "app", "tier": "application", "role": "app" },
+      { "resourceType": "Microsoft.Compute/virtualMachines", "tagKey": "acme-tier", "tagValue": "db",  "tier": "database",     "role": "db" },
+      { "resourceType": "Microsoft.Network/loadBalancers",   "tagKey": "acme-tier", "tagValue": "lb",  "tier": "presentation", "role": "lb" }
+    ]
+  }
+}
