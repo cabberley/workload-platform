@@ -1,0 +1,20 @@
+# gitleaks configuration for the Workloads Platform.
+#
+# Extends the default gitleaks ruleset (so all built-in secret detectors stay
+# active) and adds ONE narrow allowlist: Azure built-in RBAC role-definition
+# GUIDs are public, documented constants (e.g. Key Vault Secrets User =
+# 4633458b-17de-408a-b874-0445c86b69e6), not secrets. The generic
+# secret-keyword heuristic mis-flags them because a variable name contains
+# "Secrets". We exempt ONLY lines that assign a GUID to a *RoleId variable;
+# real credentials are never shaped this way.
+title = "workloads-platform"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Azure built-in RBAC role-definition GUIDs (public constants, not secrets)."
+regexTarget = "line"
+regexes = [
+  '''(?i)RoleId\s*=\s*'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'?''',
+]

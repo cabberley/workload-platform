@@ -1,12 +1,15 @@
 name: release
 
 # When a GitHub Release is published:
-#   1. Build the three container images (api · worker · web) and push to Azure Container Registry.
-#   2. Deploy the Bicep infrastructure (infra/bicep/main.bicep) to the target Azure subscription,
-#      wiring the just-built image tags. Each module is stamped as its own scalable ACA app/Job.
+#   1. bootstrap: ensure the resource group + Azure Container Registry exist (fresh environments).
+#   2. build-images: build the three container images (api · worker · web) and push to ACR.
+#   3. deploy-infra: deploy the Bicep (infra/bicep/main.bicep), wiring the just-built image tags.
+#      Each module is stamped as its own scalable ACA app/Job from its manifest scaleProfile.
 #
 # Auth is keyless via OIDC federation (no cloud secrets in GitHub). Configure these
-# repository/environment values first:
+# repository-scoped (or `production` environment-scoped) values first — all are VARIABLES, not
+# secrets. The federated credential on AZURE_CLIENT_ID must trust every job below (all three run in
+# the `production` environment, so an environment-scoped credential/vars cover them):
 #   Secrets:   (none required for cloud auth — uses OIDC)
 #   Variables: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
 #              AZURE_RESOURCE_GROUP, AZURE_LOCATION, ACR_NAME
@@ -30,9 +33,39 @@ env:
   IMAGE_TAG: ${{ github.event.release.tag_name || github.sha }}
 
 jobs:
+  bootstrap:
+    name: ensure resource group + ACR
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Azure login (OIDC, keyless)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group
+        run: |
+          az group create \
+            --name "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --location "${{ vars.AZURE_LOCATION }}"
+
+      - name: Ensure Azure Container Registry (keyless — admin disabled)
+        run: |
+          az acr create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.ACR_NAME }}" \
+            --sku Basic \
+            --admin-enabled false \
+            --location "${{ vars.AZURE_LOCATION }}" \
+            --only-show-errors
+
   build-images:
     name: build & push images
+    needs: [bootstrap]
     runs-on: ubuntu-latest
+    environment: production
     strategy:
       matrix:
         include:
@@ -91,12 +124,6 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Ensure resource group
-        run: |
-          az group create \
-            --name "${{ vars.AZURE_RESOURCE_GROUP }}" \
-            --location "${{ vars.AZURE_LOCATION }}"
 
       - name: What-if (preview changes)
         run: |
