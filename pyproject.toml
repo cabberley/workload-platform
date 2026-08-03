@@ -28,6 +28,14 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
 ]
+# Optional backend deps for the Azure StateStore (WORKLOADS_STATE_BACKEND=azure).
+# NOT part of the base install — `import shared.state` must work without azure packages.
+# Install with: pip install .[azure]
+azure = [
+    "azure-data-tables",
+    "azure-storage-blob",
+    "azure-identity",
+]
 
 [project.scripts]
 wp-worker = "cli.worker:main"

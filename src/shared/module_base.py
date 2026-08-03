@@ -12,16 +12,20 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from shared.contracts import ModuleManifest, ModuleRunResult
+from shared.state import ReadableState
 
 
 class ModuleContext:
-    """Runtime services handed to a module (Azure clients, packs engine, state writer).
+    """Runtime services handed to a module (Azure clients, packs engine, read-only state).
 
     Kept intentionally small; concrete clients are injected at the edge so pure logic
     stays Azure-free and unit-testable.
+
+    ``state`` is a **read-only** ``ReadableState`` view: modules never write shared state
+    directly. They submit their ``ModuleRunResult`` to the API core, which is the single writer.
     """
 
-    def __init__(self, *, packs: object | None = None, state: object | None = None,
+    def __init__(self, *, packs: object | None = None, state: ReadableState | None = None,
                  config: dict[str, str] | None = None) -> None:
         self.packs = packs
         self.state = state

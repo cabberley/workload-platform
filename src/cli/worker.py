@@ -14,6 +14,7 @@ import json
 import sys
 
 from shared.module_base import ModuleContext, build_default_registry
+from shared.state import ReadOnlyState, build_state_store, persist_run
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,7 +46,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"available: {', '.join(registry.names())}", file=sys.stderr)
         return 2
 
-    result = module.run(ModuleContext(), scope=scope)
+    # The worker is a single-shot writer: it runs one module then exits. In production a module
+    # deploys as its own ACA app and submits results to the API over HTTP; here the worker acts as
+    # the writer for its one run. The module itself only gets a read-only view.
+    store = build_state_store()
+    ctx = ModuleContext(state=ReadOnlyState(store))
+    result = module.run(ctx, scope=scope)
+    workload = scope.get("workload")
+    if workload:
+        persist_run(store, workload, result)
     print(json.dumps(result.model_dump(), default=str, indent=2))
     return 0 if result.ok else 1
 
