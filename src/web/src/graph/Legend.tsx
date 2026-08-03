@@ -1,12 +1,12 @@
 import type { CSSProperties } from "react";
 import type { HealthState } from "../api/types";
-import { EDGE_ENCODING, HEALTH_ENCODING, SPOF_BADGE } from "./encodings";
+import { EDGE_ENCODING, HEALTH_ENCODING, SIM_BADGE, SPOF_BADGE } from "./encodings";
 import { shapePath } from "./shapes";
 
 const HEALTH_ORDER: HealthState[] = ["up", "degraded", "down", "unknown"];
 
 /** Explains every visual encoding so the graph is legible without relying on colour. */
-export function Legend() {
+export function Legend({ showSimulation = false }: { showSimulation?: boolean }) {
   return (
     <section aria-label="Graph legend" style={box}>
       <h3 style={heading}>Legend</h3>
@@ -95,6 +95,32 @@ export function Legend() {
           </li>
         </ul>
       </div>
+
+      {showSimulation && (
+        <div style={group}>
+          <span style={groupTitle}>Blast-radius simulation</span>
+          <ul style={list}>
+            <li style={item}>
+              <span
+                style={{
+                  display: "inline-block",
+                  background: SIM_BADGE.color,
+                  color: "#fff",
+                  borderRadius: 4,
+                  padding: "1px 6px",
+                  font: "700 11px system-ui, sans-serif",
+                }}
+              >
+                {SIM_BADGE.glyph} {SIM_BADGE.label}
+              </span>
+              <span>
+                Node health is <em>simulated</em> (what breaks if this node fails), not live health.
+                Clear the simulation to return to live health.
+              </span>
+            </li>
+          </ul>
+        </div>
+      )}
     </section>
   );
 }

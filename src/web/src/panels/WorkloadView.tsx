@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ApiError, fetchDrift, fetchFindings, fetchGraph } from "../api/client";
 import type { Finding, WorkloadGraph } from "../api/types";
 import { useAsync, type AsyncState } from "../hooks/useAsync";
@@ -6,6 +6,7 @@ import { deriveHealth, rankSpofs, type NodeHealth, type Spof } from "../graph/he
 import { GraphView } from "../graph/GraphView";
 import { Legend } from "../graph/Legend";
 import { SpofPanel } from "./SpofPanel";
+import { BlastRadiusView } from "./BlastRadiusView";
 import { DriftBadge } from "./DriftBadge";
 import { card, muted } from "../styles";
 
@@ -19,6 +20,23 @@ export function WorkloadView({ workload }: { workload: string }) {
     [workload],
   );
   const driftState = useAsync(() => fetchDrift(workload), [workload]);
+
+  // The node whose failure is being simulated (null = live health). Selecting a node fetches the
+  // CANONICAL server-side impact and recolors the graph; clearing returns to live health.
+  const [simNode, setSimNode] = useState<string | null>(null);
+  // True while the simulation's impact fetch is in flight — disables re-selection so rapid clicks
+  // can't queue extra server-side traversals (the superseded request is also aborted).
+  const [simBusy, setSimBusy] = useState(false);
+
+  const graph = graphState.status === "success" ? graphState.data : null;
+
+  // Fail-closed guard: if the graph reloads and no longer contains the simulated node, drop the
+  // simulation rather than fetch an impact for a node that isn't there.
+  useEffect(() => {
+    if (simNode && graph && !graph.nodes.some((n) => n.id === simNode)) {
+      setSimNode(null);
+    }
+  }, [simNode, graph]);
 
   // Fail-closed: SPOFs are ranked ONLY from a SUCCESSFUL fetch. A loading/failed request must never
   // collapse to "no SPOFs" (a false all-clear) — it stays empty AND the panel shows loading/error.
@@ -35,6 +53,8 @@ export function WorkloadView({ workload }: { workload: string }) {
     [spofFindingsState, spofs],
   );
 
+  const simulating = simNode !== null && graph !== null;
+
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "4px 0 12px" }}>
@@ -42,24 +62,77 @@ export function WorkloadView({ workload }: { workload: string }) {
         <DriftBadge state={driftState} />
       </div>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "minmax(0, 2fr) minmax(280px, 1fr)",
-          gap: 16,
-          alignItems: "start",
-        }}
-      >
-        <section style={{ ...card, overflowX: "auto" }} aria-label="Dependency graph">
-          {renderGraph(graphState, findingsState, spofByNode, workload)}
-        </section>
+      {graph && graph.nodes.length > 0 && (
+        <NodePicker graph={graph} value={simNode} onSelect={setSimNode} disabled={simBusy} />
+      )}
 
-        <div style={{ display: "grid", gap: 16 }}>
-          <section style={card}>{renderSpofPanel(spofFindingsState, spofs)}</section>
-          <Legend />
+      {simulating ? (
+        <BlastRadiusView
+          key={simNode}
+          workload={workload}
+          graph={graph}
+          node={simNode}
+          onSelectNode={setSimNode}
+          onClear={() => setSimNode(null)}
+          onBusyChange={setSimBusy}
+        />
+      ) : (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "minmax(0, 2fr) minmax(280px, 1fr)",
+            gap: 16,
+            alignItems: "start",
+          }}
+        >
+          <section style={{ ...card, overflowX: "auto" }} aria-label="Dependency graph">
+            {renderGraph(graphState, findingsState, spofByNode, workload, setSimNode)}
+          </section>
+
+          <div style={{ display: "grid", gap: 16 }}>
+            <section style={card}>{renderSpofPanel(spofFindingsState, spofs)}</section>
+            <Legend />
+          </div>
         </div>
-      </div>
+      )}
     </div>
+  );
+}
+
+/** Picker to choose a node to simulate failing (the empty option returns to live health). */
+function NodePicker({
+  graph,
+  value,
+  onSelect,
+  disabled = false,
+}: {
+  graph: WorkloadGraph;
+  value: string | null;
+  onSelect: (nodeId: string | null) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label style={{ display: "block", margin: "0 0 12px", fontSize: 14 }}>
+      Simulate a node failing:{" "}
+      <select
+        value={value ?? ""}
+        disabled={disabled}
+        onChange={(e) => onSelect(e.target.value === "" ? null : e.target.value)}
+        style={{ fontSize: 14, padding: "4px 8px" }}
+      >
+        <option value="">— none (live health) —</option>
+        {graph.nodes.map((n) => (
+          <option key={n.id} value={n.id}>
+            {n.role ?? n.tier ?? n.name ?? n.id} ({n.id})
+          </option>
+        ))}
+      </select>
+      {disabled && (
+        <span style={{ marginLeft: 8, fontSize: 12, color: "#5f6368" }} role="status">
+          computing…
+        </span>
+      )}
+    </label>
   );
 }
 
@@ -68,6 +141,7 @@ function renderGraph(
   findingsState: AsyncState<Finding[]>,
   spofByNode: Map<string, Spof>,
   workload: string,
+  onSelectNode: (nodeId: string) => void,
 ) {
   if (graphState.status === "loading") {
     return <p style={muted}>Loading dependency graph…</p>;
@@ -115,7 +189,7 @@ function renderGraph(
           healthy.
         </p>
       )}
-      <GraphView graph={graph} health={health} spofs={spofByNode} />
+      <GraphView graph={graph} health={health} spofs={spofByNode} onSelectNode={onSelectNode} />
     </>
   );
 }
