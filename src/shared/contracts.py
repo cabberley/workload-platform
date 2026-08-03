@@ -264,3 +264,70 @@ class DriftReport(BaseModel):
         default_factory=list,
         description="Estate node ids present in the previous snapshot but gone now",
     )
+
+
+# --------------------------------------------------------------------------------------
+# Self-observability — readiness, internal metrics (issue #60).
+#
+# These are the API's *own* health/metrics contracts, distinct from the customer-workload
+# ``HealthState`` above. They carry ONLY low-cardinality names and numeric measures — never a
+# secret, connection string, resource id, or any PII (see ``shared.observability``).
+# --------------------------------------------------------------------------------------
+class DependencyStatus(BaseModel):
+    """Readiness of a single platform dependency (state store, packs engine, edge clients).
+
+    ``detail`` is a short, bounded, non-sensitive note (e.g. ``"reachable"``, ``"absent"``,
+    ``"probe error"``) — never a secret, connection string, resource id, or PII.
+    """
+
+    name: str = Field(description="Low-cardinality dependency name, e.g. 'state_store'")
+    ok: bool = Field(description="True only when the dependency was positively verified ready")
+    detail: str | None = Field(
+        default=None, description="Short, non-sensitive status note (no secrets/PII)"
+    )
+
+
+class ReadinessReport(BaseModel):
+    """Aggregated readiness across the platform's dependencies (fail-closed).
+
+    ``ready`` is True only when EVERY probed dependency reports ``ok`` (and at least one was
+    probed). An errored or unknown probe leaves its ``ok`` False, which forces ``ready`` False —
+    the readiness endpoint then answers HTTP 503. Liveness is a separate, dependency-free signal.
+    """
+
+    ready: bool = Field(description="Overall readiness; True only if all dependencies are ok")
+    dependencies: list[DependencyStatus] = Field(default_factory=list)
+
+
+class MetricSample(BaseModel):
+    """One counter reading: a name, bounded low-cardinality labels, and a non-negative count."""
+
+    name: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    value: int = Field(ge=0)
+
+
+class DurationSample(BaseModel):
+    """Aggregated duration stats for a named, labelled measure (milliseconds).
+
+    Stores only aggregates (count + sum + min/max), never per-event rows, so nothing
+    request-identifying or PII-bearing is retained.
+    """
+
+    name: str
+    labels: dict[str, str] = Field(default_factory=dict)
+    count: int = Field(ge=0)
+    totalMs: float = Field(ge=0.0)
+    minMs: float = Field(ge=0.0)
+    maxMs: float = Field(ge=0.0)
+
+
+class MetricsSnapshot(BaseModel):
+    """Point-in-time, vendor-neutral snapshot of the in-process metrics registry.
+
+    Deliberately JSON (not Prometheus text) and keyless. Labels are bounded and low-cardinality
+    (module name + outcome only); there are no resource ids, connection strings, or PII.
+    """
+
+    counters: list[MetricSample] = Field(default_factory=list)
+    durations: list[DurationSample] = Field(default_factory=list)

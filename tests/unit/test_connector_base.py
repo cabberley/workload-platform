@@ -219,6 +219,51 @@ def test_fail_closed_converts_exception_to_class_name_only() -> None:
     assert result.raw == []
 
 
+def test_fail_closed_observer_seam_counts_only_on_failure() -> None:
+    # The injectable observer seam (#60) lets a fail-closed event be counted (e.g. a metrics
+    # counter) without the shared base importing any registry. It fires ONLY on failure.
+    calls: list[int] = []
+    good = make_fetch_result(available=True, raw=[synthetic_signal_raw()])
+    fail_closed(lambda: good, observer=lambda: calls.append(1))
+    assert calls == []  # success ⇒ observer not invoked
+
+    def boom() -> FetchResult:
+        raise RuntimeError("boom")
+
+    fail_closed(boom, observer=lambda: calls.append(1))
+    assert calls == [1]  # failure ⇒ observed exactly once
+
+
+def test_fail_closed_observer_error_never_breaks_fail_closed() -> None:
+    def boom() -> FetchResult:
+        raise RuntimeError("boom")
+
+    def bad_observer() -> None:
+        raise ValueError("observer blew up")
+
+    # A broken observer must not turn a fail-closed edge into a crash.
+    result = fail_closed(boom, observer=bad_observer)
+    assert result.available is False
+    assert result.error == "RuntimeError"
+
+
+def test_fail_closed_observer_wires_to_metrics_registry() -> None:
+    # End-to-end: the observer can bind the metrics helper for a bounded, PII-free counter.
+    from shared.observability import METRIC_CONNECTOR_FAIL_CLOSED, MetricsRegistry
+
+    reg = MetricsRegistry()
+
+    def boom() -> FetchResult:
+        raise RuntimeError("boom")
+
+    fail_closed(boom, observer=lambda: reg.record_connector_fail_closed("aiops"))
+    fc = next(
+        s for s in reg.snapshot().counters if s.name == METRIC_CONNECTOR_FAIL_CLOSED
+    )
+    assert fc.labels == {"module": "aiops"}
+    assert fc.value == 1
+
+
 # --------------------------------------------------------------------------------------
 # System Pulse — now retries transient transport errors, still fails closed
 # --------------------------------------------------------------------------------------

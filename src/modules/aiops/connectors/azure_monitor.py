@@ -56,6 +56,7 @@ from modules.aiops.connectors.system_pulse import (
 )
 from shared.connectors import (
     CredentialProvider,
+    FailClosedObserver,
     FetchResult,
     fail_closed,
     run_with_retries,
@@ -714,6 +715,7 @@ class AzureMonitorClient:
         credential_provider: CredentialProvider | None = None,
         backend: MetricsBackend | None = None,
         logs_backend: LogsBackend | None = None,
+        fail_closed_observer: FailClosedObserver | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
     ) -> None:
@@ -721,6 +723,10 @@ class AzureMonitorClient:
         self._credential_provider = credential_provider
         self._backend = backend
         self._logs_backend = logs_backend
+        # Optional, keyless observer (issue #60): invoked when a fetch fails closed so the event
+        # can be counted at the composition root, without this connector importing any registry.
+        # Default None ⇒ no-op; an observer error never breaks fail-closed (guarded in fail_closed).
+        self._fail_closed_observer = fail_closed_observer
         # Injected so bounded-retry backoff is deterministic and instant in tests; real by default.
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random()  # noqa: S311 - backoff jitter, not crypto
@@ -743,7 +749,10 @@ class AzureMonitorClient:
         errors are retried (bounded, with jitter) before failing closed. When no credential
         resolves, **no** query is made.
         """
-        return fail_closed(lambda: self._fetch(metric_names=metric_names))
+        return fail_closed(
+            lambda: self._fetch(metric_names=metric_names),
+            observer=self._fail_closed_observer,
+        )
 
     def _fetch(self, *, metric_names: Sequence[str] | None) -> FetchResult:
         """Resolve the credential, then run each enabled edge under bounded retry. Guarded above."""

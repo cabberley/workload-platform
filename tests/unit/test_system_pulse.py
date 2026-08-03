@@ -216,8 +216,61 @@ def test_fetch_raw_fails_closed_on_transport_error() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Strict payload coercion — malformed feed ⇒ unavailable; legit-empty ⇒ available
+# Fail-closed observer seam (issue #60) — counts a real fail-closed fetch, keyless, module label
 # --------------------------------------------------------------------------------------
+def test_fetch_raw_fail_closed_fires_injected_observer() -> None:
+    from shared.observability import (
+        METRIC_CONNECTOR_FAIL_CLOSED,
+        MetricsRegistry,
+        connector_fail_closed_observer,
+    )
+
+    reg = MetricsRegistry()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")  # → raises → fail-closed conversion
+
+    client = SystemPulseClient(
+        SystemPulseConfig(base_url="https://pulse.internal"),
+        client=httpx.Client(transport=httpx.MockTransport(handle)),
+        credential_provider=lambda: "fake-read-token",
+        fail_closed_observer=connector_fail_closed_observer("aiops", reg),
+    )
+    result = client.fetch_raw()
+    assert result.available is False  # still fails closed
+    fc = next(
+        s for s in reg.snapshot().counters if s.name == METRIC_CONNECTOR_FAIL_CLOSED
+    )
+    assert fc.labels == {"module": "aiops"}  # bounded, low-cardinality label
+    assert fc.value == 1
+
+
+def test_fetch_raw_success_does_not_fire_observer() -> None:
+    from shared.observability import MetricsRegistry, connector_fail_closed_observer
+
+    reg = MetricsRegistry()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"signals": [_synthetic_raw()]})
+
+    client = SystemPulseClient(
+        SystemPulseConfig(base_url="https://pulse.internal"),
+        client=httpx.Client(transport=httpx.MockTransport(handle)),
+        credential_provider=lambda: "fake-read-token",
+        fail_closed_observer=connector_fail_closed_observer("aiops", reg),
+    )
+    assert client.fetch_raw().available is True
+    assert reg.snapshot().counters == []  # observer fires ONLY on a fail-closed conversion
+
+
+def test_fetch_raw_without_observer_still_fails_closed() -> None:
+    # Default (no observer) must be a no-op that never breaks the connector's fail-closed behavior.
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    result = _client_with(httpx.MockTransport(handle)).fetch_raw()
+    assert result.available is False
+    assert result.error is not None
 @pytest.mark.parametrize(
     "payload",
     [
