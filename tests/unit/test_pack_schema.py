@@ -246,9 +246,97 @@ def test_telemetry_non_finite_threshold_rejected() -> None:
 
 
 def test_telemetry_unknown_field_allowed_forward_compat() -> None:
+    # TelemetryRuleSpec uses extra="ignore"; a genuinely-unknown field must not fail CI. ('window'
+    # and 'expression' are now typed optional fields — issue #51 — so they are exercised below.)
     pack = _load(_SHIPPED["telemetry"])
-    pack["body"]["signals"][0]["window"] = "5m"
+    pack["body"]["signals"][0]["futureHint"] = "5m"
     assert validate_pack(pack) == []
+
+
+# --- Telemetry issue #51: optional windowed + expression detectors --------------------------------
+
+def test_telemetry_valid_window_aggregate_validates() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "aggregate": "avg", "mode": "aggregate"}
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_valid_window_duration_validates() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"durationSeconds": 300, "mode": "all"}
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_valid_expression_validates() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "avg > threshold and max < 900"
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_window_both_selectors_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "durationSeconds": 10}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_neither_selector_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"aggregate": "avg"}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_unknown_aggregate_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "aggregate": "median"}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_unknown_mode_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "mode": "sometimes"}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_zero_samples_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 0}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_extra_property_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "bogus": 1}
+    assert validate_pack(pack)
+
+
+def test_telemetry_non_finite_window_duration_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"durationSeconds": float("inf")}
+    errors = validate_pack(pack)
+    assert errors and any("finite" in e for e in errors)
+
+
+def test_telemetry_unsafe_expression_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "__import__('os').system('x')"
+    assert validate_pack(pack)
+
+
+def test_telemetry_expression_bad_name_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "secret > 1"
+    assert validate_pack(pack)
+
+
+def test_telemetry_expression_non_finite_literal_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "value > 1e400"
+    assert validate_pack(pack)
+
+
+def test_synthetic_windowed_example_pack_validates_clean() -> None:
+    example = CONTENT / "telemetry" / "synthetic-windowed-detectors.json"
+    assert validate_pack(_load(example)) == []
 
 
 # --- Dependency (unchanged shape) -------------------------------------------------------------

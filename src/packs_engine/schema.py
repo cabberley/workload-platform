@@ -67,11 +67,17 @@ def _format_error(error: Any) -> str:
 
 
 def _telemetry_finite_errors(body: dict[str, Any]) -> list[str]:
-    """Reject non-finite (nan/inf) signal thresholds.
+    """Reject non-finite (nan/inf) constants and unsafe expressions in telemetry signals.
 
     JSON Schema has no native finite check and a YAML loader can produce ``nan``/``inf`` floats,
-    which ``aiops`` rejects (aiops/module.py:184-192). A non-finite threshold cannot define a
-    meaningful breach, so surface it here as a fail-closed error after structural validation.
+    which ``aiops`` rejects (aiops/module.py:184-192). A non-finite threshold or window duration
+    cannot define a meaningful breach, so surface it here as a fail-closed error after structural
+    validation. Windowed/expression detectors (issue #51) add two extra fail-closed checks:
+
+    * a non-finite ``window.durationSeconds`` is rejected (same reasoning as the threshold);
+    * an ``expression`` string is validated against the shared allowlisted-AST sandbox
+      (:func:`shared.safe_expr.validate_expression`) so an unsafe or non-finite-literal expression
+      fails the pack gate here, not just at compile time.
     """
     errors: list[str] = []
     signals = body.get("signals")
@@ -87,7 +93,39 @@ def _telemetry_finite_errors(body: dict[str, Any]) -> list[str]:
             and not math.isfinite(float(threshold))
         ):
             errors.append(f"signals/{index}/threshold: {threshold!r} is not a finite number")
+        errors.extend(_window_finite_errors(index, signal.get("window")))
+        errors.extend(_expression_errors(index, signal.get("expression")))
     return errors
+
+
+def _window_finite_errors(index: int, window: Any) -> list[str]:
+    """Reject a non-finite ``window.durationSeconds`` (nan/inf) for signal ``index``."""
+    if not isinstance(window, dict):
+        return []
+    duration = window.get("durationSeconds")
+    if (
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and not math.isfinite(float(duration))
+    ):
+        return [
+            f"signals/{index}/window/durationSeconds: {duration!r} is not a finite number"
+        ]
+    return []
+
+
+def _expression_errors(index: int, expression: Any) -> list[str]:
+    """Reject an unsafe/invalid ``expression`` (allowlisted-AST sandbox), for signal ``index``."""
+    if expression is None:
+        return []
+    if not isinstance(expression, str):
+        return [f"signals/{index}/expression: must be a string"]
+    from shared.safe_expr import TELEMETRY_EXPR_NAMES, validate_expression
+
+    return [
+        f"signals/{index}/expression: {err}"
+        for err in validate_expression(expression, allowed_names=TELEMETRY_EXPR_NAMES)
+    ]
 
 
 def validate_pack(pack: dict[str, Any]) -> list[str]:

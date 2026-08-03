@@ -15,11 +15,28 @@
         "threshold": 500,
         "severity": "high",
         "nodeId": "role:example-role"
+      },
+      {
+        "name": "example_latency_ms",
+        "op": "gt",
+        "threshold": 400,
+        "severity": "medium",
+        "nodeId": "role:example-role",
+        "window": { "samples": 5, "aggregate": "avg", "mode": "aggregate" }
+      },
+      {
+        "name": "example_error_rate",
+        "op": "gt",
+        "threshold": 0.05,
+        "severity": "high",
+        "nodeId": "role:example-role",
+        "window": { "samples": 10, "aggregate": "max" },
+        "expression": "max > threshold and rate > 0"
       }
     ],
     "logAnalysis": {
       "enabled": false,
-      "note": "REPLACE ME — AI log analysis is advisory only; detections are confidence-gated and cite evidence."
+      "note": "REPLACE ME — AI log analysis is advisory only; detections are confidence-gated and cite evidence. The 2nd/3rd signals show OPTIONAL windowed + expression detectors (issue #51); delete them for a plain single-sample threshold pack."
     }
   }
 }
