@@ -194,6 +194,14 @@ class Ed25519Verifier:
         """Build a verifier from a 32-byte raw Ed25519 public key (e.g. a configured trust root)."""
         return cls(ed25519.Ed25519PublicKey.from_public_bytes(raw), key_id)
 
+    def public_bytes(self) -> bytes:
+        """Return the 32-byte raw Ed25519 public key.
+
+        A public key is provenance, not a secret: it is safe to persist/publish so a downstream
+        importer can verify a pack's detached signature. The *private* key is never exposed.
+        """
+        return self._public_key.public_bytes_raw()
+
     def verify(self, data: bytes, signature: bytes) -> bool:
         try:
             self._public_key.verify(signature, data)
