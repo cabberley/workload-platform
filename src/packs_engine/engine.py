@@ -36,6 +36,20 @@ class PackVerificationError(RuntimeError):
     """Raised when a pack's hash or signature does not verify. Fail closed."""
 
 
+# Reserved top-level subtree under the content root that is NEVER loaded or executed at runtime.
+#
+# ``content/templates/`` holds authoring SCAFFOLDS (starter packs for humans to copy). They are
+# schema-valid on purpose (so CI can validate their shape via ``scripts/validate_packs.py``), but
+# they must NEVER be loaded by this engine or handed to a module against a real customer estate:
+# a scaffold with ``targets: []`` (all workloads) would otherwise OVERRIDE alert routing (ops),
+# emit FALSE detections (telemetry), inject phantom dependency EDGES (dependency), and misclassify
+# resources (workload). Excluding the whole subtree here is a fail-safe reserved-directory
+# convention — to deploy a pack you copy it OUT of ``templates/`` into its by-type directory
+# (e.g. ``content/rules/``) and sign it. The schema gate in ``scripts/validate_packs.py`` keeps
+# its own enumeration, so templates stay validated in CI even though they are not runtime packs.
+RESERVED_NONRUNTIME_DIR = "templates"
+
+
 def compute_sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -85,8 +99,23 @@ class PacksEngine:
     def _iter_pack_files(self) -> list[Path]:
         return sorted(
             p for p in self.root.rglob("*")
-            if p.suffix in {".json", ".yaml", ".yml"} and p.is_file()
+            if p.suffix in {".json", ".yaml", ".yml"}
+            and p.is_file()
+            and not self._is_reserved_nonruntime(p)
         )
+
+    def _is_reserved_nonruntime(self, path: Path) -> bool:
+        """True if ``path`` lives under the reserved, non-runtime ``templates/`` subtree.
+
+        Any file whose first path component under the content root is ``RESERVED_NONRUNTIME_DIR``
+        is an authoring scaffold and must never be discovered/executed as a runtime pack (see the
+        constant's docstring). Fail-safe: a path outside the root is not treated as reserved.
+        """
+        try:
+            rel = path.relative_to(self.root)
+        except ValueError:
+            return False
+        return len(rel.parts) > 0 and rel.parts[0] == RESERVED_NONRUNTIME_DIR
 
     @staticmethod
     def _parse(path: Path) -> dict[str, Any]:

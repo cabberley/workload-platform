@@ -30,6 +30,9 @@ Full depth is in the Blueprint — see `docs/README.md`. `ARCHITECTURE.md` is bi
 5. **No auto‑remediation of customer infrastructure.** AIOps *proposes* RCA and remediation and
    can advise "call support"; a human always decides and applies.
 6. **Content over code.** New domain knowledge belongs in a `content/` pack, not a Python branch.
+   `content/templates/` is a **reserved, non-runtime scaffold directory** — its packs are
+   schema-validated in CI but never loaded/executed; copy a template OUT into its by-type dir to
+   deploy it.
 7. **Least privilege.** Request the narrowest Azure RBAC role that works; document why.
 8. **Provenance.** Every finding cites its evidence (resource id, metric, pack + version).
 

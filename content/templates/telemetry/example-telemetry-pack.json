@@ -1,0 +1,25 @@
+{
+  "manifest": {
+    "id": "example-telemetry-pack",
+    "type": "telemetry",
+    "name": "Example Telemetry pack — REPLACE ME",
+    "version": "0.1.0",
+    "targets": [],
+    "author": "your-org"
+  },
+  "body": {
+    "signals": [
+      {
+        "name": "example_latency_ms",
+        "op": "gt",
+        "threshold": 500,
+        "severity": "high",
+        "nodeId": "role:example-role"
+      }
+    ],
+    "logAnalysis": {
+      "enabled": false,
+      "note": "REPLACE ME — AI log analysis is advisory only; detections are confidence-gated and cite evidence."
+    }
+  }
+}

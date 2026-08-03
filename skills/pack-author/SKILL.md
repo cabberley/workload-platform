@@ -36,7 +36,25 @@ Every pack file has a `manifest` (see `src/shared/contracts.py::PackManifest`) a
 - Sign before release (SHA-256 + HMAC); the Packs Engine verifies before execute.
 - Bump `version` (semver) on any change; never mutate a released version in place.
 
+## Templates & authoring guide
+Start from a scaffold instead of a blank file. One schema-valid starter pack per type lives under
+[`content/templates/<type>/`](../../content/templates):
+
+- [`content/templates/`](../../content/templates) — the five starter packs (workload, rule,
+  telemetry, dependency, ops).
+- [`content/templates/README.md`](../../content/templates/README.md) — field-by-field docs per
+  type (required vs optional/nullable, enums, patterns, and what each placeholder means).
+- [`docs/authoring-packs.md`](../../docs/authoring-packs.md) — the end-to-end workflow: author →
+  validate → test → sign → export via the packs studio, plus versioning, signing and the
+  no-PHI/PII rule.
+
+Copy a template into the real content directory, rename it, give it a unique `id`, replace every
+`REPLACE ME`/`example-*` placeholder, then validate + test it through its consuming module. Real
+worked examples: [`content/rules/waf-security-baseline.json`](../../content/rules/waf-security-baseline.json)
+and [`content/dependencies/multi-tier-web-app.json`](../../content/dependencies/multi-tier-web-app.json).
+
 ## Definition of done
 - [ ] Schema-valid, targets set, semver bumped
 - [ ] Synthetic fixtures only
 - [ ] `pack-validate` workflow green
+- [ ] A `tests/` addition drives the pack through its consuming module
