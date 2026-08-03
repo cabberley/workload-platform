@@ -1,0 +1,200 @@
+{
+  "__comment": "SYNTHETIC, PARAMETERIZED baseline board (issue #58). WORKS TODAY: queries REAL Azure Monitor ACA platform metrics (no custom telemetry-export path / #86 needed). No real subscription/resourceGroup/resource id, URL, or token — only Grafana template variables with synthetic defaults, bound at import time (see infra/grafana/README.md). Aggregate metrics only, PII-free. Service modules (api, web, aiops, alerts) are Microsoft.App/containerApps; job modules (discovery, quality_checks, reassessments, dependency_graph) are Microsoft.App/jobs — targets are split by resource type so a selection never hits a metric the type lacks.",
+  "uid": "wp-module-throughput",
+  "title": "Aegis · Module Throughput & Queue Depth",
+  "description": "Works today from real Azure Monitor ACA platform metrics (Container Apps + Jobs) — does NOT depend on the #86 telemetry-export path. Container Apps and Jobs metrics are split into separate panels because they are different resource types with different metric sets.",
+  "tags": ["aegis", "baseline", "throughput", "keda", "aca", "no-pii", "works-today"],
+  "schemaVersion": 39,
+  "version": 3,
+  "editable": true,
+  "timezone": "",
+  "time": { "from": "now-3h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "monitor",
+        "label": "Azure Monitor data source",
+        "type": "datasource",
+        "query": "grafana-azure-monitor-datasource",
+        "current": {}
+      },
+      {
+        "name": "subscription",
+        "label": "Subscription",
+        "type": "textbox",
+        "description": "Deploy-time: set to the in-boundary subscription id (never committed).",
+        "query": "00000000-0000-0000-0000-000000000000",
+        "current": { "text": "00000000-0000-0000-0000-000000000000", "value": "00000000-0000-0000-0000-000000000000" },
+        "options": [ { "text": "00000000-0000-0000-0000-000000000000", "value": "00000000-0000-0000-0000-000000000000", "selected": true } ]
+      },
+      {
+        "name": "resourceGroup",
+        "label": "Resource group",
+        "type": "textbox",
+        "description": "Deploy-time: set to the in-boundary resource group name (from deploy outputs).",
+        "query": "wp-rg",
+        "current": { "text": "wp-rg", "value": "wp-rg" },
+        "options": [ { "text": "wp-rg", "value": "wp-rg", "selected": true } ]
+      },
+      {
+        "name": "storageAccount",
+        "label": "Queue storage account",
+        "type": "textbox",
+        "description": "Deploy-time: set to the in-boundary storage account backing the KEDA queues (synthetic default).",
+        "query": "wpstsynthetic",
+        "current": { "text": "wpstsynthetic", "value": "wpstsynthetic" },
+        "options": [ { "text": "wpstsynthetic", "value": "wpstsynthetic", "selected": true } ]
+      },
+      {
+        "name": "serviceModule",
+        "label": "Service module (Container App)",
+        "type": "custom",
+        "description": "Long-running Microsoft.App/containerApps modules. Aggregate metrics only.",
+        "query": "api,web,aiops,alerts",
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "aiops", "value": "aiops" }
+      },
+      {
+        "name": "jobModule",
+        "label": "Job module (Container Apps Job)",
+        "type": "custom",
+        "description": "Scale-to-zero Microsoft.App/jobs modules. Aggregate metrics only.",
+        "query": "discovery,quality_checks,reassessments,dependency_graph",
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "quality_checks", "value": "quality_checks" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Service modules (Microsoft.App/containerApps)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Active replicas (service module)",
+      "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+      "description": "Container Apps `Replicas` metric for the selected service module — shows independent scale. Aggregate replica count only.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "Azure Monitor",
+          "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+          "subscription": "${subscription}",
+          "azureMonitor": {
+            "resources": [
+              {
+                "subscription": "${subscription}",
+                "resourceGroup": "${resourceGroup}",
+                "resourceName": "wp-${serviceModule}",
+                "metricNamespace": "microsoft.app/containerapps"
+              }
+            ],
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "Replicas",
+            "aggregation": "Average"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Requests processed (service module)",
+      "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+      "description": "Container Apps `Requests` metric for the selected service module. Aggregate total only.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "Azure Monitor",
+          "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+          "subscription": "${subscription}",
+          "azureMonitor": {
+            "resources": [
+              {
+                "subscription": "${subscription}",
+                "resourceGroup": "${resourceGroup}",
+                "resourceName": "wp-${serviceModule}",
+                "metricNamespace": "microsoft.app/containerapps"
+              }
+            ],
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "Requests",
+            "aggregation": "Total"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Job modules (Microsoft.App/jobs)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Job executions (job module)",
+      "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+      "description": "Container Apps Job `Executions` metric for the selected job module — batch throughput / fan-out. Aggregate execution count only.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "Azure Monitor",
+          "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+          "subscription": "${subscription}",
+          "azureMonitor": {
+            "resources": [
+              {
+                "subscription": "${subscription}",
+                "resourceGroup": "${resourceGroup}",
+                "resourceName": "wp-${jobModule}",
+                "metricNamespace": "microsoft.app/jobs"
+              }
+            ],
+            "metricNamespace": "microsoft.app/jobs",
+            "metricName": "Executions",
+            "aggregation": "Total"
+          }
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Queue depth (KEDA scaler backlog)",
+      "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+      "description": "Approximate queue length backing the event-driven job modules (quality_checks, dependency_graph) and service modules (aiops, alerts). Aggregate depth only — message contents are never read.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "Azure Monitor",
+          "datasource": { "type": "grafana-azure-monitor-datasource", "uid": "${monitor}" },
+          "subscription": "${subscription}",
+          "azureMonitor": {
+            "resources": [
+              {
+                "subscription": "${subscription}",
+                "resourceGroup": "${resourceGroup}",
+                "resourceName": "${storageAccount}/default",
+                "metricNamespace": "microsoft.storage/storageaccounts/queueservices"
+              }
+            ],
+            "metricNamespace": "microsoft.storage/storageaccounts/queueservices",
+            "metricName": "QueueMessageCount",
+            "aggregation": "Average"
+          }
+        }
+      ]
+    }
+  ]
+}

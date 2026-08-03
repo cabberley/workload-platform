@@ -43,9 +43,12 @@ success is ever shown).
   Recovered, Still failing (each a `FindingRow` list) plus Added / Removed nodes. The `DriftBadge`
   only summarises; this view shows every delta.
 - **Drift badge** (optional) — `GET /api/workloads/{w}/drift`.
-- **Telemetry panel** (optional) — an iframe is rendered only when `VITE_GRAFANA_PANEL_URL` is set
-  at build time; otherwise a placeholder shows. Grafana vs Azure Workbooks is an open decision
-  (`TODO(human)` in `src/panels/GrafanaPanel.tsx`). No URL/secret is hardcoded.
+- **Telemetry panel** (optional) — Managed Grafana blocks iframing by default, so the console
+  **defaults to a keyless deep-link** ("Open in Azure Managed Grafana", new tab, Entra SSO) when
+  `VITE_GRAFANA_URL` is set. An iframe embed is an optional path behind `VITE_GRAFANA_PANEL_URL`
+  (requires an embeddable, auth-proxied panel URL). Unset ⇒ documented placeholder (fail-closed).
+  Managed Grafana over Azure Monitor is the resolved decision (ADR `0007`;
+  see `docs/telemetry-visualization.md`). No URL/token is hardcoded.
 
 All read-model views fail closed: loading / 404 / empty / error are each surfaced explicitly and a
 missing or failed fetch is never collapsed into a misleading "all clear".
