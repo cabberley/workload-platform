@@ -5,6 +5,7 @@ import { computeLayout, DEFAULT_LAYOUT, type PositionedNode } from "./layout";
 import {
   EDGE_ENCODING,
   healthEncoding,
+  SIM_BADGE,
   SPOF_BADGE,
   spofSizeScale,
   spofStrokeWidth,
@@ -15,13 +16,19 @@ type GraphViewProps = {
   graph: WorkloadGraph;
   health: Map<string, NodeHealth>;
   spofs: Map<string, Spof>;
+  /** When set, clicking (or Enter/Space on) a node calls this with the node id — used to pick a
+   *  node to simulate failing. Omitted in read-only contexts. */
+  onSelectNode?: (nodeId: string) => void;
+  /** The node currently simulated as failed — gets a distinct "SIMULATED FAILURE" origin badge so
+   *  a recolored simulation view never masquerades as live health. */
+  failedNode?: string | null;
 };
 
 const primaryLabel = (node: ResourceNode): string =>
   node.role ?? node.tier ?? node.name ?? node.id;
 
 /** Renders the dependency graph as an accessible SVG (shape + glyph + label, never colour alone). */
-export function GraphView({ graph, health, spofs }: GraphViewProps) {
+export function GraphView({ graph, health, spofs, onSelectNode, failedNode }: GraphViewProps) {
   const maxBr = maxBlastRadius([...spofs.values()]);
 
   const sizeOf = (node: ResourceNode) => {
@@ -85,6 +92,8 @@ export function GraphView({ graph, health, spofs }: GraphViewProps) {
           health={health.get(pn.node.id)?.state ?? "unknown"}
           spof={spofs.get(pn.node.id)}
           maxBr={maxBr}
+          onSelectNode={onSelectNode}
+          isFailed={failedNode === pn.node.id}
         />
       ))}
     </svg>
@@ -96,9 +105,11 @@ type GraphNodeProps = {
   health: HealthState;
   spof: Spof | undefined;
   maxBr: number;
+  onSelectNode?: (nodeId: string) => void;
+  isFailed?: boolean;
 };
 
-function GraphNode({ positioned, health, spof, maxBr }: GraphNodeProps) {
+function GraphNode({ positioned, health, spof, maxBr, onSelectNode, isFailed }: GraphNodeProps) {
   const { node, x, y, width, height } = positioned;
   const enc = healthEncoding(health);
   const ratio = spof && maxBr > 0 ? spof.blastRadius / maxBr : 0;
@@ -107,17 +118,38 @@ function GraphNode({ positioned, health, spof, maxBr }: GraphNodeProps) {
   const title =
     `${primaryLabel(node)} — ${node.type}\n` +
     `health: ${enc.label}` +
-    (spof ? `\nSPOF · blast radius ${spof.blastRadius} · ${spof.severity}` : "");
+    (isFailed ? `\n${SIM_BADGE.label} (simulated origin)` : "") +
+    (spof ? `\nSPOF · blast radius ${spof.blastRadius} · ${spof.severity}` : "") +
+    (onSelectNode ? "\n(click to simulate this node failing)" : "");
+
+  const clickable = Boolean(onSelectNode);
+  const select = () => onSelectNode?.(node.id);
 
   return (
-    <g>
+    <g
+      role={clickable ? "button" : undefined}
+      aria-label={clickable ? `Simulate failure of ${primaryLabel(node)}` : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      onClick={clickable ? select : undefined}
+      onKeyDown={
+        clickable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                select();
+              }
+            }
+          : undefined
+      }
+      style={clickable ? { cursor: "pointer" } : undefined}
+    >
       <title>{title}</title>
       <path
         d={shapePath(enc.shape, x, y, width, height)}
         fill={enc.fill}
-        stroke={spof ? SPOF_BADGE.color : enc.stroke}
-        strokeWidth={strokeWidth}
-        strokeDasharray={spof ? undefined : enc.strokeDasharray}
+        stroke={isFailed ? SIM_BADGE.color : spof ? SPOF_BADGE.color : enc.stroke}
+        strokeWidth={isFailed ? Math.max(strokeWidth, 3) : strokeWidth}
+        strokeDasharray={spof || isFailed ? undefined : enc.strokeDasharray}
       />
       <text
         x={x + width / 2}
@@ -170,6 +202,21 @@ function GraphNode({ positioned, health, spof, maxBr }: GraphNodeProps) {
             style={{ font: "700 11px system-ui, sans-serif", fill: SPOF_BADGE.color }}
           >
             {`blast radius: ${spof.blastRadius}`}
+          </text>
+        </>
+      )}
+
+      {isFailed && (
+        <>
+          {/* Simulated-failure origin badge, top-left — never conflated with a live-health down. */}
+          <rect x={x + 2} y={y - 12} width={140} height={20} rx={4} fill={SIM_BADGE.color} />
+          <text
+            x={x + 72}
+            y={y + 2}
+            textAnchor="middle"
+            style={{ font: "700 11px system-ui, sans-serif", fill: "#fff" }}
+          >
+            {`${SIM_BADGE.glyph} ${SIM_BADGE.label}`}
           </text>
         </>
       )}

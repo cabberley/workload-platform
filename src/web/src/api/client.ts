@@ -5,6 +5,7 @@
 import type {
   DriftReport,
   Finding,
+  ImpactResult,
   ModuleManifest,
   WorkloadGraph,
 } from "./types";
@@ -19,10 +20,10 @@ export class ApiError extends Error {
   }
 }
 
-async function getJson<T>(path: string): Promise<T> {
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(path, { method: "GET", headers: { Accept: "application/json" } });
+    res = await fetch(path, { method: "GET", headers: { Accept: "application/json" }, signal });
   } catch (cause) {
     throw new ApiError(0, `network error: ${String(cause)}`);
   }
@@ -53,4 +54,20 @@ export function fetchFindings(workload: string, module?: string): Promise<Findin
 
 export function fetchDrift(workload: string): Promise<DriftReport> {
   return getJson<DriftReport>(`/api/workloads/${encodeURIComponent(workload)}/drift`);
+}
+
+/**
+ * Canonical blast-radius impact of simulating `node`'s failure (issue #56). The core returns 404
+ * when no graph is persisted OR when `node` is not in the graph (fail-closed) — callers surface
+ * that, never a false all-clear. The math is server-side only; this just reads the projection.
+ */
+export function fetchImpact(
+  workload: string,
+  node: string,
+  signal?: AbortSignal,
+): Promise<ImpactResult> {
+  return getJson<ImpactResult>(
+    `/api/workloads/${encodeURIComponent(workload)}/impact?node=${encodeURIComponent(node)}`,
+    signal,
+  );
 }

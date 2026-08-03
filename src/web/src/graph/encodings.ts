@@ -76,6 +76,13 @@ export const SEVERITY_COLOR: Record<Severity, string> = {
 /** SPOF badge — a shape+text cue independent of colour, shown on flagged nodes and in the legend. */
 export const SPOF_BADGE = { glyph: "⚠", label: "SPOF", color: "#a50e0e" } as const;
 
+/**
+ * Simulated-failure origin badge — marks the node the user chose to "fail" in a blast-radius
+ * simulation (issue #56). Distinct glyph + word + colour so a simulated origin never reads as a
+ * live-health `down`, and the recolored graph never masquerades as live health.
+ */
+export const SIM_BADGE = { glyph: "⌁", label: "SIMULATED FAILURE", color: "#6a1b9a" } as const;
+
 /** Edge styling — solid = redundant (has a backup path), dashed = non-redundant (single path). */
 export const EDGE_ENCODING = {
   redundant: {

@@ -13,9 +13,11 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
+from shared.blast_radius import compute_impact, graph_revision
 from shared.contracts import (
     DriftReport,
     Finding,
+    HealthState,
     ModuleRunResult,
     ResourceNode,
     WorkloadGraph,
@@ -188,13 +190,88 @@ def get_estate(workload: str, store: StoreDep) -> list[ResourceNode]:
     return store.get_estate(workload)
 
 
+class GraphResponse(WorkloadGraph):
+    """The dependency graph plus a server-computed topology revision (issue #56 round 3).
+
+    ADDITIVE local response model: it is exactly a :class:`WorkloadGraph` (same ``nodes``/``edges``)
+    with one extra ``graphRevision`` field, so existing consumers that parse only ``nodes``/
+    ``edges`` are unaffected. ``graphRevision`` is :func:`shared.blast_radius.graph_revision` over
+    the FULL topology; the impact endpoint returns the SAME value so the web can detect that an
+    impact was computed against a different topology than the one it is displaying — WITHOUT hashing
+    the graph itself in TypeScript (no TS/Python divergence). The shared ``WorkloadGraph`` contract
+    is left untouched (this projection lives at the API edge, like ``ImpactResult``).
+    """
+
+    graphRevision: str
+
+
 @app.get("/api/workloads/{workload}/graph")
-def get_graph(workload: str, store: StoreDep) -> WorkloadGraph:
-    """Return the latest dependency graph for ``workload`` (404 if none persisted yet)."""
+def get_graph(workload: str, store: StoreDep) -> GraphResponse:
+    """Return the latest dependency graph for ``workload`` + its revision (404 if none)."""
     graph = store.get_graph(workload)
     if graph is None:
         raise HTTPException(status_code=404, detail=f"no graph for workload {workload!r}")
-    return graph
+    return GraphResponse(
+        nodes=graph.nodes, edges=graph.edges, graphRevision=graph_revision(graph)
+    )
+
+
+class ImpactResult(BaseModel):
+    """Read model for a single blast-radius simulation ("what breaks if ``failedNode`` is down").
+
+    Presentation-only projection of the CANONICAL server-side math in
+    :func:`shared.blast_radius.compute_impact` — it is *not* a cross-module contract, so it lives
+    here in the API app rather than in ``shared.contracts``. The endpoint never reimplements the
+    math: ``states`` is exactly ``compute_impact(graph, failedNode)`` and ``down``/``degraded``/
+    ``blastRadius`` are derived from it (``blastRadius`` == ``len(down)`` == ``blast_radius(...)``).
+    ``graphRevision`` is the SAME server-computed :func:`shared.blast_radius.graph_revision` the
+    graph endpoint returns, so the web can fail closed when the two were computed on different
+    topologies (edge-level staleness a node-id check alone would miss).
+    """
+
+    failedNode: str
+    states: dict[str, HealthState]
+    blastRadius: int
+    down: list[str]
+    degraded: list[str]
+    graphRevision: str
+
+
+@app.get("/api/workloads/{workload}/impact")
+def get_impact(workload: str, node: str, store: StoreDep) -> ImpactResult:
+    """Return the canonical blast-radius impact of failing ``node`` in ``workload``'s graph.
+
+    Thin, read-only, fail-closed: 404 if no graph is persisted (mirrors :func:`get_graph`), and
+    404 if ``node`` is not a member of that graph — we never silently return an all-up map for an
+    unknown node. The impact itself is the canonical :func:`shared.blast_radius.compute_impact`
+    result (no TypeScript/duplicate math anywhere); this endpoint only projects it into lists.
+
+    Cost is bounded: ``compute_impact`` and ``graph_revision`` are pure, in-memory traversals over
+    a single small persisted graph (estates are thousands of nodes at most) with no I/O, so there
+    is no unbounded work to throttle — a concurrency limiter would be over-engineering. The web
+    side already cancels superseded requests via ``AbortSignal`` and guards against launching a new
+    simulation until the prior one settles.
+    """
+    graph = store.get_graph(workload)
+    if graph is None:
+        raise HTTPException(status_code=404, detail=f"no graph for workload {workload!r}")
+    if node not in {n.id for n in graph.nodes}:
+        raise HTTPException(
+            status_code=404, detail=f"node {node!r} not in graph for workload {workload!r}"
+        )
+    states = compute_impact(graph, node)
+    down = sorted(
+        nid for nid, st in states.items() if st == HealthState.down and nid != node
+    )
+    degraded = sorted(nid for nid, st in states.items() if st == HealthState.degraded)
+    return ImpactResult(
+        failedNode=node,
+        states=states,
+        blastRadius=len(down),
+        down=down,
+        degraded=degraded,
+        graphRevision=graph_revision(graph),
+    )
 
 
 @app.get("/api/workloads/{workload}/findings")

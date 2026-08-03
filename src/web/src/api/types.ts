@@ -68,10 +68,14 @@ export type DependencyEdge = {
   origin: string;
 };
 
-/** Mirrors `contracts.WorkloadGraph`. */
+/** Mirrors `contracts.WorkloadGraph`. The API's graph endpoint additionally returns an opaque
+ *  server-computed `graphRevision` over the FULL topology (nodes + edges) — optional so this stays
+ *  back-compatible with the pure contract shape. The web treats it as an OPAQUE string (never
+ *  hashes the graph itself). */
 export type WorkloadGraph = {
   nodes: ResourceNode[];
   edges: DependencyEdge[];
+  graphRevision?: string;
 };
 
 /** Mirrors `contracts.SourceReference`. `detail` is nullable-but-present. */
@@ -109,4 +113,21 @@ export type DriftReport = {
   stillFailing: Finding[];
   addedNodes: string[];
   removedNodes: string[];
+};
+
+/**
+ * Mirrors the API app's `ImpactResult` read model (issue #56) — the projection of the CANONICAL
+ * server-side `shared.blast_radius.compute_impact`. `states` maps every node id to its simulated
+ * `HealthState` when `failedNode` is down; `blastRadius === down.length`. This is a *read* shape
+ * only (the SPA never posts an impact). Do not add fields the backend does not send.
+ */
+export type ImpactResult = {
+  failedNode: string;
+  states: Record<string, HealthState>;
+  blastRadius: number;
+  down: string[];
+  degraded: string[];
+  /** Opaque server-computed revision of the topology the impact was computed on. Compare (as a
+   *  string) with the displayed graph's `graphRevision` to detect edge-level staleness. */
+  graphRevision: string;
 };

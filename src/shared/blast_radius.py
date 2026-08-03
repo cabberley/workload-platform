@@ -6,9 +6,29 @@ redundancy (a redundant dependency edge degrades rather than downs the dependent
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 
 from shared.contracts import DependencyEdge, HealthState, WorkloadGraph
+
+
+def graph_revision(graph: WorkloadGraph) -> str:
+    """Return a stable, order-independent revision hash over the FULL topology (nodes + edges).
+
+    Pure and deterministic (no I/O): the SAME function produces the value the API attaches to both
+    the graph and the impact responses, so the web never hashes a graph itself (no TS/Python
+    divergence). Two graphs share a revision iff they have the same node id set AND the same set of
+    edges — including edge attributes (``type``, ``redundant``) — so an edge-only change (same
+    nodes, different/removed edge) yields a DIFFERENT revision. Reordering nodes or edges does not
+    change it: both are canonicalised by sorting before hashing.
+    """
+    nodes = sorted(n.id for n in graph.nodes)
+    edges = sorted(
+        [e.source, e.target, str(e.type), bool(e.redundant)] for e in graph.edges
+    )
+    canonical = json.dumps({"nodes": nodes, "edges": edges}, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _dependents_index(edges: list[DependencyEdge]) -> dict[str, list[DependencyEdge]]:

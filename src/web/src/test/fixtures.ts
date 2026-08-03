@@ -31,6 +31,7 @@ export function makeGraph(overrides: Partial<WorkloadGraph> = {}): WorkloadGraph
       { source: "n-web", target: "n-api", type: "depends_on", redundant: true, origin: "auto" },
       { source: "n-api", target: "n-db", type: "depends_on", redundant: false, origin: "auto" },
     ],
+    graphRevision: "rev-fake-1",
     ...overrides,
   };
 }
