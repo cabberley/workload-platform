@@ -17,6 +17,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from modules.aiops.connectors.azure_monitor import to_signals as azure_monitor_to_signals
 from modules.aiops.connectors.system_pulse import FetchResult, Signal
 from modules.aiops.connectors.system_pulse import to_signals as system_pulse_to_signals
+from modules.aiops.rca import (
+    RCA_CONFIDENCE_FLOOR,
+    correlate_rca,
+    correlate_root_cause,
+)
 from shared.blast_radius import blast_radius
 from shared.contracts import (
     AgentResponse,
@@ -54,8 +59,8 @@ _MANIFEST = ModuleManifest(
     ),
 )
 
-# Confidence below which we do not assert an RCA — we advise contacting support instead.
-RCA_CONFIDENCE_FLOOR = 0.6
+# ``RCA_CONFIDENCE_FLOOR`` and the correlation logic live in ``modules.aiops.rca`` (issue #50) and
+# are imported above; re-exported here so the module's public RCA surface is unchanged.
 
 
 def detect_metric_breach(signal: dict) -> Finding | None:
@@ -83,30 +88,6 @@ def detect_metric_breach(signal: dict) -> Finding | None:
         evidence=[SourceReference(kind="metric", id=signal["name"],
                                   detail=f"{signal['value']} {op} {signal['threshold']}")],
         detail="Proactive detection from telemetry pack threshold.",
-    )
-
-
-def correlate_rca(finding: Finding, blast_radius_of: dict[str, int]) -> AgentResponse:
-    """Localize likely root cause using blast radius; gate assertions by confidence."""
-    node = finding.nodeId or "unknown"
-    radius = blast_radius_of.get(node, 0)
-    confidence = 0.8 if radius > 0 else 0.4
-    if confidence >= RCA_CONFIDENCE_FLOOR:
-        recs = [f"Investigate {node} (blast radius {radius}) as probable root cause."]
-        nxt = ["propose-remediation"]
-    else:
-        recs = ["Root cause not confidently localized."]
-        nxt = ["recommend-contact-support"]
-    return AgentResponse(
-        agentName="aiops",
-        taskType="auto-rca",
-        inputSummary=f"finding={finding.id}",
-        findings=[finding.title],
-        risks=[f"blast radius {radius}"] if radius else [],
-        recommendations=recs,
-        sourceReferences=finding.evidence,
-        confidence=confidence,
-        nextActions=nxt,
     )
 
 
@@ -576,11 +557,15 @@ class AiopsModule(Module):
                 continue
 
             workload_detections = fuse_detections(rules, signals, state.get_estate(workload))
-            blast_of = _blast_radius_map(state.get_graph(workload))
+            graph = state.get_graph(workload)
+            blast_of = _blast_radius_map(graph)
             for finding in workload_detections:
                 if finding.nodeId is not None:
                     finding.blastRadius = blast_of.get(finding.nodeId, 0)
-                rca_responses.append(correlate_rca(finding, blast_of))
+            # Graph-wide, multi-detection correlation (issue #50): one correlated RCA per workload's
+            # active detection set. Single-finding sets preserve the original single-node semantics.
+            if workload_detections:
+                rca_responses.append(correlate_root_cause(workload_detections, graph))
             detections.extend(workload_detections)
 
         # Accurate accounting (partial outages preserved): ``sourcesAvailable`` = sources that
@@ -623,7 +608,9 @@ class AiopsModule(Module):
 
 __all__ = [
     "AiopsModule",
+    "RCA_CONFIDENCE_FLOOR",
     "correlate_rca",
+    "correlate_root_cause",
     "detect_metric_breach",
     "fuse_detections",
     "load_telemetry_rules",
