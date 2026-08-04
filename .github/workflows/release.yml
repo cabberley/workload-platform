@@ -146,6 +146,30 @@ jobs:
               containerRegistry="${{ vars.ACR_NAME }}" \
               imageTag="${{ env.IMAGE_TAG }}"
 
+      # Brownfield fix (issue #79): incremental ARM does NOT delete the pre-#79 single shared
+      # identity nor its Storage Blob/Table Data Contributor assignments, so an environment first
+      # deployed with the shared identity would RETAIN a state-writer that is neither the api nor the
+      # worker. This step reuses the CD OIDC login (keyless — the destructive delete stays in CD, not
+      # a script identity) to (a) remove that legacy writer and (b) FAIL the release, fail-closed, if
+      # ANY principal other than the api/worker identities still holds a state-write role at the
+      # storage account. It is a no-op on greenfield (nothing stray to remove).
+      - name: Enforce API-only-writer boundary (cleanup legacy identity + verify)
+        run: |
+          set -euo pipefail
+          outputs=$(az deployment group show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "wp-${{ env.IMAGE_TAG }}" \
+            --query properties.outputs -o json)
+          SA_ID=$(echo "$outputs" | jq -r '.storageAccountId.value')
+          API_PID=$(echo "$outputs" | jq -r '.apiIdentityPrincipalId.value')
+          WORKER_PID=$(echo "$outputs" | jq -r '.workerIdentityPrincipalId.value')
+          python3 scripts/cleanup_verify_state_writers.py \
+            --scope "$SA_ID" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --allow "$API_PID" \
+            --allow "$WORKER_PID" \
+            --cleanup
+
       - name: Output endpoints
         run: |
           az deployment group show \

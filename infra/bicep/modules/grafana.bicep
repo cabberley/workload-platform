@@ -1,8 +1,9 @@
 // grafana.bicep — Azure Managed Grafana as the telemetry visualization surface (issue #58, ADR
 // 0007). Keyless by construction:
-//   * The instance authenticates to its Azure Monitor data source with the SHARED user-assigned
-//     Managed Identity created in core.bicep (no Grafana API keys, no service-principal secrets).
-//     This identity is the DATA-SOURCE (read) identity ONLY.
+//   * The instance authenticates to its Azure Monitor data source with a DEDICATED read-only
+//     user-assigned Managed Identity created in core.bicep (identityGrafana, issue #79) — no Grafana
+//     API keys, no service-principal secrets. This identity is the DATA-SOURCE (read) identity ONLY
+//     and, unlike the api/worker identities, holds NO state-store write role (it can never write).
 //   * `apiKey: 'Disabled'` so no admin API keys can be issued for the instance.
 //   * Dashboards + the Azure Monitor data source are provisioned separately via the Grafana API
 //     (see infra/grafana/README.md) by a SEPARATE Entra caller (CI Managed Identity or operator)
@@ -10,8 +11,8 @@
 //     content and holds no Grafana Editor/Admin role. They are NOT child resources here, and no
 //     board JSON, workspace id, subscription id or token is embedded in this template.
 //
-// Least privilege: the shared identity is granted ONLY read roles required by the Azure Monitor
-// data source — Monitoring Reader (metrics + the resources' monitoring config) and Log Analytics
+// Least privilege: the dedicated grafana identity is granted ONLY read roles required by the Azure
+// Monitor data source — Monitoring Reader (metrics + the resources' monitoring config) and Log Analytics
 // Reader (KQL over the in-boundary workspace). No write/admin (e.g. Grafana Admin, Monitoring
 // Contributor) role is granted. See the role-assignment comments below for the scope rationale.
 param location string = resourceGroup().location
@@ -23,10 +24,10 @@ param namePrefix string = 'wp'
 @description('Resource token to keep the globally-unique Grafana name stable per resource group')
 param resourceToken string = uniqueString(resourceGroup().id)
 
-@description('Resource id of the shared user-assigned Managed Identity (from core.outputs.identityId)')
+@description('Resource id of the dedicated read-only Grafana user-assigned Managed Identity (from core.outputs.identityGrafanaId, issue #79)')
 param identityResourceId string
 
-@description('Principal (object) id of that identity (from core.outputs.identityPrincipalId) — the RBAC target')
+@description('Principal (object) id of that identity (from core.outputs.identityGrafanaPrincipalId) — the RBAC target')
 param identityPrincipalId string
 
 @description('Name of the in-boundary Log Analytics workspace (from core.outputs.logAnalyticsName). Used to scope the Log Analytics Reader assignment to that single workspace — least privilege.')
@@ -51,8 +52,8 @@ resource grafana 'Microsoft.Dashboard/grafana@2023-09-01' = {
   sku: {
     name: grafanaSku
   }
-  // Keyless: reuse the shared user-assigned identity (same one core.bicep uses for AcrPull / queue
-  // / Key Vault) so the Azure Monitor data source authenticates as a workload identity — no keys.
+  // Keyless: use the dedicated read-only grafana user-assigned identity (issue #79) so the Azure
+  // Monitor data source authenticates as a workload identity — no keys, and no write role.
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

@@ -2,7 +2,9 @@
 //   * Azure Container Registry (keyless; images pulled via Managed Identity / AcrPull)
 //   * Log Analytics workspace + Container Apps managed environment
 //   * Storage account + the KEDA queues the module triggers reference
-//   * User-assigned Managed Identity (one identity, least-privilege role assignments)
+//   * Per-component user-assigned Managed Identities (issue #79) — one each for the API core, the
+//     module worker/job compute, the web front-end, and the Grafana read surface — with roles
+//     scoped so ONLY the writers (api + worker/job) hold the state-store WRITE data roles.
 //   * Key Vault (runtime secrets by reference — never in code/outputs)
 // Everything is keyless via Managed Identity. No keys/connection strings are emitted as outputs.
 @description('Azure region')
@@ -32,7 +34,14 @@ param queueNames array = [
 
 var laName = '${namePrefix}-log-${resourceToken}'
 var envName = '${namePrefix}-env-${resourceToken}'
-var idName = '${namePrefix}-id-${resourceToken}'
+// Per-component user-assigned identities (issue #79). Each ACA app/job runs as ITS OWN identity so
+// component-level least privilege is enforced by RBAC, not just by convention. The writers (api +
+// worker/job) are the ONLY principals granted the state-store WRITE data roles; the web front-end
+// is a reader; the grafana identity is a read-only Azure Monitor data-source principal.
+var idApiName = '${namePrefix}-id-api-${resourceToken}'
+var idWorkerName = '${namePrefix}-id-worker-${resourceToken}'
+var idWebName = '${namePrefix}-id-web-${resourceToken}'
+var idGrafanaName = '${namePrefix}-id-grafana-${resourceToken}'
 var kvName = take('${namePrefix}kv${resourceToken}', 24)
 var saName = take('${namePrefix}st${resourceToken}', 24)
 
@@ -46,9 +55,38 @@ var keyVaultSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'          
 var readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'                        // Reader
 var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'    // Storage Blob Data Contributor
 var storageTableDataContributorRoleId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'   // Storage Table Data Contributor
+// Read-plane monitor roles for the worker identity's Azure Monitor connector (aiops). The Grafana
+// data-source identity gets its OWN copies of these two roles in grafana.bicep — a different
+// principal, so there is no RoleAssignmentExists conflict (the shared-identity coupling that used to
+// forbid re-declaring them here no longer applies now that identities are per-component).
+var monitoringReaderRoleId = '43d0d8ad-25c7-4714-9337-8ba259a9fe05'              // Monitoring Reader
+var logAnalyticsReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'            // Log Analytics Reader
 
-resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: idName
+// ---- Per-component user-assigned managed identities (issue #79) ----
+// api    : the single-writer API core.
+// worker : ALL module workers (aiops, alerts) and jobs (discovery, quality_checks, reassessments,
+//          dependency_graph) — they run modules, so they are writers and hold the read-plane roles
+//          their connectors need. Per the issue's "one for the worker/job" guidance this is a single
+//          identity whose role set is the UNION of what the module workers/jobs need.
+// web    : the read-only front-end — it talks only to the API and gets NO state-store write role.
+// grafana: read-only Azure Monitor data-source principal (see grafana.bicep) — no write, no AcrPull.
+resource identityApi 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: idApiName
+  location: location
+}
+
+resource identityWorker 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: idWorkerName
+  location: location
+}
+
+resource identityWeb 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: idWebName
+  location: location
+}
+
+resource identityGrafana 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: idGrafanaName
   location: location
 }
 
@@ -125,115 +163,230 @@ resource envDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-previe
   }
 }
 
-// ---- Keyless role assignments for the shared module identity (least privilege) ----
-// AcrPull so every module can pull its image without a registry credential.
-resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(registry.id, identity.id, acrPullRoleId)
+// ======================================================================================
+// Keyless, least-privilege role assignments (issue #79 splits write vs read across identities).
+// Assignment names are guid(scope, identity, roleId) so they are deterministic and idempotent; each
+// per-component identity produces a DISTINCT name for the same role+scope.
+//
+// Component → identity → roles matrix enforced below:
+//   api     (writer) : AcrPull · Queue Data Contributor · KV Secrets User · Blob+Table Data Contributor
+//   worker  (writer) : AcrPull · Queue Data Contributor · KV Secrets User · Blob+Table Data Contributor
+//                      · Reader (RG) · Monitoring Reader (RG) · Log Analytics Reader (workspace)
+//   web     (reader) : AcrPull · KV Secrets User          ← NO storage data role, NO queue role
+//   grafana (reader) : Monitoring Reader + Log Analytics Reader (assigned in grafana.bicep)
+// The state-store WRITE data roles (Blob/Table Data Contributor) are granted to the api and worker
+// identities ONLY. The web identity never receives them, so the "API is the only writer" boundary
+// (with the worker/job that runs modules) is enforced by RBAC, not merely by convention.
+// ======================================================================================
+
+// ---- AcrPull: each container principal pulls its image without a registry credential ----
+resource acrPullApi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, identityApi.id, acrPullRoleId)
   scope: registry
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
-    principalId: identity.properties.principalId
+    principalId: identityApi.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource acrPullWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, identityWorker.id, acrPullRoleId)
+  scope: registry
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: identityWorker.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource acrPullWeb 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, identityWeb.id, acrPullRoleId)
+  scope: registry
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: identityWeb.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
-// Storage Queue Data Contributor: modules enqueue/dequeue work and KEDA reads queue length.
-resource queueDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, identity.id, storageQueueDataContributorRoleId)
+// ---- Storage Queue Data Contributor: enqueue/dequeue work + KEDA queue-length reads ----
+// Only the API (dispatches work onto the queues) and the worker/job compute (module KEDA scalers
+// + enqueue/dequeue) authenticate to queues. The web front-end scales on HTTP concurrency only and
+// never touches a queue, so it is deliberately NOT granted this role.
+resource queueDataContributorApi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identityApi.id, storageQueueDataContributorRoleId)
   scope: storage
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageQueueDataContributorRoleId)
-    principalId: identity.properties.principalId
+    principalId: identityApi.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource queueDataContributorWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identityWorker.id, storageQueueDataContributorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageQueueDataContributorRoleId)
+    principalId: identityWorker.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
-// Key Vault Secrets User: runtime secrets are read by identity, never embedded.
-resource kvSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, identity.id, keyVaultSecretsUserRoleId)
+// ---- Key Vault Secrets User: runtime secrets read by identity, never embedded ----
+// Granted to the SECRET-CONSUMING container principals ONLY — the api and worker, which resolve
+// their own runtime config from Key Vault by reference. Read-only (Secrets User, not Officer). The
+// web identity is deliberately excluded: the web component is a static nginx SPA that reads no
+// runtime secret from Key Vault (module-app.bicep defines no `secrets`/Key Vault `secretRef`), so
+// granting it vault-wide secret read would needlessly widen the blast radius of the public,
+// internet-facing frontend (least-privilege, guardrail #7). The grafana identity reads no Key Vault.
+resource kvSecretsUserApi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, identityApi.id, keyVaultSecretsUserRoleId)
   scope: keyVault
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultSecretsUserRoleId)
-    principalId: identity.properties.principalId
+    principalId: identityApi.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource kvSecretsUserWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, identityWorker.id, keyVaultSecretsUserRoleId)
+  scope: keyVault
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultSecretsUserRoleId)
+    principalId: identityWorker.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
-// ---- Read-plane role assignments (issue #80) — least privilege, keyless ----
-// The six capability modules share this SINGLE user-assigned identity, so its effective permission
-// set is the UNION of what every read-plane client needs. Each grant below names its real Python
-// consumer and whether that consumer is wired in deployment today or forward-looking, so the intent
-// is deliberate — not accidental over-grant.
+// ---- Read-plane role assignments (issue #80 intent preserved, now scoped to the WORKER only) ----
+// The read-plane clients (ARG discovery, network topology, the aiops Azure Monitor connector) all
+// run inside the worker/job compute, so these grants move from the old shared identity to the
+// worker identity. The web and grafana identities do NOT receive them (grafana gets its own
+// monitor-read pair in grafana.bicep). The worker identity's effective set is the UNION of what the
+// module workers/jobs need — the issue explicitly sanctions "one for the worker/job".
 
-// Reader (management-plane */read). Consumers:
+// Reader (management-plane */read). Consumers (all worker/job compute):
 //   * Azure Resource Graph discovery — src/modules/discovery/arg.py (AzureResourceGraphClient):
 //     read-only KQL over resources (id/name/type/tags). ACTIVE — the discovery Job runs today.
 //   * Network-topology reads — src/modules/dependency_graph/topology.py
 //     (AzureNetworkTopologyClient): load balancers / application gateways / network interfaces
-//     read. FORWARD-LOOKING — the client is injected via ctx.clients["network"] but not yet wired
-//     into the deployed job's env; provisioning its least-privilege role now keeps it fail-closed
-//     rather than fail-open when wired.
+//     read. FORWARD-LOOKING — injected via ctx.clients["network"] but not yet wired into the
+//     deployed job's env; provisioning its least-privilege role now keeps it fail-closed.
 // Reader also transitively covers the Azure Monitor connector's in-RG reads: */read includes
 // Microsoft.Insights/*/read (metrics) and Microsoft.OperationalInsights/workspaces/query/*/read
-// (Log Analytics). That connector additionally holds explicit Monitoring Reader (RG scope) +
-// Log Analytics Reader (workspace scope) on this SAME shared identity from grafana.bicep — so those
-// two roles are NOT re-declared here: a second assignment for the same principal+role+scope is
-// rejected by Azure with RoleAssignmentExists. See infra/bicep/README.md for the read-plane matrix.
+// (Log Analytics); explicit Monitoring Reader + Log Analytics Reader for that connector are ALSO
+// granted to the worker below (a distinct principal from the grafana identity, so no conflict).
 //
 // SCOPE — this is a resourceGroup-scoped deployment (main.bicep targetScope = 'resourceGroup'), so
 // Reader is assigned at the RESOURCE GROUP: the narrowest scope this template can grant inline. ARG
 // discovery reads across the SUBSCRIPTION, so subscription-wide discovery additionally requires a
 // SUBSCRIPTION-scope Reader applied SEPARATELY (it cannot be created from an RG-scoped deployment).
-// At this RG scope, ARG returns only the in-boundary resources in this resource group. This is
-// documented — we do NOT over-claim subscription-wide discovery from an RG grant.
-resource reader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(resourceGroup().id, identity.id, readerRoleId)
+// At this RG scope, ARG returns only the in-boundary resources in this resource group.
+resource readerWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, identityWorker.id, readerRoleId)
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', readerRoleId)
-    principalId: identity.properties.principalId
+    principalId: identityWorker.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
-// Storage Table Data Contributor (data-plane). Consumer: the Azure state backend —
-// src/shared/state.py (AzureStateStore) — creates the snapshots/workloads tables and writes the
-// manifest entities that are its single commit point (create_table_if_not_exists / create_entity /
-// update_entity). It WRITES, so Contributor (not the read-only Table Data Reader) is required —
-// least privilege for a read+write consumer. FORWARD-LOOKING: the backend defaults to local and is
-// selected only when WORKLOADS_STATE_BACKEND=azure with the state endpoints wired; module-app.bicep
-// does not export those env vars yet. Scoped to the storage account (narrowest inline scope).
-resource stateTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, identity.id, storageTableDataContributorRoleId)
+// Monitoring Reader (RG scope) — the aiops Azure Monitor connector's metrics edge
+// (src/modules/aiops/connectors/azure_monitor.py). Metrics span multiple platform resources
+// (Container Apps, storage), so RG is the narrowest scope that resolves every metric. The grafana
+// data-source identity holds its OWN Monitoring Reader (grafana.bicep) — a different principal.
+resource monitoringReaderWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, identityWorker.id, monitoringReaderRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', monitoringReaderRoleId)
+    principalId: identityWorker.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Log Analytics Reader (workspace scope) — the aiops connector's logs edge
+// (LogsQueryClient.query_workspace) reads only the single in-boundary workspace, so the grant is
+// scoped to that workspace resource (least privilege), not the RG. The grafana data-source identity
+// holds its OWN workspace-scoped Log Analytics Reader (grafana.bicep) — a different principal.
+resource logAnalyticsReaderWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(logAnalytics.id, identityWorker.id, logAnalyticsReaderRoleId)
+  scope: logAnalytics
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', logAnalyticsReaderRoleId)
+    principalId: identityWorker.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ---- State-store WRITE data roles (the API-only-writer boundary) — api + worker ONLY ----
+// Consumer: the Azure state backend — src/shared/state.py (AzureStateStore). It creates the
+// snapshots/workloads tables and writes the manifest entities that are its single commit point
+// (create_table_if_not_exists / create_entity / update_entity), and creates the state container +
+// uploads/reads the immutable version-scoped estate/graph/findings blobs (create_container /
+// upload_blob / download_blob). Because it WRITES, the Contributor data roles are required, not the
+// read-only *Data Reader variants (Contributor ⊇ Reader). FORWARD-LOOKING: the backend defaults to
+// local and is selected only when WORKLOADS_STATE_BACKEND=azure with the state endpoints wired.
+//
+// These are granted to the api (the single writer) and the worker/job (which runs modules) ONLY.
+// The web (reader) identity is deliberately absent from these four assignments, so the web front-end
+// CANNOT write blobs or tables — the least-privilege boundary this issue enforces. Scoped to the
+// storage account (narrowest inline scope); allowSharedKeyAccess is false, so access is keyless.
+resource stateTableDataContributorApi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identityApi.id, storageTableDataContributorRoleId)
   scope: storage
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageTableDataContributorRoleId)
-    principalId: identity.properties.principalId
+    principalId: identityApi.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
-
-// Storage Blob Data Contributor (data-plane). Consumer: the same Azure state backend
-// (AzureStateStore) — creates the state container and uploads the immutable, version-scoped
-// estate/graph/findings blobs the manifest points at (create_container / upload_blob), as well as
-// reading them back (download_blob). Because it WRITES blobs, Contributor is required, not the
-// read-only Storage Blob Data Reader (Contributor ⊇ Reader, so it also covers any read-only
-// pack-content blob access under this shared identity). FORWARD-LOOKING alongside the table grant
-// above. Scoped to the storage account.
-resource stateBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, identity.id, storageBlobDataContributorRoleId)
+resource stateTableDataContributorWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identityWorker.id, storageTableDataContributorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageTableDataContributorRoleId)
+    principalId: identityWorker.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource stateBlobDataContributorApi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identityApi.id, storageBlobDataContributorRoleId)
   scope: storage
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
-    principalId: identity.properties.principalId
+    principalId: identityApi.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource stateBlobDataContributorWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identityWorker.id, storageBlobDataContributorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
+    principalId: identityWorker.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
 output environmentId string = env.id
-output identityId string = identity.id
-output identityClientId string = identity.properties.clientId
-output identityPrincipalId string = identity.properties.principalId
+// Per-component identity outputs (issue #79). main.bicep threads each component's OWN identity into
+// its ACA app/job; grafana.bicep receives the read-only grafana identity.
+output identityApiId string = identityApi.id
+output identityApiClientId string = identityApi.properties.clientId
+// Principal (object) ids of the two WRITER identities — surfaced so the post-deploy CD gate can
+// assert that ONLY these principals hold Blob/Table Data Contributor at the storage-account scope
+// (issue #79 brownfield fix). No secrets: an object id is not a credential.
+output identityApiPrincipalId string = identityApi.properties.principalId
+output identityWorkerId string = identityWorker.id
+output identityWorkerClientId string = identityWorker.properties.clientId
+output identityWorkerPrincipalId string = identityWorker.properties.principalId
+output identityWebId string = identityWeb.id
+output identityWebClientId string = identityWeb.properties.clientId
+output identityGrafanaId string = identityGrafana.id
+output identityGrafanaPrincipalId string = identityGrafana.properties.principalId
 output storageName string = storage.name
+// Storage-account resource id — the SCOPE the post-deploy CD gate lists state-write role
+// assignments against to enforce the API-only-writer boundary (issue #79 brownfield fix).
+output storageAccountId string = storage.id
 output keyVaultName string = keyVault.name
 output logAnalyticsId string = logAnalytics.id
 output logAnalyticsName string = logAnalytics.name
