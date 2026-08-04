@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -172,6 +173,177 @@ def test_add_findings_upserts_by_id(store: LocalStateStore) -> None:
     assert findings[0].passed is True
 
 
+def test_cross_module_same_id_findings_both_persist(store: LocalStateStore) -> None:
+    # R5: findings are identified by (module, finding_id). A dependency_graph SPOF FAIL and an
+    # imported quality_checks rule minting the SAME id (``spof::N``) are DISTINCT rows — the
+    # quality_checks PASS must NOT overwrite (hide) the dependency_graph single-point-of-failure.
+    store.add_findings("epic", [_finding("spof::vm-odb-1", "dependency_graph", passed=False)])
+    store.add_findings("epic", [_finding("spof::vm-odb-1", "quality_checks", passed=True)])
+
+    all_findings = store.get_findings("epic")
+    assert len(all_findings) == 2
+    by_module = {f.module: f for f in all_findings}
+    # The shipped dependency_graph FAIL is intact — the imported PASS did not clobber it.
+    assert by_module["dependency_graph"].id == "spof::vm-odb-1"
+    assert by_module["dependency_graph"].passed is False
+    assert by_module["quality_checks"].passed is True
+    # And a per-module read still returns only that module's row.
+    dep = store.get_findings("epic", module="dependency_graph")
+    assert [(f.id, f.passed) for f in dep] == [("spof::vm-odb-1", False)]
+
+
+def test_same_module_same_id_still_upserts(store: LocalStateStore) -> None:
+    # Within ONE (module, id) the new write still wins (unchanged last-wins semantics).
+    store.add_findings("epic", [_finding("spof::n", "dependency_graph", passed=False)])
+    store.add_findings("epic", [_finding("spof::n", "dependency_graph", passed=True)])
+    rows = store.get_findings("epic", module="dependency_graph")
+    assert [(f.id, f.passed) for f in rows] == [("spof::n", True)]
+
+
+# --------------------------------------------------------------------------------------
+# R6 — legacy `findings` PK migration: (workload, finding_id) → (workload, module, finding_id).
+# An on-disk state.db created before the R5 change keeps the 2-column PK; without migration the new
+# ON CONFLICT(workload, module, finding_id) upsert raises OperationalError. The store migrates it
+# atomically at init.
+# --------------------------------------------------------------------------------------
+_LEGACY_TS = "2020-01-01T00:00:00Z"
+
+
+def _legacy_findings_db(db_path: Path, rows: list[tuple], *, module_not_null: bool = True) -> None:
+    """Create a state.db carrying the LEGACY findings schema (PK (workload, finding_id))."""
+    module_decl = "module TEXT NOT NULL" if module_not_null else "module TEXT"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE findings ("
+            " workload TEXT NOT NULL, finding_id TEXT NOT NULL, " + module_decl + ","
+            " data TEXT NOT NULL, updated_at TEXT NOT NULL,"
+            " PRIMARY KEY (workload, finding_id))"
+        )
+        conn.executemany(
+            "INSERT INTO findings (workload, finding_id, module, data, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _findings_ddl(db_path: Path) -> str:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='findings'"
+        ).fetchone()
+        return str(row[0]) if row else ""
+    finally:
+        conn.close()
+
+
+def _raw_findings(db_path: Path) -> list[tuple[str, str, str]]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [
+            (str(r["workload"]), str(r["finding_id"]), str(r["module"]))
+            for r in conn.execute(
+                "SELECT workload, finding_id, module FROM findings ORDER BY module, finding_id"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _legacy_row(fid: str, module: str, *, passed: bool, module_col: str | None = ...) -> tuple:
+    data = _finding(fid, module, passed=passed).model_dump_json()
+    col = module if module_col is ... else module_col
+    return ("epic", fid, col, data, _LEGACY_TS)
+
+
+def test_migrates_legacy_findings_pk_and_preserves_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    _legacy_findings_db(db_path, [
+        _legacy_row("spof::vm-1", "dependency_graph", passed=False),
+        _legacy_row("q1", "quality_checks", passed=False),
+    ])
+    assert "primary key (workload, finding_id)" in _findings_ddl(db_path).lower()
+
+    store = LocalStateStore(str(tmp_path))
+
+    # (a) the migration ran — the table now declares the 3-column PK.
+    ddl = "".join(_findings_ddl(db_path).lower().split())
+    assert "primarykey(workload,module,finding_id)" in ddl
+
+    # (b) all legacy rows survive with correct module values (checked at the column level).
+    assert _raw_findings(db_path) == [
+        ("epic", "spof::vm-1", "dependency_graph"),
+        ("epic", "q1", "quality_checks"),
+    ]
+    assert {(f.id, f.module, f.passed) for f in store.get_findings("epic")} == {
+        ("spof::vm-1", "dependency_graph", False),
+        ("q1", "quality_checks", False),
+    }
+
+    # (c) the new PK is active: the SAME finding_id under a DIFFERENT module persists as a 2nd row.
+    store.add_findings("epic", [_finding("spof::vm-1", "quality_checks", passed=True)])
+    spof_rows = {
+        (f.module, f.passed) for f in store.get_findings("epic") if f.id == "spof::vm-1"
+    }
+    assert spof_rows == {("dependency_graph", False), ("quality_checks", True)}
+
+    # (d) re-writing the same (workload, module, finding_id) upserts last-wins (one row).
+    store.add_findings("epic", [_finding("spof::vm-1", "dependency_graph", passed=True)])
+    dep = store.get_findings("epic", module="dependency_graph")
+    assert [(f.id, f.passed) for f in dep] == [("spof::vm-1", True)]
+
+
+def test_findings_pk_migration_is_idempotent(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    _legacy_findings_db(db_path, [_legacy_row("q1", "quality_checks", passed=False)])
+    LocalStateStore(str(tmp_path))  # first init migrates
+    migrated_ddl = _findings_ddl(db_path)
+    # Second init against the already-migrated DB is a no-op and must not raise.
+    LocalStateStore(str(tmp_path))
+    assert _findings_ddl(db_path) == migrated_ddl
+    assert _raw_findings(db_path) == [("epic", "q1", "quality_checks")]
+
+
+def test_findings_pk_migration_backfills_null_module_from_data(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    # A partial legacy shape: nullable module column, NULL for this row, but module in data JSON.
+    _legacy_findings_db(
+        db_path,
+        [_legacy_row("spof::vm-1", "dependency_graph", passed=False, module_col=None)],
+        module_not_null=False,
+    )
+    store = LocalStateStore(str(tmp_path))
+    # The migration backfilled the module column from data JSON — the row survives, module correct.
+    assert _raw_findings(db_path) == [("epic", "spof::vm-1", "dependency_graph")]
+    assert [(f.id, f.module) for f in store.get_findings("epic")] == [
+        ("spof::vm-1", "dependency_graph")
+    ]
+
+
+def test_azure_merge_findings_is_module_qualified() -> None:
+    # R5: the Azure backend merges committed findings by (module, id), not id alone — so an
+    # imported quality_checks PASS ``spof::N`` cannot clobber the dependency_graph SPOF FAIL. This
+    # exercises the pure staticmethod directly; no azure SDK / network is required.
+    previous = [_finding("spof::vm-1", "dependency_graph", passed=False)]
+    new = [_finding("spof::vm-1", "quality_checks", passed=True)]
+    merged = AzureStateStore._merge_findings(previous, new)
+    by_module = {f.module: f for f in merged}
+    assert len(merged) == 2
+    assert by_module["dependency_graph"].passed is False   # shipped SPOF FAIL preserved
+    assert by_module["quality_checks"].passed is True
+    # New-wins still applies WITHIN the same (module, id).
+    merged2 = AzureStateStore._merge_findings(
+        [_finding("spof::vm-1", "dependency_graph", passed=False)],
+        [_finding("spof::vm-1", "dependency_graph", passed=True)],
+    )
+    assert [(f.module, f.passed) for f in merged2] == [("dependency_graph", True)]
+
+
 def test_list_workloads_unions_all_kinds(store: LocalStateStore) -> None:
     store.put_estate("epic", _nodes())
     store.put_graph("sap", _graph())
@@ -224,6 +396,34 @@ def test_compute_drift_new_recovered_still() -> None:
     assert [f.id for f in drift.newFailures] == ["q3"]
     assert [f.id for f in drift.recovered] == ["q2"]
     assert [f.id for f in drift.stillFailing] == ["q1"]
+
+
+def test_compute_drift_cross_module_same_id_is_module_qualified() -> None:
+    # R5: drift keys findings by (module, id). A dependency_graph FAIL ``spof::N`` that RECOVERS
+    # (now PASS) while an imported quality_checks rule NEWLY fails with the SAME id ``spof::N`` must
+    # be diffed as one recovery + one new failure — never masked as "unchanged" by id-only keying.
+    previous = [_finding("spof::N", "dependency_graph", passed=False)]
+    current = [
+        _finding("spof::N", "dependency_graph", passed=True),    # dep_graph SPOF recovered
+        _finding("spof::N", "quality_checks", passed=False),     # imported rule newly failing
+    ]
+    drift = compute_drift(previous, current, workload="epic")
+    assert [(f.module, f.id) for f in drift.newFailures] == [("quality_checks", "spof::N")]
+    assert [(f.module, f.id) for f in drift.recovered] == [("dependency_graph", "spof::N")]
+    assert drift.stillFailing == []
+
+
+def test_compute_drift_cross_module_pass_does_not_mask_shipped_fail() -> None:
+    # A cross-module PASS with a colliding id must NOT be reported as recovering a DIFFERENT
+    # module's still-live FAIL.
+    previous = [_finding("spof::N", "dependency_graph", passed=False)]
+    current = [
+        _finding("spof::N", "dependency_graph", passed=False),   # dep_graph SPOF still failing
+        _finding("spof::N", "quality_checks", passed=True),      # imported rule passes (advisory)
+    ]
+    drift = compute_drift(previous, current, workload="epic")
+    assert drift.recovered == []
+    assert [(f.module, f.id) for f in drift.stillFailing] == [("dependency_graph", "spof::N")]
 
 
 def test_compute_drift_reports_estate_node_deltas() -> None:
