@@ -36,10 +36,16 @@ var idName = '${namePrefix}-id-${resourceToken}'
 var kvName = take('${namePrefix}kv${resourceToken}', 24)
 var saName = take('${namePrefix}st${resourceToken}', 24)
 
-// Built-in role definition ids (keyless RBAC — least privilege).
+// Built-in role definition ids (keyless RBAC — least privilege). Every GUID below was verified with
+// `az role definition list --name "<Role Name>" --query "[0].name"` against the target tenant.
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'                      // AcrPull
 var storageQueueDataContributorRoleId = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'  // Storage Queue Data Contributor
 var keyVaultSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'          // Key Vault Secrets User
+// Read-plane roles (issue #80). Reader is a management-plane read role; the storage data roles are
+// data-plane. None grants any management-plane write (no Contributor at the control plane).
+var readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'                        // Reader
+var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'    // Storage Blob Data Contributor
+var storageTableDataContributorRoleId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'   // Storage Table Data Contributor
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: idName
@@ -153,6 +159,76 @@ resource kvSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+// ---- Read-plane role assignments (issue #80) — least privilege, keyless ----
+// The six capability modules share this SINGLE user-assigned identity, so its effective permission
+// set is the UNION of what every read-plane client needs. Each grant below names its real Python
+// consumer and whether that consumer is wired in deployment today or forward-looking, so the intent
+// is deliberate — not accidental over-grant.
+
+// Reader (management-plane */read). Consumers:
+//   * Azure Resource Graph discovery — src/modules/discovery/arg.py (AzureResourceGraphClient):
+//     read-only KQL over resources (id/name/type/tags). ACTIVE — the discovery Job runs today.
+//   * Network-topology reads — src/modules/dependency_graph/topology.py
+//     (AzureNetworkTopologyClient): load balancers / application gateways / network interfaces
+//     read. FORWARD-LOOKING — the client is injected via ctx.clients["network"] but not yet wired
+//     into the deployed job's env; provisioning its least-privilege role now keeps it fail-closed
+//     rather than fail-open when wired.
+// Reader also transitively covers the Azure Monitor connector's in-RG reads: */read includes
+// Microsoft.Insights/*/read (metrics) and Microsoft.OperationalInsights/workspaces/query/*/read
+// (Log Analytics). That connector additionally holds explicit Monitoring Reader (RG scope) +
+// Log Analytics Reader (workspace scope) on this SAME shared identity from grafana.bicep — so those
+// two roles are NOT re-declared here: a second assignment for the same principal+role+scope is
+// rejected by Azure with RoleAssignmentExists. See infra/bicep/README.md for the read-plane matrix.
+//
+// SCOPE — this is a resourceGroup-scoped deployment (main.bicep targetScope = 'resourceGroup'), so
+// Reader is assigned at the RESOURCE GROUP: the narrowest scope this template can grant inline. ARG
+// discovery reads across the SUBSCRIPTION, so subscription-wide discovery additionally requires a
+// SUBSCRIPTION-scope Reader applied SEPARATELY (it cannot be created from an RG-scoped deployment).
+// At this RG scope, ARG returns only the in-boundary resources in this resource group. This is
+// documented — we do NOT over-claim subscription-wide discovery from an RG grant.
+resource reader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, identity.id, readerRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', readerRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Storage Table Data Contributor (data-plane). Consumer: the Azure state backend —
+// src/shared/state.py (AzureStateStore) — creates the snapshots/workloads tables and writes the
+// manifest entities that are its single commit point (create_table_if_not_exists / create_entity /
+// update_entity). It WRITES, so Contributor (not the read-only Table Data Reader) is required —
+// least privilege for a read+write consumer. FORWARD-LOOKING: the backend defaults to local and is
+// selected only when WORKLOADS_STATE_BACKEND=azure with the state endpoints wired; module-app.bicep
+// does not export those env vars yet. Scoped to the storage account (narrowest inline scope).
+resource stateTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identity.id, storageTableDataContributorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageTableDataContributorRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Storage Blob Data Contributor (data-plane). Consumer: the same Azure state backend
+// (AzureStateStore) — creates the state container and uploads the immutable, version-scoped
+// estate/graph/findings blobs the manifest points at (create_container / upload_blob), as well as
+// reading them back (download_blob). Because it WRITES blobs, Contributor is required, not the
+// read-only Storage Blob Data Reader (Contributor ⊇ Reader, so it also covers any read-only
+// pack-content blob access under this shared identity). FORWARD-LOOKING alongside the table grant
+// above. Scoped to the storage account.
+resource stateBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identity.id, storageBlobDataContributorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 output environmentId string = env.id
 output identityId string = identity.id
 output identityClientId string = identity.properties.clientId
@@ -160,5 +236,6 @@ output identityPrincipalId string = identity.properties.principalId
 output storageName string = storage.name
 output keyVaultName string = keyVault.name
 output logAnalyticsId string = logAnalytics.id
+output logAnalyticsName string = logAnalytics.name
 output registryName string = registry.name
 output registryLoginServer string = registry.properties.loginServer

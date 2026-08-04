@@ -49,6 +49,7 @@ module grafana 'modules/grafana.bicep' = {
     location: location
     identityResourceId: core.outputs.identityId
     identityPrincipalId: core.outputs.identityPrincipalId
+    logAnalyticsName: core.outputs.logAnalyticsName
   }
 }
 
