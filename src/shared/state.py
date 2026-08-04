@@ -730,7 +730,21 @@ class AzureStateStore:
         return str(downloader.readall())
 
     def _write_blob(self, name: str, data: str) -> None:
-        self._container.upload_blob(name, data.encode("utf-8"), overwrite=True)
+        """Write a blob **create-if-absent** (write-once) — never clobber an existing name.
+
+        Every blob this store writes is addressed by a UNIQUE, version-scoped name: the commit
+        components use a per-attempt ``{commit_id}=uuid4().hex`` (``_commit``) and the snapshot
+        blob uses a table-claimed monotonic sequence (``snapshot``). None of these paths ever
+        legitimately re-write an existing name — the mutable commit point is the *manifest table
+        entity*, guarded by its own ETag, NOT a blob. So we upload with ``overwrite=False``, which
+        the Azure SDK sends as a conditional ``If-None-Match: *`` create: a name collision (a
+        ret/racing rewrite, or an attacker overwriting a committed artifact in place) FAILS CLOSED
+        with ``ResourceExistsError`` instead of silently clobbering. This is the SDK-level
+        tamper-RESISTANCE that backs the storage-layer immutability/versioning posture (issue #81)
+        and the append-only hash-chain tamper-EVIDENCE (issue #59). Blob **versioning** on the
+        account (see ``infra/bicep/modules/core.bicep``) additionally retains any prior bytes.
+        """
+        self._container.upload_blob(name, data.encode("utf-8"), overwrite=False)
 
     # -- the manifest: the single commit point AND the sole read path --------------------
     def _manifest_with_etag(self, workload: str) -> tuple[dict[str, Any] | None, str | None]:

@@ -125,6 +125,9 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # Set the `MANAGE_STATE_IMMUTABILITY_POLICY` repository variable to `false` once the
+      # state-container WORM policy has been LOCKED out-of-band — Azure rejects any PUT on a locked
+      # immutability policy, so the pipeline must then stop managing it (see docs/adr/0009…).
       - name: What-if (preview changes)
         run: |
           az deployment group what-if \
@@ -133,7 +136,8 @@ jobs:
             --parameters \
               location="${{ vars.AZURE_LOCATION }}" \
               containerRegistry="${{ vars.ACR_NAME }}" \
-              imageTag="${{ env.IMAGE_TAG }}"
+              imageTag="${{ env.IMAGE_TAG }}" \
+              manageStateImmutabilityPolicy="${{ vars.MANAGE_STATE_IMMUTABILITY_POLICY || 'true' }}"
 
       - name: Deploy
         run: |
@@ -144,7 +148,8 @@ jobs:
             --parameters \
               location="${{ vars.AZURE_LOCATION }}" \
               containerRegistry="${{ vars.ACR_NAME }}" \
-              imageTag="${{ env.IMAGE_TAG }}"
+              imageTag="${{ env.IMAGE_TAG }}" \
+              manageStateImmutabilityPolicy="${{ vars.MANAGE_STATE_IMMUTABILITY_POLICY || 'true' }}"
 
       # Brownfield fix (issue #79): incremental ARM does NOT delete the pre-#79 single shared
       # identity nor its Storage Blob/Table Data Contributor assignments, so an environment first

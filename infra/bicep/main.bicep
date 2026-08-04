@@ -19,6 +19,9 @@ param containerRegistry string
 @description('Image tag to deploy (usually the release tag)')
 param imageTag string = 'latest'
 
+@description('Manage (create/update) the state container time-based immutability (WORM) policy from IaC (issue #81). Set FALSE once the policy has been LOCKED out-of-band — Azure rejects any PUT on a LOCKED immutability policy, so leaving this true would break every subsequent deployment (core is always deployed).')
+param manageStateImmutabilityPolicy bool = true
+
 // Long-running service modules run the persistent service entrypoint (cli.serve), which stays alive
 // and dispatches the module named by WP_MODULE. Jobs use cli.worker (run-once) via module-job.
 var serviceCommand = [ 'python', '-m', 'cli.serve' ]
@@ -28,6 +31,9 @@ module core 'modules/core.bicep' = {
   params: {
     location: location
     registryName: containerRegistry
+    // Threaded so an operator can flip it FALSE at deploy time AFTER locking the WORM policy
+    // out-of-band (Azure rejects any PUT on a locked immutability policy) — issue #81 / F1.
+    manageStateImmutabilityPolicy: manageStateImmutabilityPolicy
   }
 }
 

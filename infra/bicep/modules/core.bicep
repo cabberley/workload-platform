@@ -32,6 +32,32 @@ param queueNames array = [
   'findings'     // alerts module (azure-queue trigger)
 ]
 
+// ---- Audit/state tamper-resistance knobs (issue #81) ----
+// The state Blob container holds the write-once, version-scoped estate/graph/findings/snapshot/
+// manifest artifacts written by AzureStateStore (src/shared/state.py). Blob VERSIONING + soft delete
+// make an overwrite/delete of those BLOB STATE ARTIFACTS RECOVERABLE, and a time-based immutability
+// (WORM) policy makes them UN-deletable/UN-overwritable for the retention window — storage-layer
+// tamper-RESISTANCE for the BLOB state store. NOTE: these are BLOB-service controls and do NOT cover
+// the Azure-TABLE audit stream (the #59 hash chain is Table-based) — see the audit note above
+// stateTableDataContributorApi (~L429). Retention windows are parameterized.
+@description('Name of the durable state Blob container (mirrors WORKLOADS_STATE_CONTAINER, default "state").')
+@minLength(3)
+@maxLength(63)
+param stateContainerName string = 'state'
+
+@description('Soft-delete retention (days) for blobs AND containers on the state account — window to recover a deleted/overwritten state artifact.')
+@minValue(1)
+@maxValue(365)
+param stateSoftDeleteRetentionDays int = 7
+
+@description('Time-based immutability (WORM) retention (days) on the state container — an artifact cannot be deleted/overwritten until this elapses. Unlocked so a human can extend/lock it out-of-band.')
+@minValue(1)
+@maxValue(146000)
+param stateImmutabilityRetentionDays int = 7
+
+@description('Manage (create/update) the state container time-based immutability (WORM) policy from IaC. Set FALSE once the policy has been LOCKED out-of-band — Azure rejects any PUT on a LOCKED immutability policy, so leaving this true would break every subsequent deployment (main.bicep always deploys core).')
+param manageStateImmutabilityPolicy bool = true
+
 var laName = '${namePrefix}-log-${resourceToken}'
 var envName = '${namePrefix}-env-${resourceToken}'
 // Per-component user-assigned identities (issue #79). Each ACA app/job runs as ITS OWN identity so
@@ -129,6 +155,67 @@ resource queues 'Microsoft.Storage/storageAccounts/queueServices/queues@2023-05-
   parent: queueService
   name: q
 }]
+
+// ---- Blob service hardening for the state store (issue #81) ----
+// VERSIONING + CHANGE FEED + soft delete convert destructive blob operations from irreversible into
+// recoverable/audited: an overwrite creates a new VERSION (prior bytes retained), a delete is
+// SOFT (recoverable for the retention window), and the change feed is an append-only, out-of-band
+// log of every blob mutation. This hardens the BLOB STATE ARTIFACTS (estate/graph/findings/snapshot/
+// manifest blobs) and is keyless (no keys/SAS — access stays Managed-Identity only). It does NOT
+// protect the Azure-TABLE audit stream — the #59 audit hash chain is Table-based and these
+// blob-service controls do not cover Tables (see the audit note above stateTableDataContributorApi).
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  parent: storage
+  name: 'default'
+  properties: {
+    isVersioningEnabled: true                              // overwrite ⇒ new version, prior bytes retained
+    changeFeed: { enabled: true }                          // append-only out-of-band log of blob mutations
+    deleteRetentionPolicy: {                               // blob soft delete: a deleted blob is recoverable
+      enabled: true
+      days: stateSoftDeleteRetentionDays
+    }
+    containerDeleteRetentionPolicy: {                      // container soft delete: a deleted container is recoverable
+      enabled: true
+      days: stateSoftDeleteRetentionDays
+    }
+  }
+}
+
+// The durable state container, pre-created so a WORM policy can be attached (AzureStateStore also
+// create_container_if_not_exists at runtime — idempotent). Name mirrors WORKLOADS_STATE_CONTAINER.
+resource stateContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: stateContainerName
+  properties: {
+    publicAccess: 'None'                                   // in-boundary: never publicly reachable
+  }
+}
+
+// Time-based immutability (WORM) policy on the state container (issue #81). While in effect, a blob
+// cannot be deleted or overwritten until `immutabilityPeriodSinceCreationInDays` elapses — so a
+// Contributor-role principal can no longer delete/clobber committed state artifacts out-of-band.
+//   * Left UNLOCKED (no `state: 'Locked'`) so a human operator can EXTEND or LOCK it out-of-band per
+//     the customer's retention decision — locking is irreversible, so it is deliberately a human
+//     step, not baked into IaC (fail-closed by keeping the safer, reversible posture by default).
+//   * `allowProtectedAppendWrites: true` keeps APPEND-blob semantics available under the policy —
+//     honouring the append-only guardrail and forward-compatible with the documented migration of
+//     the audit log to an immutable append-blob container (see docs/adr/0009-...).
+//   * GATED on `manageStateImmutabilityPolicy` (default true). Azure REJECTS any PUT (create/update)
+//     on a LOCKED time-based immutability policy — you can only EXTEND retention via the dedicated
+//     action, never re-PUT (even with identical properties). Because main.bicep ALWAYS deploys core,
+//     leaving this resource unconditional would make the FIRST deployment after a human LOCKs the
+//     policy fail on this resource. Operational sequence: deploy (unlocked) → operator EXTENDs/LOCKs
+//     out-of-band per the retention decision → operator sets manageStateImmutabilityPolicy=false on
+//     all SUBSEQUENT deployments so IaC stops managing the now-locked policy. This is a leaf resource
+//     (no output/other resource references it), so the conditional cannot break any reference.
+resource stateContainerImmutability 'Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies@2023-05-01' = if (manageStateImmutabilityPolicy) {
+  parent: stateContainer
+  name: 'default'
+  properties: {
+    immutabilityPeriodSinceCreationInDays: stateImmutabilityRetentionDays
+    allowProtectedAppendWrites: true
+  }
+}
 
 resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: kvName
@@ -330,6 +417,32 @@ resource logAnalyticsReaderWorker 'Microsoft.Authorization/roleAssignments@2022-
 // The web (reader) identity is deliberately absent from these four assignments, so the web front-end
 // CANNOT write blobs or tables — the least-privilege boundary this issue enforces. Scoped to the
 // storage account (narrowest inline scope); allowSharedKeyAccess is false, so access is keyless.
+//
+// TABLE AUDIT STORE DESTRUCTIVE PERMISSIONS (issue #81) — why they are NOT restricted, this stays
+// Table Data Contributor, and NOT a narrower/custom append-only role:
+//   * The audit log is Azure-TABLE-based (AzureStateStore.append_audit, _AZ_AUDIT_TABLE). Azure
+//     Table Storage has NO built-in append-only data role, and its RBAC data actions
+//     (Microsoft.Storage/storageAccounts/tableServices/tables/entities/{read,write,add,update,
+//     delete}/action) CANNOT be scoped to an individual table by name — a custom role can only
+//     grant/deny an action across ALL tables on the account.
+//   * The single-writer commit path LEGITIMATELY needs entity update/merge on OTHER tables: the
+//     manifest commit point (workloads table, update_entity replace) and the snapshot pointer
+//     (snapshots table, update_entity merge). A role that denied entities/delete + entities/write
+//     to protect the audit table would therefore ALSO break those non-audit writes.
+//   * Conclusion: a truly append-only Table role is NOT expressible without breaking the writer.
+//     IMPORTANT — the blob-service controls above (versioning, change feed, blob/container soft
+//     delete, and the container WORM immutability policy) are BLOB-service controls scoped to the
+//     blob state CONTAINER: they protect the blob STATE artifacts (estate/graph/findings/snapshot/
+//     manifest blobs) and provide NO storage-layer tamper-resistance to Azure TABLE entities. The
+//     audit stream is a TABLE and the destructive Table role (Table Data Contributor) is UNCHANGED,
+//     so a principal holding it can still replace/delete audit event entities and advance the HEAD
+//     out-of-band. Table audit tamper-resistance TODAY therefore comes ONLY from (a) the
+//     application-level create-only + ETag-guarded append path (append_audit exposes no rewrite
+//     path) and (c) the documented migration of the audit log to an immutable append-blob container
+//     — which remains the REQUIRED (still-unresolved) path to genuine per-store audit WORM PRECISELY
+//     because the blob-service/WORM posture (b) does not cover Tables (see
+//     docs/adr/0009-audit-store-tamper-resistance.md). Because no role id changes, the CD gate
+//     scripts/cleanup_verify_state_writers.py (STATE_WRITE_ROLE_IDS) is intentionally UNCHANGED.
 resource stateTableDataContributorApi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, identityApi.id, storageTableDataContributorRoleId)
   scope: storage
