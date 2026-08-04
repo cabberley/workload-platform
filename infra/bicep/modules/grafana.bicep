@@ -29,6 +29,9 @@ param identityResourceId string
 @description('Principal (object) id of that identity (from core.outputs.identityPrincipalId) — the RBAC target')
 param identityPrincipalId string
 
+@description('Name of the in-boundary Log Analytics workspace (from core.outputs.logAnalyticsName). Used to scope the Log Analytics Reader assignment to that single workspace — least privilege.')
+param logAnalyticsName string
+
 @description('Grafana SKU. Standard is the only GA tier.')
 @allowed([ 'Standard' ])
 param grafanaSku string = 'Standard'
@@ -74,13 +77,25 @@ resource grafana 'Microsoft.Dashboard/grafana@2023-09-01' = {
   }
 }
 
+// Existing in-boundary Log Analytics workspace (created in core.bicep). Referenced here ONLY so the
+// Log Analytics Reader assignment below can be scoped to this single workspace (least privilege),
+// rather than the whole resource group.
+resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
+  name: logAnalyticsName
+}
+
 // ---- Least-privilege READ role assignments for the shared identity ----
-// Scope: the RESOURCE GROUP. Rationale — the whole in-boundary platform (Log Analytics workspace,
-// Container Apps, storage, the customer workload signals surfaced to Azure Monitor) is deployed
-// into this single resource group, so an RG-scoped read grant is the narrowest scope that still
-// lets the Azure Monitor data source resolve every metric/log the baseline boards query. It grants
-// NO access outside this RG and NO write/admin anywhere. If boards ever need to read a workspace in
-// another RG, add a second, explicitly-scoped assignment rather than widening this one.
+// Two roles, deliberately scoped DIFFERENTLY to stay least-privilege:
+//   * Monitoring Reader — RESOURCE GROUP scope. Metrics span MULTIPLE platform resources (Container
+//     Apps, storage, and the customer workload signals surfaced to Azure Monitor), not just the
+//     workspace, so RG is the narrowest scope that still lets the data source resolve every metric
+//     the baseline boards query. It grants NO access outside this RG and NO write/admin anywhere.
+//   * Log Analytics Reader — WORKSPACE scope. The log-backed panels (and the Azure Monitor
+//     connector's logs edge, LogsQueryClient.query_workspace) read only the SINGLE in-boundary
+//     workspace, so the assignment is scoped to that workspace resource — not the RG — so it grants
+//     query access to NO other workspace that may exist in the RG.
+// If boards ever need a workspace in another RG, add a second, explicitly-scoped assignment rather
+// than widening either of these.
 
 // Monitoring Reader: read metrics and the monitoring configuration of resources in this RG.
 resource monitoringReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -93,9 +108,12 @@ resource monitoringReader 'Microsoft.Authorization/roleAssignments@2022-04-01' =
 }
 
 // Log Analytics Reader: run KQL (read-only) over the in-boundary Log Analytics workspace for the
-// log-backed panels. Read-only — it cannot modify data-collection or workspace settings.
+// log-backed panels. Scoped to the workspace resource (least privilege) — the guid() seed includes
+// the workspace id so this is a distinct, idempotent assignment. Read-only — it cannot modify
+// data-collection or workspace settings.
 resource logAnalyticsReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(resourceGroup().id, identityPrincipalId, logAnalyticsReaderRoleId)
+  name: guid(logAnalytics.id, identityPrincipalId, logAnalyticsReaderRoleId)
+  scope: logAnalytics
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', logAnalyticsReaderRoleId)
     principalId: identityPrincipalId
