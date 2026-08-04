@@ -6,6 +6,7 @@ isolated, redundant-node issue is a low-priority ticket.
 """
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -46,6 +47,34 @@ _ESCALATION_ORDER = [Severity.info, Severity.low, Severity.medium, Severity.high
 # Channels that mean "silence this notification": an Ops Pack maps a severity here (e.g.
 # ``info`` -> ``"none"``) to suppress delivery. Empty/whitespace channels are treated the same.
 _SUPPRESSED_CHANNELS = frozenset({"none"})
+
+# Domain-separation prefix for the opaque outbound finding-id digest (see ``opaque_finding_id``).
+# Bumping the ``v1`` version (or the label) yields a DIFFERENT, non-colliding token space; keeping
+# it stable keeps tokens deterministic so an out-of-boundary receiver can still dedup on them.
+_OPAQUE_FINDING_ID_DOMAIN = b"wp-finding-id:v1|"
+
+
+def opaque_finding_id(finding_id: str) -> str:
+    """Opaque, keyless, deterministic token for an OUT-OF-BOUNDARY ``findingId``.
+
+    A raw :attr:`Finding.id` is ``"{rule}::{node.id}"`` and thus embeds the customer resource node
+    id. When a notification egresses OUTSIDE the customer boundary (see
+    :attr:`~modules.alerts.channels.NotificationChannel.egresses_out_of_boundary`) the raw id must
+    not leave, so we substitute this token. It is:
+
+    * **keyless** — a plain domain-separated SHA-256, NO secret/HMAC key (keyless guardrail);
+    * **deterministic/stable** — same input ⇒ same token, so an external receiver can still dedup;
+    * **non-reversible** & **PII-free** — a one-way digest; the node id (nor any substring of it)
+      cannot appear in the 64-hex output;
+    * **bounded & control-free** — always 64 lowercase hex chars.
+
+    The ``errors="surrogatepass"`` encoding is TOTAL and deterministic for ANY ``str`` (including a
+    lone surrogate that strict UTF-8 cannot encode), mirroring the opaque-digest pattern in
+    :func:`packs_engine.engine._audit_safe_identifier`, so hashing never raises.
+    """
+    return hashlib.sha256(
+        _OPAQUE_FINDING_ID_DOMAIN + finding_id.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
 
 
 def is_suppressed(channel: str | None) -> bool:
@@ -124,7 +153,9 @@ def load_ops_routing(packs: object | None, workload: str) -> dict[str, Any]:
     return ops
 
 
-def _notification_payload(finding: Finding, decision: Mapping[str, Any]) -> dict[str, Any]:
+def _notification_payload(
+    finding: Finding, decision: Mapping[str, Any], *, out_of_boundary: bool
+) -> dict[str, Any]:
     """Build the outbound payload as an EXPLICIT allowlist — this data leaves the boundary.
 
     Only ``findingId``, ``severity``, ``channel`` and ``runbook`` are ever egressed. This is a
@@ -132,16 +163,41 @@ def _notification_payload(finding: Finding, decision: Mapping[str, Any]) -> dict
     ``detail``, ``evidence`` and the raw finding are excluded so no unconstrained,
     customer-derived data crosses the process boundary.
 
-    TODO(human): even ``findingId`` can encode a customer resource id. If the delivery endpoint is
-    EXTERNAL to the customer boundary, add a redaction/hashing option for ``findingId`` — a policy
-    decision (in-boundary vs. egress), so keep it a deliberate hook rather than a silent default.
+    Egress policy for ``findingId`` (issue #78): the raw :attr:`Finding.id` is
+    ``"{rule}::{node.id}"`` and embeds the customer resource node id. When the target channel
+    egresses OUT OF the customer boundary (``out_of_boundary`` true — the fail-closed default for an
+    unknown/undeclared boundary) the id is replaced with :func:`opaque_finding_id`, a keyless,
+    deterministic, non-reversible 64-hex token that carries no node id. Only an IN-boundary channel
+    (explicitly ``egresses_out_of_boundary is False``) keeps the raw id. The raw id is UNCHANGED in
+    in-boundary state (audit/correlation/dedup); only this outbound copy is opaqued.
     """
+    finding_id = opaque_finding_id(finding.id) if out_of_boundary else finding.id
     return {
-        "findingId": finding.id,
+        "findingId": finding_id,
         "severity": decision["severity"],
         "channel": decision["channel"],
         "runbook": decision.get("runbook"),
     }
+
+
+def channel_egresses_out_of_boundary(notifier: object | None) -> bool:
+    """Fail-closed read of a channel's egress boundary (issue #78).
+
+    Returns ``True`` (⇒ the module opaques the outbound ``findingId``) UNLESS the channel explicitly
+    declares :attr:`~modules.alerts.channels.NotificationChannel.egresses_out_of_boundary` as the
+    bool ``False``. A missing marker, a non-bool marker, an accessor that raises, or a ``None``
+    notifier are ALL treated as out-of-boundary — a channel must PROVE it stays in boundary to keep
+    the raw id.
+    """
+    if notifier is None:
+        return True
+    try:
+        marker = notifier.egresses_out_of_boundary  # type: ignore[attr-defined]
+    except Exception:
+        return True
+    if not isinstance(marker, bool):
+        return True
+    return marker
 
 
 def _deliver(notifier: NotificationChannel | None, payload: Mapping[str, Any]) -> DeliveryResult:
@@ -175,6 +231,9 @@ class AlertsModule(Module):
         scope = scope or {}
         state = ctx.state
         notifier = cast(NotificationChannel | None, ctx.clients.get("notifier"))
+        # Fail-closed egress policy (#78): opaque the outbound findingId unless the target channel
+        # PROVES it stays in boundary. Read once — the notifier is fixed for the whole run.
+        out_of_boundary = channel_egresses_out_of_boundary(notifier)
         workloads = _resolve_workloads(state, scope)
 
         audit: list[dict[str, Any]] = []
@@ -199,7 +258,10 @@ class AlertsModule(Module):
                         "runbook": decision.get("runbook"),
                     })
                     continue
-                result = _deliver(notifier, _notification_payload(finding, decision))
+                result = _deliver(
+                    notifier,
+                    _notification_payload(finding, decision, out_of_boundary=out_of_boundary),
+                )
                 audit.append({
                     "workload": workload,
                     "findingId": finding.id,

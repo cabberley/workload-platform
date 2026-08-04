@@ -301,7 +301,25 @@ class NotificationChannel(Protocol):
     ``notification`` mapping is the routed decision (id/severity/channel/runbook) — never customer
     data. Implementations must **fail closed**: return an undelivered :class:`DeliveryResult` rather
     than raising for an expected delivery error.
+
+    Every channel must also DECLARE its egress boundary via
+    :attr:`egresses_out_of_boundary`. This is the policy hook the Alerts module reads to decide
+    whether the outbound ``findingId`` must be opaqued (see
+    :func:`modules.alerts.module.opaque_finding_id`): a channel that delivers OUTSIDE the customer
+    boundary (e.g. an arbitrary operator-configured webhook URL) egresses a customer resource id if
+    the raw ``findingId`` is sent, so the module hashes it. The read is **fail closed** — a channel
+    that does not (or cannot) declare ``False`` is treated as out-of-boundary and its id is opaqued.
     """
+
+    @property
+    def egresses_out_of_boundary(self) -> bool:
+        """True if this channel delivers OUTSIDE the customer boundary (id must be opaqued).
+
+        Declare ``False`` ONLY for a channel proven to stay IN boundary (e.g. a future in-tenant
+        Teams/ACS channel authenticated by Managed Identity). Fail closed: anything not explicitly
+        ``False`` (missing/unreadable) is treated as out-of-boundary by the module.
+        """
+        ...
 
     def send(self, notification: Mapping[str, Any]) -> DeliveryResult:
         """Deliver ``notification`` and return a :class:`DeliveryResult`."""
@@ -323,6 +341,13 @@ class WebhookChannel:
     ``httpx.Client`` (e.g. an auth hook / default header) at the edge — keep the secret out of this
     file, out of ``ctx.config`` literals, and out of tests.
     """
+
+    #: This channel POSTs to an arbitrary operator-configured URL that may be EXTERNAL to the
+    #: customer boundary, so it egresses out of boundary: the module MUST opaque the ``findingId``
+    #: This channel POSTs to an arbitrary operator-configured URL that may be EXTERNAL to the
+    #: customer boundary, so it egresses out of boundary: the module MUST opaque the ``findingId``
+    #: before it is sent (a raw ``findingId`` embeds the customer resource node id). Always true.
+    egresses_out_of_boundary: bool = True
 
     def __init__(
         self,
