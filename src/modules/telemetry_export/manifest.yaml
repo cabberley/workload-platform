@@ -1,0 +1,18 @@
+name: telemetry_export
+displayName: Telemetry Export (Azure Monitor)
+kind: job
+enabled: true
+consumes: []
+produces: [WpNodeState_CL, WpSpof_CL, WpFinding_CL, WpConnectorFetch_CL]
+scaleProfile:
+  kind: job
+  # Schedule job: scale-to-zero between fires; one replica per scheduled run (parallelism=1 in
+  # infra/bicep/modules/module-job.bicep). minReplicas is N/A to schedule cadence; kept for schema
+  # consistency. The */5 cadence matches the 5-minute bins the freshness/health boards summarize.
+  minReplicas: 0
+  maxReplicas: 1
+  triggers:
+    - type: cron
+      metadata: { schedule: "*/5 * * * *" }
+  cpu: 0.25
+  memoryGi: 0.5

@@ -40,6 +40,9 @@ param queueName string = ''
 @description('Internal base URL of the API core (single writer) the worker reads state from and submits results to, e.g. https://wp-api.internal.<env>.azurecontainerapps.io. Threaded from the API container-app\'s internal ingress FQDN by main.bicep so it is correct by construction (never a hardcoded host).')
 param apiBaseUrl string = ''
 
+@description('Extra environment variables for this job\'s container (array of { name, value }). Used to thread module-specific, non-secret config (e.g. the telemetry_export DCE endpoint + DCR immutable id) without baking it into this generic template. Defaults to none.')
+param extraEnv array = []
+
 // Assemble this job's KEDA scale rules from its declared triggers (FLAT shape, keyless queue auth).
 var queueRules = empty(queueName) ? [] : [
   {
@@ -66,7 +69,7 @@ var baseEnv = [
 var apiEnv = empty(apiBaseUrl) ? [] : [
   { name: 'WP_API_BASE_URL', value: apiBaseUrl }
 ]
-var containerEnv = concat(baseEnv, apiEnv)
+var containerEnv = concat(baseEnv, apiEnv, extraEnv)
 
 resource job 'Microsoft.App/jobs@2025-01-01' = {
   name: 'wp-${moduleName}'

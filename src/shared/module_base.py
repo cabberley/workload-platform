@@ -128,13 +128,18 @@ class ModuleRegistry:
 
 
 def build_default_registry() -> ModuleRegistry:
-    """Register the six shipped modules. Import locally to keep modules decoupled."""
+    """Register the shipped capability modules. Import locally to keep modules decoupled.
+
+    The six core modules plus ``telemetry_export`` (issue #86) — an opt-in, independently-scalable
+    ACA Job that emits the platform's PII-free app-signals to Log Analytics for the baseline boards.
+    """
     from modules.aiops.module import AiopsModule
     from modules.alerts.module import AlertsModule
     from modules.dependency_graph.module import DependencyGraphModule
     from modules.discovery.module import DiscoveryModule
     from modules.quality_checks.module import QualityChecksModule
     from modules.reassessments.module import ReassessmentsModule
+    from modules.telemetry_export.module import TelemetryExportModule
 
     registry = ModuleRegistry()
     for mod in (
@@ -144,6 +149,7 @@ def build_default_registry() -> ModuleRegistry:
         DependencyGraphModule(),
         AiopsModule(),
         AlertsModule(),
+        TelemetryExportModule(),
     ):
         registry.register(mod)
     return registry
