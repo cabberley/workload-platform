@@ -16,7 +16,10 @@ Guardrails honoured here:
     worker) never requires an Azure SDK and ``mypy src`` stays clean without them installed.
   * **Fail closed.** A missing SDK, missing config, or missing content root leaves the pack/client
     simply **absent** — the module then fails closed on its own (packs=None / client lookup miss).
-    None of these builders ever raise.
+    These builders do not raise for absent/optional dependencies. The one deliberate exception is a
+    security misconfiguration: a non-HTTPS outbound webhook URL is REJECTED at composition time
+    (``InsecureWebhookError``) rather than silently accepted, so findings can never egress over
+    cleartext.
 """
 from __future__ import annotations
 
@@ -24,8 +27,6 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
-
-import httpx
 
 from packs_engine.engine import PacksEngine
 from shared.observability import connector_fail_closed_observer
@@ -35,6 +36,10 @@ from shared.observability import connector_fail_closed_observer
 ENV_CONTENT_ROOT = "WP_CONTENT_ROOT"
 ENV_SUBSCRIPTION_ID = "WP_SUBSCRIPTION_ID"
 ENV_ALERT_WEBHOOK_URL = "WP_ALERT_WEBHOOK_URL"
+# Documented opt-out gating a loopback-ONLY cleartext webhook (a local test sink). Truthy permits
+# http:// only to 127.0.0.0/8 / ::1 / localhost; cleartext to any non-loopback host is ALWAYS
+# rejected, even with this set. Keyless — only the env var name lives in code.
+ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK = "WP_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK"
 ENV_SYSTEM_PULSE_BASE_URL = "SYSTEM_PULSE_BASE_URL"
 SYSTEM_PULSE_TOKEN_ENV = "SYSTEM_PULSE_READ_TOKEN"  # noqa: S105 - env var *name*, not a secret
 # Azure Monitor connector (aiops). A Log Analytics workspace id gates the logs edge; the metrics
@@ -100,12 +105,16 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     """Build the keyless edge-client registry injected as ``ctx.clients`` at the boundary.
 
     Each client is constructed only when its config is present and its SDK imports; anything
-    missing leaves that key **absent** so the consuming module fails closed on lookup. Never
-    raises. Keys mirror what the modules read:
+    missing leaves that key **absent** so the consuming module fails closed on lookup. Does not
+    raise for absent/optional dependencies — the one exception is a security misconfiguration: a
+    non-HTTPS ``$WP_ALERT_WEBHOOK_URL`` is rejected fail-closed (``InsecureWebhookError``). Keys
+    mirror what the modules read:
 
     * ``"resource_graph"`` (discovery) — needs ``azure-identity`` for a keyless credential.
     * ``"network"`` (dependency_graph) — needs ``$WP_SUBSCRIPTION_ID`` + ``azure-mgmt-network``.
-    * ``"notifier"`` (alerts) — needs ``$WP_ALERT_WEBHOOK_URL`` (a Key Vault-backed value).
+    * ``"notifier"`` (alerts) — needs ``$WP_ALERT_WEBHOOK_URL`` (a Key Vault-backed value); the URL
+      MUST be ``https://`` (cleartext rejected unless it is a loopback sink and
+      ``$WP_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK`` is set).
     * ``"system_pulse"`` (aiops) — needs ``$SYSTEM_PULSE_BASE_URL``; the read token is resolved at
       the edge from the Key Vault-backed ``$SYSTEM_PULSE_READ_TOKEN`` (never embedded here).
     * ``"azure_monitor"`` (aiops) — needs ``$AZURE_MONITOR_WORKSPACE_ID`` (Log Analytics workspace,
@@ -168,17 +177,32 @@ def _add_network(
 
 
 def _add_notifier(registry: dict[str, object], cfg: Mapping[str, str]) -> None:
-    """alerts' webhook channel — the URL is a Key Vault-backed value, never a literal secret."""
+    """alerts' webhook channel — the URL is a Key Vault-backed value, never a literal secret.
+
+    Fails closed at composition time on a non-HTTPS webhook URL: a misconfigured cleartext
+    ``http://`` endpoint is REJECTED (via :class:`InsecureWebhookError`) rather than silently
+    accepted, so findings can never egress over the wire in the clear. Cleartext is tolerated only
+    for an explicit loopback test sink gated behind
+    ``$WP_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK``. The shared validator carries only scheme/host in
+    its message, so no token in the URL path/query leaks (no-PII). An empty URL still leaves the
+    key simply absent (module fails closed on lookup).
+    """
+    from modules.alerts.channels import WebhookChannel, require_https_webhook
+
     url = (cfg.get(ENV_ALERT_WEBHOOK_URL) or "").strip()
     if not url:
         return
-    try:
-        from modules.alerts.channels import WebhookChannel
-
-        client = httpx.Client(timeout=_WEBHOOK_TIMEOUT_S, verify=True)
-        registry["notifier"] = WebhookChannel(url, client)
-    except Exception:  # noqa: BLE001 - fail closed: omit the channel, never crash wiring
-        return
+    allow_insecure_loopback = (
+        cfg.get(ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK) or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    # Fail closed at composition time: a cleartext egress URL is a security misconfiguration we
+    # refuse here (the channel re-validates as defense in depth).
+    require_https_webhook(url, allow_insecure_loopback=allow_insecure_loopback)
+    # The channel OWNS its hardened client (env proxies ignored + redirects not followed), so the
+    # loopback cleartext exception cannot be routed off-box or TLS-downgraded via a 307 (issue #84).
+    registry["notifier"] = WebhookChannel(
+        url, timeout=_WEBHOOK_TIMEOUT_S, allow_insecure_loopback=allow_insecure_loopback
+    )
 
 
 def _add_system_pulse(registry: dict[str, object], cfg: Mapping[str, str]) -> None:
