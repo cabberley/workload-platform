@@ -33,22 +33,22 @@ module core 'modules/core.bicep' = {
 
 // ======================================================================================
 // Telemetry visualization — Azure Managed Grafana over Azure Monitor (issue #58, ADR 0007).
-// Keyless: the instance reuses the SHARED user-assigned Managed Identity from core (identityId) as
-// its DATA-SOURCE (read) identity, granted ONLY least-privilege READ roles (Monitoring Reader +
-// Log Analytics Reader) scoped to this resource group — see grafana.bicep for the scope rationale.
-// No API keys, no data-source secrets, no board JSON in IaC.
+// Keyless: the instance uses its OWN read-only user-assigned Managed Identity (identityGrafana from
+// core, issue #79) as its DATA-SOURCE (read) identity, granted ONLY least-privilege READ roles
+// (Monitoring Reader + Log Analytics Reader) scoped as documented in grafana.bicep. It is a
+// dedicated read principal — NOT any writer identity — so Grafana can never write state.
 //
 // Provisioning the Azure Monitor data source + dashboards is NOT done here: it is performed
 // out-of-band by a SEPARATE Entra caller (CI Managed Identity or operator) holding the Grafana
-// Editor data-plane role — NOT this shared identity, which only READS Azure Monitor at query time.
+// Editor data-plane role — NOT this identity, which only READS Azure Monitor at query time.
 // Boards are versioned in infra/grafana and imported via the Grafana API (infra/grafana/README.md).
 // ======================================================================================
 module grafana 'modules/grafana.bicep' = {
   name: 'grafana'
   params: {
     location: location
-    identityResourceId: core.outputs.identityId
-    identityPrincipalId: core.outputs.identityPrincipalId
+    identityResourceId: core.outputs.identityGrafanaId
+    identityPrincipalId: core.outputs.identityGrafanaPrincipalId
     logAnalyticsName: core.outputs.logAnalyticsName
   }
 }
@@ -57,6 +57,10 @@ module grafana 'modules/grafana.bicep' = {
 // API core + web — the platform, NOT modules. The API core is the single writer, so it
 // stays modest (http-concurrency scaling) while the six modules below scale independently.
 // (These use their own images' default entrypoints — no command override.)
+//
+// Per-component identities (issue #79): the API runs as the WRITER identity (identityApi — holds the
+// state-store write data roles); the web runs as the READER identity (identityWeb — no write role),
+// so the "API is the only writer" boundary is enforced by RBAC, not convention.
 // ======================================================================================
 var coreServices = [
   { name: 'api', image: 'api', min: 1, max: 3, cpu: '0.5',  mem: '1.0Gi', http: 50 }
@@ -68,8 +72,9 @@ module coreApps 'modules/module-app.bicep' = [for s in coreServices: {
   params: {
     location: location
     environmentId: core.outputs.environmentId
-    identityId: core.outputs.identityId
-    identityClientId: core.outputs.identityClientId
+    // API => WRITER identity (holds state-store write roles); web => READER identity (no write).
+    identityId: s.name == 'api' ? core.outputs.identityApiId : core.outputs.identityWebId
+    identityClientId: s.name == 'api' ? core.outputs.identityApiClientId : core.outputs.identityWebClientId
     storageName: core.outputs.storageName
     registry: containerRegistry
     imageTag: imageTag
@@ -99,8 +104,9 @@ module serviceApps 'modules/module-app.bicep' = [for m in serviceModules: {
   params: {
     location: location
     environmentId: core.outputs.environmentId
-    identityId: core.outputs.identityId
-    identityClientId: core.outputs.identityClientId
+    // Service modules run modules => they run as the WRITER worker identity (issue #79).
+    identityId: core.outputs.identityWorkerId
+    identityClientId: core.outputs.identityWorkerClientId
     storageName: core.outputs.storageName
     registry: containerRegistry
     imageTag: imageTag
@@ -180,8 +186,9 @@ module jobApps 'modules/module-job.bicep' = [for m in jobModules: {
   params: {
     location: location
     environmentId: core.outputs.environmentId
-    identityId: core.outputs.identityId
-    identityClientId: core.outputs.identityClientId
+    // Job modules run modules => they run as the WRITER worker identity (issue #79).
+    identityId: core.outputs.identityWorkerId
+    identityClientId: core.outputs.identityWorkerClientId
     storageName: core.outputs.storageName
     registry: containerRegistry
     imageTag: imageTag
@@ -209,3 +216,12 @@ output webFqdn string = coreApps[1].outputs.fqdn
 // endpoint is NOT an embeddable panel URL. Only set VITE_GRAFANA_PANEL_URL to a separate,
 // auth-proxied, embeddable panel URL; never a token in either.
 output grafanaEndpoint string = grafana.outputs.grafanaEndpoint
+
+// ---- API-only-writer enforcement surface (issue #79 brownfield fix) ----
+// Consumed by the post-deploy CD gate (.github/workflows/release.yml → scripts/
+// cleanup_verify_state_writers.py): it lists Blob/Table Data Contributor assignments at
+// storageAccountId and asserts the ONLY principals holding them are the api + worker identities,
+// removing any legacy shared-identity writer first. Object ids are not credentials (keyless).
+output storageAccountId string = core.outputs.storageAccountId
+output apiIdentityPrincipalId string = core.outputs.identityApiPrincipalId
+output workerIdentityPrincipalId string = core.outputs.identityWorkerPrincipalId
