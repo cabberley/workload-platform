@@ -28,7 +28,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
+from packs_engine.content_store import PackContentStore, build_pack_content_store
 from packs_engine.engine import PacksEngine
+from packs_engine.registry import PackRegistry
 from shared.observability import connector_fail_closed_observer
 
 # Env var *names* the composition root reads. Values are supplied at runtime by identity / Key
@@ -78,8 +80,32 @@ def build_packs_engine() -> PacksEngine | None:
     try:
         if not Path(root).is_dir():
             return None
-        return PacksEngine(root)
+        # Issue #44: wire the metadata registry + the digest-addressed content store so the engine
+        # can resolve IMPORTED packs (never shipped in the image) by their verified registry digest,
+        # re-verifying ``canonical_digest == registry.digest`` before execution (fail closed). The
+        # content-root filesystem stays the source for shipped packs; the store is additive. Both
+        # are optional — if the store cannot be built from optional Azure deps, the engine still
+        # serves shipped packs (fail closed for imports). An UNKNOWN backend still fails closed
+        # (the selector raises) — a misconfiguration we refuse rather than silently downgrade.
+        registry = PackRegistry(index_path=Path(root) / "registry" / "index.json")
+        content_store = _build_pack_content_store_or_none()
+        return PacksEngine(root, registry=registry, content_store=content_store)
     except OSError:
+        return None
+
+
+def _build_pack_content_store_or_none() -> PackContentStore | None:
+    """Build the pack content store, or ``None`` when its optional Azure deps are unavailable.
+
+    Mirrors the fail-closed-but-non-crashing contract of the other builders here: a missing Azure
+    SDK / endpoint config leaves the store absent so the engine simply serves shipped packs and
+    fails closed for imported ones. An UNKNOWN ``WORKLOADS_PACK_STORE_BACKEND`` is NOT swallowed —
+    :func:`build_pack_content_store` raises ``ValueError`` and it propagates, so a misconfigured
+    backend fails closed rather than silently degrading to the filesystem.
+    """
+    try:
+        return build_pack_content_store()
+    except (ImportError, RuntimeError, OSError):
         return None
 
 

@@ -111,10 +111,13 @@ def route(finding: Finding, ops: dict) -> dict:
 
 @runtime_checkable
 class _OpsPack(Protocol):
-    """Local view of a verified pack — just the parsed body the routing table lives in."""
+    """Local view of a verified pack — the parsed body plus its shipped/imported provenance."""
 
     @property
     def body(self) -> Mapping[str, Any]: ...
+
+    @property
+    def imported(self) -> bool: ...
 
 
 @runtime_checkable
@@ -141,7 +144,17 @@ def load_ops_routing(packs: object | None, workload: str) -> dict[str, Any]:
         loaded = source.load_for_workload(workload, PackType.ops)
     except Exception:  # unverifiable/unavailable ops packs -> fail closed, no routing table
         return {}
-    for pack in loaded:
+    # Shipped Ops policy is AUTHORITATIVE per key: a signed IMPORTED pack (customer/third-party,
+    # store-resolved) may only CONTRIBUTE routing keys the shipped policy does not already define —
+    # it may NEVER override (suppress/reroute) a shipped ``route``, ``default`` or ``runbook`` and
+    # thus can never, e.g., divert ``critical`` away from paging. In this last-wins merge we apply
+    # IMPORTED packs FIRST and SHIPPED packs LAST so shipped keys win. This does not rely on engine
+    # iteration order: provenance is read from ``pack.imported`` (PacksEngine.load_all marks
+    # store-resolved packs ``imported=True``; shipped content-root packs default to ``False``).
+    ordered = sorted(
+        loaded, key=lambda p: bool(getattr(p, "imported", False)), reverse=True
+    )
+    for pack in ordered:
         body = pack.body
         pack_routes = body.get("routes")
         if isinstance(pack_routes, Mapping):

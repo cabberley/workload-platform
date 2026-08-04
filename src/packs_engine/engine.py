@@ -20,6 +20,7 @@ is injected, gate (2) is inert and today's behavior is preserved exactly.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -27,11 +28,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
+from pydantic import ValidationError
 
+from packs_engine.canonical import canonical_digest
 from shared.contracts import AuditAction, AuditResult, PackManifest, PackType, is_audit_safe
 from shared.signing import Verifier, verify_pack
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import; avoids runtime coupling to the emitter
+    from packs_engine.content_store import PackContentStore
+    from packs_engine.registry import PackRegistry
     from shared.audit import AuditEmitter
 
 
@@ -111,11 +116,21 @@ def verify(manifest: PackManifest, content: bytes, secret: bytes | None) -> None
 
 
 class Pack:
-    """A loaded, parsed pack: manifest + body."""
+    """A loaded, parsed pack: manifest + body.
 
-    def __init__(self, manifest: PackManifest, body: dict[str, Any]) -> None:
+    ``imported`` marks provenance: ``False`` for platform-shipped packs loaded from the content-root
+    filesystem, ``True`` for signed packs resolved from the digest-addressed content store (issue
+    #44). Consumers that merge pack bodies last-wins (e.g. alerts ``load_ops_routing``) rely on this
+    flag to keep SHIPPED policy authoritative per key — an imported pack may only ADD keys shipped
+    does not define, never override a shipped route/default/runbook (e.g. suppress critical paging).
+    """
+
+    def __init__(
+        self, manifest: PackManifest, body: dict[str, Any], *, imported: bool = False
+    ) -> None:
         self.manifest = manifest
         self.body = body
+        self.imported = imported
 
 
 class PacksEngine:
@@ -128,6 +143,8 @@ class PacksEngine:
         signing_secret: bytes | None = None,
         signature_verifier: Verifier | None = None,
         audit_emitter: AuditEmitter | None = None,
+        registry: PackRegistry | None = None,
+        content_store: PackContentStore | None = None,
     ) -> None:
         self.root = Path(content_root)
         self._secret = signing_secret
@@ -138,6 +155,12 @@ class PacksEngine:
         # store-backed emitter — the single writer), a pack whose signature/hash verification FAILS
         # is recorded as a fail-closed ``pack.verify`` audit event before the failure propagates.
         self._audit_emitter = audit_emitter
+        # Optional digest-addressed content store + registry (issue #44). Inert when either is None:
+        # the engine then serves ONLY packs shipped on the content-root filesystem, exactly as
+        # before. When both are set, imported packs that were never shipped in the image are
+        # resolved from the store BY the registry's verified digest and re-verified before use.
+        self._registry = registry
+        self._content_store = content_store
 
     def attach_audit_emitter(self, emitter: AuditEmitter) -> None:
         """Attach a store-backed audit emitter after construction (used by the API composition)."""
@@ -172,7 +195,39 @@ class PacksEngine:
         return yaml.safe_load(text)
 
     def load_all(self, *, pack_type: PackType | None = None, verify_sig: bool = True) -> list[Pack]:
+        """Load verified packs: platform-shipped (content-root) then imported (content store).
+
+        Provenance is explicit, NOT positional: every returned :class:`Pack` carries ``imported``
+        (``False`` for content-root packs, ``True`` for store-resolved ones). Last-wins consumers
+        that merge pack bodies (e.g. alerts ``load_ops_routing``) MUST keep SHIPPED policy
+        authoritative per key by reading ``pack.imported`` — an imported pack may only ADD keys the
+        shipped policy does not define, never override a shipped route/default/runbook. Returning
+        shipped packs first is a convenience only; correctness relies on the ``imported`` flag so it
+        holds regardless of iteration order.
+
+        Security gates (fail-closed): a store pack is re-verified against the registry digest and
+        bound to the registry ref; and an imported pack may never share a SHIPPED pack id (shipped
+        packs are authoritative at every version — see :meth:`_resolve_imported_packs`).
+        """
         packs: list[Pack] = []
+        # Canonical digests of packs shipped on the content-root filesystem — an identical import
+        # (same digest) is not loaded twice. This is a de-dup optimization, NOT the security gate.
+        shipped_digests: set[str] = set()
+        # The ``id@version`` refs shipped on the content-root filesystem. This IS the security gate:
+        # a shipped pack is AUTHORITATIVE for its ref, so an imported store pack sharing that ref
+        # (even with different content ⇒ different digest) must NEVER be resolved alongside it and
+        # shadow/override the shipped policy. Digest de-dup alone cannot prevent this — the whole
+        # point of the attack is that the digests DIFFER — so we exclude colliding refs explicitly.
+        shipped_refs: set[tuple[str, str]] = set()
+        # The pack IDS shipped on the content-root filesystem. This is the PRIMARY security gate: a
+        # shipped pack id is authoritative at EVERY version, so an imported pack sharing a shipped
+        # id is never resolved — even at a HIGHER version. Without this, a signed import of
+        # ``default-notify@1.0.1`` (a different ref than shipped ``@1.0.0`` ⇒ passes the ref gate)
+        # is merged last-wins by consumers (alerts ``routes.update``) and can reroute/suppress the
+        # ``critical`` paging route — a fail-open. Platform packs upgrade via the content-root
+        # (releases), NOT the import path; imports are customer/third-party packs in their OWN id
+        # namespace, so an imported id may never equal a shipped id.
+        shipped_ids: set[str] = set()
         for path in self._iter_pack_files():
             raw = self._parse(path)
             if "manifest" not in raw:
@@ -204,7 +259,125 @@ class PacksEngine:
                 self._emit_verify_failure(manifest)
                 raise
             packs.append(Pack(manifest=manifest, body=raw.get("body", {})))
+            shipped_refs.add((manifest.id, manifest.version))
+            shipped_ids.add(manifest.id)
+            with contextlib.suppress(TypeError, ValueError):
+                # Record the shipped pack's version identity so its imported twin (same digest) is
+                # not also resolved from the store. A non-JSON-native pack that cannot be
+                # canonicalized simply is not deduped — harmless, since a store entry could never
+                # match a digest we could not compute.
+                shipped_digests.add(canonical_digest(raw))
+        # Issue #44: additionally resolve imported packs from the digest-addressed content store.
+        # Each is re-verified (``canonical_digest(loaded) == registry.digest``) before use and fails
+        # closed on a miss/mismatch. Shipped packs are appended FIRST and win by ref — a store pack
+        # can never shadow a shipped one. Inert unless BOTH a registry and a store are injected.
+        packs.extend(
+            self._resolve_imported_packs(
+                pack_type=pack_type,
+                shipped_digests=shipped_digests,
+                shipped_refs=shipped_refs,
+                shipped_ids=shipped_ids,
+            )
+        )
         return packs
+
+    def _resolve_imported_packs(
+        self,
+        *,
+        pack_type: PackType | None,
+        shipped_digests: set[str],
+        shipped_refs: set[tuple[str, str]],
+        shipped_ids: set[str],
+    ) -> list[Pack]:
+        """Resolve imported packs from the content store BY the registry's verified digest.
+
+        This is the runtime read side of issue #44: a pack that was signature-verified on import
+        and recorded in the registry — but never shipped on the content-root filesystem — is loaded
+        from the content store keyed by the registry ``digest`` and re-verified before execution.
+
+        **Shipped packs are authoritative and win by pack ID (at EVERY version).** A store-resolved
+        pack whose ``id`` matches ANY shipped pack id is NEVER appended — regardless of version or
+        digest. Platform packs are upgraded through the content-root (platform releases), not the
+        import/store path; imports are customer/third-party packs, which MUST use their OWN pack id
+        namespace. This closes the fail-open where a validly-signed HIGHER-version import
+        (``default-notify@1.0.1`` vs shipped ``@1.0.0`` — a different ref, so the (id,version) gate
+        alone would pass it) is merged last-wins by a consumer (alerts ``routes.update``) and
+        reroutes/suppresses the ``critical`` paging route. The (id,version) ref exclusion and digest
+        de-dup are kept as (harmless) subsets of this id gate.
+
+        **Fail closed at every step** — the pack resolves to NOTHING (is silently skipped, never
+        executed) when:
+
+        * no registry/store is wired (nothing to resolve);
+        * a shipped pack owns the entry's ``id`` at any version (shipped wins by id);
+        * the digest's bytes are absent from the store (missing digest);
+        * the stored bytes are not parseable JSON, or cannot be canonicalized;
+        * ``canonical_digest(loaded) != registry.digest`` (tampered/mismatched bytes);
+        * the loaded manifest's ``id``/``version`` does not match the registry entry's ref (the
+          bytes claim a different identity than the entry that authorized them);
+        * the loaded manifest is malformed or its type does not match the entry.
+
+        The digest re-verification is the trust gate here: because the registry digest was recorded
+        only AFTER a successful signature verification on import, bytes whose recomputed canonical
+        digest matches that digest are exactly the verified content — no separate signature check is
+        needed (and the stored canonical bytes deliberately exclude the volatile signature fields).
+
+        Two store entries can never share one ``id@version`` with differing content: the registry
+        rejects a re-publish of an existing ``id@version`` under a different digest
+        (``ImmutableVersionError``), so imported-vs-imported shadowing cannot arise. Shipped packs
+        are appended before these, giving a deterministic, shipped-first authoritative order.
+
+        TODO(human): precedence AMONG multiple imported packs (two imported packs of the same id
+        would be merged last-wins by consumers) and an explicit per-workload pack ASSIGNMENT/pinning
+        model (so only assigned imported refs resolve) are deferred to a follow-up — they need a
+        product decision on whether signed imports may ever override shipped/critical policy. This
+        method only makes shipped-wins-by-id airtight; it does NOT implement an assignment model.
+        """
+        registry = self._registry
+        store = self._content_store
+        if registry is None or store is None:
+            return []
+        resolved: list[Pack] = []
+        for entry in registry.list(pack_type):
+            if entry.ref.id in shipped_ids:
+                continue  # a shipped pack owns this id at every version -> never shadow/override it
+            if (entry.ref.id, entry.ref.version) in shipped_refs:
+                continue  # a shipped pack owns this ref and is authoritative -> never shadow it
+            if entry.digest in shipped_digests:
+                continue  # already served from the content-root image; do not double-load
+            data = store.get(entry.digest)
+            if data is None:
+                continue  # missing digest -> fail closed (resolve nothing)
+            try:
+                raw = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue  # unparseable stored bytes -> fail closed
+            if not isinstance(raw, dict):
+                continue
+            try:
+                recomputed = canonical_digest(raw)
+            except (TypeError, ValueError):
+                continue  # non-canonicalizable -> fail closed
+            # Constant-time compare of two 64-char hex digests; a mismatch means the stored bytes do
+            # not match the verified registry identity, so we NEVER execute them (fail closed).
+            if not (recomputed.isascii() and hmac.compare_digest(recomputed, entry.digest)):
+                continue
+            manifest_raw = raw.get("manifest")
+            if not isinstance(manifest_raw, dict):
+                continue
+            try:
+                manifest = PackManifest(**manifest_raw)
+            except ValidationError:
+                continue  # malformed manifest -> fail closed
+            # Bind the loaded bytes to the registry reference that authorized them: the manifest's
+            # id AND version must equal the entry's ref, so store bytes can never claim a different
+            # id@version than the entry that admitted them (fail closed on any mismatch).
+            if manifest.id != entry.ref.id or manifest.version != entry.ref.version:
+                continue
+            if manifest.type != entry.type:
+                continue  # registry type must match the loaded manifest -> fail closed
+            resolved.append(Pack(manifest=manifest, body=raw.get("body", {}), imported=True))
+        return resolved
 
     def _emit_verify_failure(self, manifest: PackManifest) -> None:
         """Record a ``pack.verify`` failure event (no-op when no audit emitter is injected).

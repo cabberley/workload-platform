@@ -47,6 +47,8 @@ from packs_engine import (
     canonical_digest,
     validate_pack,
 )
+from packs_engine.canonical import canonical_bytes
+from packs_engine.content_store import LocalPackContentStore
 from packs_engine.engine import Pack
 from shared.contracts import (
     DependencyEdge,
@@ -704,6 +706,14 @@ def cmd_export(args: argparse.Namespace) -> int:
         return 1
 
     digest = canonical_digest(pack)
+    # Issue #44: persist the VERIFIED canonical bytes into the digest-addressed content store keyed
+    # by the registry digest, so an imported pack that was never shipped in the content-root image
+    # is resolvable at runtime. We store exactly ``canonical_bytes(pack)`` — the same bytes the
+    # digest was computed over — so the runtime resolver can re-verify
+    # ``canonical_digest(loaded) == registry.digest`` before execution (fail closed). The store is
+    # colocated with the dist registry so a distribution is self-contained (registry + bytes).
+    content_store = LocalPackContentStore(dist / "store")
+    content_store.put(digest, canonical_bytes(pack))
     bundle = build_bundle(pack, digest=digest, created_at=entry.createdAt, public_key=public_b64)
     _write_json(bundle_path, bundle)
     _write_json(sidecar_path, bundle["provenance"])
@@ -711,6 +721,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     print(
         f"exported {entry.ref.format()} ({entry.type.value}) -> {bundle_path}\n"
         f"  registered digest {digest[:12]}... in {registry.index_path}\n"
+        f"  stored verified pack bytes -> {dist / 'store'}\n"
         f"  provenance sidecar (incl. public key) -> {sidecar_path}"
     )
     return 0

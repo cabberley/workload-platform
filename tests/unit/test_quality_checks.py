@@ -318,3 +318,90 @@ def test_run_does_not_crash_on_malformed_pack_body_and_surfaces_notes():
     assert result.ok is True
     assert result.findings == []
     assert result.extra["surfacedNotes"]  # malformed body surfaced, not raised
+
+
+# --------------------------------------------------------------------------------------
+# R4 — shipped rule ids are AUTHORITATIVE over imported rule ids. A Finding id is
+# ``{rule_id}::{node_id}`` (not pack-namespaced) and findings persist last-wins on
+# ``(workload, finding_id)``, so a NEW-pack-id imported rule REUSING a shipped rule id could
+# overwrite (and suppress a FAIL from) the shipped rule. ``load_rules`` runs a two-pass, shipped-
+# first merge keyed on ``pack.imported`` so an imported rule may ADD a new id but never shadow one.
+# --------------------------------------------------------------------------------------
+def _rule(rule_id: str, required_tag: str) -> dict[str, Any]:
+    return {
+        "id": rule_id,
+        "title": rule_id,
+        "resourceType": VM_TYPE,
+        "requiredTag": required_tag,
+        "severity": "high",
+        "description": rule_id,
+    }
+
+
+def _shipped_pack(*, pack_id: str, rules: list[dict[str, Any]]) -> Pack:
+    return Pack(
+        manifest=PackManifest(id=pack_id, type=PackType.rule, name=pack_id, version="1.0.0"),
+        body={"rules": rules},
+        imported=False,
+    )
+
+
+def _imported_pack(*, pack_id: str, rules: list[dict[str, Any]]) -> Pack:
+    return Pack(
+        manifest=PackManifest(id=pack_id, type=PackType.rule, name=pack_id, version="1.0.0"),
+        body={"rules": rules},
+        imported=True,
+    )
+
+
+def test_load_rules_imported_rule_shadowing_shipped_id_is_skipped():
+    # Shipped and a DIFFERENT-pack-id import both define rule id "rel-01" — the import is skipped.
+    shipped = _shipped_pack(pack_id="waf-shipped", rules=[_rule("rel-01", "availability-zone")])
+    attacker = _imported_pack(pack_id="attacker-rules", rules=[_rule("rel-01", "always-present")])
+    rules, notes = load_rules(FakePacks([shipped, attacker]), "epic")
+
+    # Exactly one rule for the shadowed id — the SHIPPED one (its requiredTag), not the import's.
+    matching = [r for r in rules if r["id"] == "rel-01"]
+    assert len(matching) == 1
+    assert matching[0]["requiredTag"] == "availability-zone"
+    assert matching[0]["packId"] == "waf-shipped"
+    # The collision is surfaced as a fail-closed skip note (shipped wins).
+    assert any(
+        "attacker-rules" in n and "shadows shipped rule id" in n and "rel-01" in n for n in notes
+    )
+
+
+def test_load_rules_imported_rule_with_unique_id_still_loads():
+    shipped = _shipped_pack(pack_id="waf-shipped", rules=[_rule("rel-01", "availability-zone")])
+    addon = _imported_pack(pack_id="team-addon", rules=[_rule("addon-01", "cost-centre")])
+    rules, notes = load_rules(FakePacks([shipped, addon]), "epic")
+
+    ids = sorted(r["id"] for r in rules)
+    assert ids == ["addon-01", "rel-01"]  # import AUGMENTS with its unique id
+    assert not any("shadows shipped rule id" in n for n in notes)
+
+
+def test_imported_pass_cannot_suppress_shipped_fail_in_persisted_state(tmp_path):
+    from shared.state import LocalStateStore
+
+    # Node HAS "env" (would PASS the attacker rule) but LACKS "availability-zone" (FAILs shipped).
+    node = _vm("vm-1", tags={"env": "prod"})
+    store = LocalStateStore(tmp_path)
+    store.put_estate("epic", [node])
+
+    shipped = _shipped_pack(pack_id="waf-shipped", rules=[_rule("rel-01", "availability-zone")])
+    # Same rule id "rel-01" but a predicate the node satisfies → would emit a PASS for rel-01::vm-1.
+    attacker = _imported_pack(pack_id="attacker-rules", rules=[_rule("rel-01", "env")])
+
+    ctx = ModuleContext(state=store, packs=FakePacks([shipped, attacker]))
+    result = QualityChecksModule().run(ctx, scope={"workload": "epic"})
+    # Only the shipped rule ran → exactly one finding for the shadowed id, and it FAILS.
+    assert len(result.findings) == 1
+    assert result.findings[0].id == "rel-01::vm-1"
+    assert result.findings[0].passed is False
+
+    # Persist + read back: the shipped FAIL is what lands in durable state (no imported PASS to
+    # last-wins-overwrite it).
+    store.add_findings("epic", result.findings)
+    persisted = store.get_findings("epic", module="quality_checks")
+    assert [(f.id, f.passed) for f in persisted] == [("rel-01::vm-1", False)]

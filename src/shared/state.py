@@ -250,6 +250,15 @@ def _default_state_dir() -> Path:
     return Path(tempfile.gettempdir()) / _DEFAULT_DIR_NAME
 
 
+def _has_module_qualified_pk(findings_ddl: str) -> bool:
+    """True if a ``findings`` table DDL declares the 3-column PK ``(workload, module, finding_id)``.
+
+    Whitespace-insensitive so it matches regardless of how the DDL was formatted when created.
+    """
+    normalized = "".join(findings_ddl.lower().split())
+    return "primarykey(workload,module,finding_id)" in normalized
+
+
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS estate ("
     " workload TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)",
@@ -258,7 +267,7 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS findings ("
     " workload TEXT NOT NULL, finding_id TEXT NOT NULL, module TEXT NOT NULL,"
     " data TEXT NOT NULL, updated_at TEXT NOT NULL,"
-    " PRIMARY KEY (workload, finding_id))",
+    " PRIMARY KEY (workload, module, finding_id))",
     "CREATE TABLE IF NOT EXISTS snapshots ("
     " seq INTEGER PRIMARY KEY AUTOINCREMENT, workload TEXT NOT NULL,"
     " data TEXT NOT NULL, created_at TEXT NOT NULL)",
@@ -289,6 +298,7 @@ class LocalStateStore:
         base.mkdir(parents=True, exist_ok=True)
         self._db_path = base / "state.db"
         self._init_schema()
+        self._migrate_findings_pk()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
@@ -299,6 +309,86 @@ class LocalStateStore:
         with self._connect() as conn:
             for stmt in _SCHEMA:
                 conn.execute(stmt)
+
+    def _migrate_findings_pk(self) -> None:
+        """Upgrade a legacy ``findings`` table to the module-qualified primary key (idempotent).
+
+        The ``findings`` primary key evolved from ``(workload, finding_id)`` to
+        ``(workload, module, finding_id)`` (issue #44 R5) so two modules can emit findings that
+        share a ``finding_id`` — e.g. a quality_checks rule id ``spof`` and a dependency_graph SPOF
+        finding both key ``spof::<node>`` — without one silently overwriting the other. Because the
+        table is created with ``CREATE TABLE IF NOT EXISTS``, a ``state.db`` written before this
+        change keeps its old 2-column PK; the new ``ON CONFLICT(workload, module, finding_id)``
+        upsert then has no matching constraint and raises ``OperationalError`` on the next findings
+        write (and the state DB persists across runs — which is what drift detection relies on).
+        This atomic migration rewrites such a legacy table into the new shape, backfilling
+        ``module`` from the stored Finding JSON (``data``) when the column value is NULL. It is a
+        no-op when the table is absent (a fresh DB already has the new shape from ``_SCHEMA``) or
+        already has the 3-column PK, so it is safe to run on every init. Runs AFTER ``_init_schema``
+        so the ``CREATE TABLE IF NOT EXISTS`` has already no-oped on a legacy DB before we fix its
+        PK.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='findings'"
+            ).fetchone()
+            if row is None:
+                return  # no findings table yet — nothing to migrate
+            if _has_module_qualified_pk(str(row["sql"] or "")):
+                return  # already the new 3-column PK — idempotent no-op
+            columns = {str(c["name"]) for c in conn.execute("PRAGMA table_info(findings)")}
+            if "data" not in columns:
+                raise RuntimeError(
+                    "Cannot migrate legacy 'findings' table: no 'data' column to source the "
+                    "module from — refusing to drop rows (fail closed)."
+                )
+            has_module_col = "module" in columns
+            # Fixed, fully-static SQL per branch (no interpolation) — module is backfilled from the
+            # stored Finding JSON (``$.module``) when the column is missing/NULL.
+            if has_module_col:
+                unresolved_sql = (
+                    "SELECT COUNT(*) AS n FROM findings"
+                    " WHERE COALESCE(module, json_extract(data, '$.module')) IS NULL"
+                )
+                insert_sql = (
+                    "INSERT INTO findings_new (workload, finding_id, module, data, updated_at)"
+                    " SELECT workload, finding_id,"
+                    " COALESCE(module, json_extract(data, '$.module')),"
+                    " data, updated_at FROM findings"
+                )
+            else:
+                unresolved_sql = (
+                    "SELECT COUNT(*) AS n FROM findings"
+                    " WHERE json_extract(data, '$.module') IS NULL"
+                )
+                insert_sql = (
+                    "INSERT INTO findings_new (workload, finding_id, module, data, updated_at)"
+                    " SELECT workload, finding_id, json_extract(data, '$.module'),"
+                    " data, updated_at FROM findings"
+                )
+            unresolved = conn.execute(unresolved_sql).fetchone()
+            if unresolved is not None and int(unresolved["n"]) > 0:
+                raise RuntimeError(
+                    f"Cannot migrate legacy 'findings' table: {int(unresolved['n'])} row(s) have "
+                    "no resolvable module (NULL column and no '$.module' in data JSON) — refusing "
+                    "to drop rows (fail closed)."
+                )
+            conn.isolation_level = None  # take manual control of the migration transaction
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "CREATE TABLE findings_new ("
+                    " workload TEXT NOT NULL, finding_id TEXT NOT NULL, module TEXT NOT NULL,"
+                    " data TEXT NOT NULL, updated_at TEXT NOT NULL,"
+                    " PRIMARY KEY (workload, module, finding_id))"
+                )
+                conn.execute(insert_sql)
+                conn.execute("DROP TABLE findings")
+                conn.execute("ALTER TABLE findings_new RENAME TO findings")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     @contextlib.contextmanager
     def _transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -441,9 +531,8 @@ class LocalStateStore:
         conn.executemany(
             "INSERT INTO findings (workload, finding_id, module, data, updated_at)"
             " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(workload, finding_id) DO UPDATE SET"
-            " module = excluded.module, data = excluded.data,"
-            " updated_at = excluded.updated_at",
+            " ON CONFLICT(workload, module, finding_id) DO UPDATE SET"
+            " data = excluded.data, updated_at = excluded.updated_at",
             rows,
         )
 
@@ -702,11 +791,20 @@ class AzureStateStore:
 
     @staticmethod
     def _merge_findings(previous: list[Finding], new: list[Finding]) -> list[Finding]:
-        """Additive upsert of findings by id (new wins), preserving prior findings."""
-        by_id = {finding.id: finding for finding in previous}
+        """Additive upsert of findings by ``(module, id)`` (new wins), preserving prior findings.
+
+        Findings are identified by the MODULE-QUALIFIED key ``(module, finding_id)`` — a finding
+        id is only unique within its emitting module (e.g. a quality_checks rule id ``spof`` mints
+        the same ``spof::<node>`` id a dependency_graph SPOF finding uses). Keying by id alone would
+        let one module's finding overwrite another's — e.g. an imported quality_checks PASS
+        ``spof::N`` clobbering the dependency_graph SPOF FAIL and hiding a real single point of
+        failure. Qualifying by ``(module, id)`` keeps cross-module same-id findings distinct;
+        new-wins applies only WITHIN the same ``(module, id)``.
+        """
+        by_key = {(finding.module, finding.id): finding for finding in previous}
         for finding in new:
-            by_id[finding.id] = finding
-        return list(by_id.values())
+            by_key[(finding.module, finding.id)] = finding
+        return list(by_key.values())
 
     def _commit(
         self,
@@ -1054,22 +1152,32 @@ def compute_drift(
     * ``addedNodes``/``removedNodes`` — estate node ids gained/lost since the previous snapshot.
 
     A finding is "failing" when ``passed is False`` (fail-closed: ``None``/unknown is not a fail).
-    """
-    prev_failing = {finding.id: finding for finding in previous if finding.passed is False}
-    cur_failing = {finding.id: finding for finding in current if finding.passed is False}
 
-    new_failures = [f for fid, f in cur_failing.items() if fid not in prev_failing]
-    still_failing = [f for fid, f in cur_failing.items() if fid in prev_failing]
-    recovered = [f for fid, f in prev_failing.items() if fid not in cur_failing]
+    Findings are identified by the MODULE-QUALIFIED key ``(module, id)``: a finding id is only
+    unique within its emitting module, so a quality_checks ``spof::N`` and a dependency_graph
+    ``spof::N`` are DISTINCT findings. Keying by id alone would mis-diff them — e.g. report a
+    quality_checks ``spof::N`` PASS as "recovered" against a dependency_graph ``spof::N`` FAIL,
+    hiding a still-live single point of failure.
+    """
+    prev_failing = {
+        (finding.module, finding.id): finding for finding in previous if finding.passed is False
+    }
+    cur_failing = {
+        (finding.module, finding.id): finding for finding in current if finding.passed is False
+    }
+
+    new_failures = [f for key, f in cur_failing.items() if key not in prev_failing]
+    still_failing = [f for key, f in cur_failing.items() if key in prev_failing]
+    recovered = [f for key, f in prev_failing.items() if key not in cur_failing]
 
     prev_ids = set(previous_nodes)
     cur_ids = set(current_nodes)
 
     return DriftReport(
         workload=workload,
-        newFailures=sorted(new_failures, key=lambda f: f.id),
-        recovered=sorted(recovered, key=lambda f: f.id),
-        stillFailing=sorted(still_failing, key=lambda f: f.id),
+        newFailures=sorted(new_failures, key=lambda f: (f.module, f.id)),
+        recovered=sorted(recovered, key=lambda f: (f.module, f.id)),
+        stillFailing=sorted(still_failing, key=lambda f: (f.module, f.id)),
         addedNodes=sorted(cur_ids - prev_ids),
         removedNodes=sorted(prev_ids - cur_ids),
     )

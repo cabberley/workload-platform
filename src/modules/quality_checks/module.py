@@ -213,19 +213,54 @@ def load_rules(packs: object | None, workload: str) -> tuple[list[dict[str, Any]
     engine = cast(_PacksEngineLike, packs)
     rules: list[dict[str, Any]] = []
     notes: list[str] = []
-    for pack in engine.load_for_workload(workload, PackType.rule):
+    loaded = list(engine.load_for_workload(workload, PackType.rule))
+    # SHIPPED rule ids are AUTHORITATIVE over IMPORTED rule ids (the rule-granularity analog of the
+    # shipped-wins-by-pack-id / shipped-wins-per-key model). A Finding id is ``{rule_id}::{node}`` —
+    # NOT namespaced by pack — and findings persist last-wins on ``(workload, finding_id)``, so a
+    # NEW-pack-id imported rule that REUSES a shipped rule id would overwrite (and could suppress a
+    # FAIL from) the shipped rule's finding. We resolve in TWO passes by provenance: SHIPPED packs
+    # first (build the authoritative rule-id set), IMPORTED packs second (skip any rule whose id
+    # collides with a shipped rule id, surfacing a note). Provenance is read defensively from
+    # ``pack.imported`` (default False = shipped = authoritative); the engine sets ``imported=True``
+    # on every store-resolved pack (engine.py). Imports may ADD new rule ids, not suppress shipped.
+    shipped_rule_ids: set[str] = set()
+
+    def _normalize_pack_rules(pack: _RulePackLike) -> list[dict[str, Any]]:
         body = pack.body
         raw_rules = body.get("rules") if isinstance(body, dict) else None
         if not isinstance(raw_rules, list):
             if isinstance(body, dict) and "rules" in body:
                 notes.append(f"pack {pack.manifest.id}: 'rules' is not a list — skipped")
-            continue
+            return []
+        out: list[dict[str, Any]] = []
         for raw in raw_rules:
             rule, note = _normalize_rule(raw, pack.manifest.id, pack.manifest.version)
             if note is not None:
                 notes.append(note)
             if rule is not None:
-                rules.append(rule)
+                out.append(rule)
+        return out
+
+    # First pass — SHIPPED packs (order-preserving); their rule ids become authoritative.
+    for pack in loaded:
+        if getattr(pack, "imported", False):
+            continue
+        for rule in _normalize_pack_rules(pack):
+            rules.append(rule)
+            shipped_rule_ids.add(str(rule.get("id", "rule")))
+    # Second pass — IMPORTED packs may ADD new rule ids but NEVER shadow a shipped rule id.
+    for pack in loaded:
+        if not getattr(pack, "imported", False):
+            continue
+        for rule in _normalize_pack_rules(pack):
+            rule_id = str(rule.get("id", "rule"))
+            if rule_id in shipped_rule_ids:
+                notes.append(
+                    f"pack {pack.manifest.id}: imported rule {rule_id!r} shadows shipped rule id "
+                    "— skipped (shipped wins)"
+                )
+                continue
+            rules.append(rule)
     return rules, notes
 
 
