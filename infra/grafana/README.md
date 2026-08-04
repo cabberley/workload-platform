@@ -107,27 +107,32 @@ update`, if they prefer not to pre-substitute.
 The substitution above only rebinds the **scope** placeholders (subscription / resource group /
 workspace / storage account). The three `Wp*_CL` boards additionally reference **custom Log
 Analytics table names** (`WpNodeState_CL`, `WpSpof_CL`, `WpFinding_CL`, `WpConnectorFetch_CL`) — those
-are the platform's *intended* telemetry schema and are **not rebound** here because nothing emits
-them yet (see #86 below).
+are the platform's telemetry schema, now **emitted** by the opt-in `telemetry_export` module (#86,
+see below), so they resolve once that module is configured and has run.
 
 ## Which boards work today vs require #86
 
 | Board | Status | Data source |
 |-------|--------|-------------|
 | `module-throughput.json` | **Works today** | Real Azure Monitor **ACA platform metrics** — `Microsoft.App/containerApps` (`Replicas`, `Requests`) for service modules and `Microsoft.App/jobs` (`Executions`) for job modules, plus storage `QueueMessageCount`. No custom telemetry needed. |
-| `workload-health.json` | **Requires #86** | Custom LA table `WpNodeState_CL` (not emitted yet) |
-| `blast-radius-summary.json` | **Requires #86** | Custom LA tables `WpSpof_CL`, `WpFinding_CL` (not emitted yet) |
-| `telemetry-freshness.json` | **Requires #86** | Custom LA table `WpConnectorFetch_CL` (not emitted yet) |
+| `workload-health.json` | **Emitted by #86** | Custom LA table `WpNodeState_CL` (emitted by the `telemetry_export` module) |
+| `blast-radius-summary.json` | **Emitted by #86** | Custom LA tables `WpSpof_CL`, `WpFinding_CL` (emitted by the `telemetry_export` module) |
+| `telemetry-freshness.json` | **Schema ready (#86)** | Custom LA table `WpConnectorFetch_CL` — table + emit path exist; connector-fetch rows are pending a PII-free source (see `TODO(human)` in `src/modules/telemetry_export/module.py`) |
 
-**#86 — platform telemetry export.** Today the platform emits **no** custom Log Analytics telemetry,
-so the three `Wp*_CL` boards are versioned **TARGET** boards: they import cleanly but **fail at query
-time** until the [#86](../../docs/telemetry-visualization.md) telemetry-export path writes these
-tables. `module-throughput.json` does not depend on #86 and renders as soon as it is bound.
+**#86 — platform telemetry export.** The `telemetry_export` module (an opt-in, in-boundary, keyless
+ACA **Job**) now writes these `Wp*_CL` tables via the Azure Monitor **Logs Ingestion API** (Data
+Collection Endpoint + Data Collection Rule, Managed Identity — no keys). The tables, DCE, DCR, and a
+least-privilege **Monitoring Metrics Publisher** grant are provisioned by
+[`../bicep/modules/telemetry-export.bicep`](../bicep/modules/telemetry-export.bicep) (wired from
+`main.bicep`). The three `Wp*_CL` boards render once the module is deployed, configured (the DCE/DCR
+ids are threaded to the Job as env), and has run. `module-throughput.json` does not depend on #86 and
+renders as soon as it is bound.
 
-### Intended custom-table schema (target of #86)
+### Custom-table schema (emitted by #86)
 
-The `Wp*_CL` boards expect these Log Analytics custom tables (aggregate, PII-free — no resource ids,
-no payloads):
+The `Wp*_CL` boards read these Log Analytics custom tables (aggregate, PII-free — no resource ids,
+no payloads; `NodeRef_s` is an **opaque** node ref, never a raw id). This is exactly the schema the
+`telemetry_export` shaping functions produce and the Bicep provisions:
 
 | Table | Columns the boards read |
 |-------|-------------------------|
@@ -135,6 +140,10 @@ no payloads):
 | `WpSpof_CL` | `Workload_s` (string), `NodeRef_s` (string, opaque node ref) |
 | `WpFinding_CL` | `Workload_s` (string), `BlastRadius_d` (real), `TimeGenerated` (datetime) |
 | `WpConnectorFetch_CL` | `Connector_s` (string), `Success_b` (bool), `TimeGenerated` (datetime) |
+
+> Every custom table also carries the mandatory `TimeGenerated` system column — including `WpSpof_CL`
+> (the SPOF board filters on the dashboard time range), whose board-read columns are just
+> `Workload_s` + `NodeRef_s`.
 
 ## Dashboards (parameterized, PII-free)
 
@@ -150,9 +159,9 @@ shape and metric targets a proper `azureMonitor.resources[]`
 | File | Board | Signals | Status |
 |------|-------|---------|--------|
 | `dashboards/module-throughput.json` | Module Throughput & Queue Depth | ACA `Replicas`/`Requests` (apps), `Executions` (jobs), queue depth | **Works today** |
-| `dashboards/workload-health.json` | Workload Health & Node State | node-state counts, healthy-node ratio | Requires #86 |
-| `dashboards/blast-radius-summary.json` | Blast Radius & SPOF Summary | active SPOF count, blast-radius distribution/peak | Requires #86 |
-| `dashboards/telemetry-freshness.json` | Connector & Telemetry Freshness | per-connector staleness, fetch success ratio | Requires #86 |
+| `dashboards/workload-health.json` | Workload Health & Node State | node-state counts, healthy-node ratio | Emitted by #86 |
+| `dashboards/blast-radius-summary.json` | Blast Radius & SPOF Summary | active SPOF count, blast-radius distribution/peak | Emitted by #86 |
+| `dashboards/telemetry-freshness.json` | Connector & Telemetry Freshness | per-connector staleness, fetch success ratio | Schema ready (#86); connector rows pending source |
 
 ## Embedding in the console
 

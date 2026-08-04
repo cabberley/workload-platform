@@ -51,6 +51,12 @@ ENV_AZURE_MONITOR_WORKSPACE_ID = "AZURE_MONITOR_WORKSPACE_ID"
 ENV_AZURE_MONITOR_RESOURCE_IDS = "AZURE_MONITOR_RESOURCE_IDS"
 ENV_AZURE_MONITOR_METRICS_ENDPOINT = "AZURE_MONITOR_METRICS_ENDPOINT"
 ENV_AZURE_MONITOR_METRIC_NAMESPACE = "AZURE_MONITOR_METRIC_NAMESPACE"
+# Telemetry export write edge (telemetry_export module, issue #86). The Logs Ingestion API needs a
+# Data Collection Endpoint URI + a Data Collection Rule *immutable id* (both non-secret Azure ids
+# from the deploy outputs). Absent either ⇒ the exporter is inert (opt-in). Keyless — Managed
+# Identity supplies the credential; only the env var names live in code.
+ENV_TELEMETRY_EXPORT_DCE_ENDPOINT = "TELEMETRY_EXPORT_DCE_ENDPOINT"
+ENV_TELEMETRY_EXPORT_DCR_IMMUTABLE_ID = "TELEMETRY_EXPORT_DCR_IMMUTABLE_ID"
 
 _DEFAULT_CONTENT_ROOT = "content"
 _WEBHOOK_TIMEOUT_S = 10.0
@@ -148,6 +154,11 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
       ``$AZURE_MONITOR_RESOURCE_IDS`` / ``$AZURE_MONITOR_METRICS_ENDPOINT`` /
       ``$AZURE_MONITOR_METRIC_NAMESPACE`` enable the metrics edge. The SDK imports lazily at the
       edge, so a missing package leaves the key absent (fail closed) rather than crashing.
+    * ``"telemetry_exporter"`` (telemetry_export, #86) — the keyless Logs Ingestion **write** edge.
+      Registered only when ``$TELEMETRY_EXPORT_DCE_ENDPOINT`` +
+      ``$TELEMETRY_EXPORT_DCR_IMMUTABLE_ID`` (both non-secret Azure ids) **and** a keyless
+      credential are present; otherwise the key is
+      absent and the module runs inert (opt-in). The SDK imports lazily at the edge.
 
     ``config`` defaults to ``os.environ``; tests pass an explicit mapping.
     """
@@ -160,6 +171,7 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     _add_notifier(registry, cfg)
     _add_system_pulse(registry, cfg)
     _add_azure_monitor(registry, cfg, credential)
+    _add_telemetry_exporter(registry, cfg, credential)
 
     return registry
 
@@ -292,4 +304,39 @@ def _add_azure_monitor(
             fail_closed_observer=connector_fail_closed_observer("aiops"),
         )
     except Exception:  # noqa: BLE001 - fail closed: omit the connector, never crash wiring
+        return
+
+
+def _add_telemetry_exporter(
+    registry: dict[str, object], cfg: Mapping[str, str], credential: object | None
+) -> None:
+    """telemetry_export's keyless Logs Ingestion **write** edge (issue #86) — opt-in, fail-closed.
+
+    Registered ONLY when a Data Collection Endpoint URI (``$TELEMETRY_EXPORT_DCE_ENDPOINT``) **and**
+    a Data Collection Rule immutable id (``$TELEMETRY_EXPORT_DCR_IMMUTABLE_ID``) **and** a keyless
+    credential are all present — otherwise the key is absent and the module runs inert (opt-in). A
+    ``credential_provider`` closure over the wiring credential keeps the export keyless (Managed
+    Identity via ``DefaultAzureCredential``); no key/SAS/connection string is ever read here. The
+    ``azure-monitor-ingestion`` SDK imports lazily at the edge, so a missing package fails closed at
+    upload time; this builder never raises — a missing id or credential leaves the key absent.
+    """
+    endpoint = (cfg.get(ENV_TELEMETRY_EXPORT_DCE_ENDPOINT) or "").strip()
+    rule_id = (cfg.get(ENV_TELEMETRY_EXPORT_DCR_IMMUTABLE_ID) or "").strip()
+    if not endpoint or not rule_id or credential is None:
+        return
+    try:
+        from modules.telemetry_export.exporter import (
+            LogsIngestionClient,
+            LogsIngestionConfig,
+        )
+        from modules.telemetry_export.module import CLIENT_KEY
+
+        registry[CLIENT_KEY] = LogsIngestionClient(
+            LogsIngestionConfig(endpoint=endpoint, rule_id=rule_id),
+            credential_provider=lambda: credential,
+            # Keyless observer (issue #60): a fail-closed export increments
+            # connector_fail_closed_total{module="telemetry_export"} on the process registry.
+            fail_closed_observer=connector_fail_closed_observer("telemetry_export"),
+        )
+    except Exception:  # noqa: BLE001 - fail closed: omit the exporter, never crash wiring
         return

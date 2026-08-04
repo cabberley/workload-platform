@@ -6,7 +6,7 @@ from shared.contracts import Finding, ResourceNode, Severity
 from shared.module_base import Module, ModuleContext, build_default_registry, run_module
 
 
-def test_registry_has_six_modules():
+def test_registry_has_seven_modules():
     reg = build_default_registry()
     names = set(reg.names())
     assert names == {
@@ -16,6 +16,7 @@ def test_registry_has_six_modules():
         "dependency_graph",
         "aiops",
         "alerts",
+        "telemetry_export",
     }
 
 

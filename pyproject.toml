@@ -19,6 +19,7 @@ dependencies = [
     "azure-mgmt-resourcegraph>=8.0",
     "azure-monitor-query>=1.4",
     "azure-monitor-querymetrics>=1.0",
+    "azure-monitor-ingestion>=1.0",
     "cryptography>=42",
 ]
 

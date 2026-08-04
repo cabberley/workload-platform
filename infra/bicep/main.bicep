@@ -54,8 +54,27 @@ module grafana 'modules/grafana.bicep' = {
 }
 
 // ======================================================================================
+// Telemetry export provisioning — the emit path for the #58 boards (issue #86).
+// Provisions the 4 PII-free custom Log Analytics tables (WpNodeState_CL / WpSpof_CL / WpFinding_CL
+// / WpConnectorFetch_CL), a Data Collection Endpoint + Data Collection Rule mapping one stream per
+// table into the in-boundary workspace, and a LEAST-PRIVILEGE Monitoring Metrics Publisher grant on
+// the DCR to the WORKER identity (which runs the telemetry_export Job). Keyless: the Job publishes
+// via the Logs Ingestion API with Managed Identity — no ingestion key anywhere. The DCE endpoint +
+// DCR immutable id are non-secret outputs threaded to the Job as env below.
+// ======================================================================================
+module telemetryExport 'modules/telemetry-export.bicep' = {
+  name: 'telemetry-export'
+  params: {
+    location: location
+    logAnalyticsId: core.outputs.logAnalyticsId
+    logAnalyticsName: core.outputs.logAnalyticsName
+    publisherPrincipalId: core.outputs.identityWorkerPrincipalId
+  }
+}
+
+// ======================================================================================
 // API core + web — the platform, NOT modules. The API core is the single writer, so it
-// stays modest (http-concurrency scaling) while the six modules below scale independently.
+// stays modest (http-concurrency scaling) while the module Jobs/apps below scale independently.
 // (These use their own images' default entrypoints — no command override.)
 //
 // Per-component identities (issue #79): the API runs as the WRITER identity (identityApi — holds the
@@ -207,6 +226,41 @@ module jobApps 'modules/module-job.bicep' = [for m in jobModules: {
     apiBaseUrl: 'https://${coreApps[0].outputs.fqdn}'
   }
 }]
+
+// ======================================================================================
+// Telemetry Export module (kind: job) — its OWN scheduled ACA Job, mirroring
+// src/modules/telemetry_export/manifest.yaml (cron */5, cpu 0.25, mem 0.5Gi, scale-to-zero). Kept
+// SEPARATE from the jobModules loop above so its container env can be threaded with the DCE endpoint
+// + DCR immutable id from the telemetryExport provisioning module (non-secret ids). Runs as the
+// WORKER identity (which holds the least-privilege Monitoring Metrics Publisher grant on the DCR).
+// ======================================================================================
+module telemetryExportJob 'modules/module-job.bicep' = {
+  name: 'job-telemetry_export'
+  params: {
+    location: location
+    environmentId: core.outputs.environmentId
+    identityId: core.outputs.identityWorkerId
+    identityClientId: core.outputs.identityWorkerClientId
+    storageName: core.outputs.storageName
+    registry: containerRegistry
+    imageTag: imageTag
+    moduleName: 'telemetry_export'
+    triggerType: 'Schedule'
+    cronExpression: '*/5 * * * *'
+    queueName: ''
+    minExecutions: 0
+    maxExecutions: 1
+    cpu: '0.25'
+    memoryGi: '0.5Gi'
+    apiBaseUrl: 'https://${coreApps[0].outputs.fqdn}'
+    // Keyless, non-secret export target ids threaded from the provisioning module's outputs so the
+    // exporter opts in at runtime (absent ⇒ the module runs inert). No key/SAS/connection string.
+    extraEnv: [
+      { name: 'TELEMETRY_EXPORT_DCE_ENDPOINT', value: telemetryExport.outputs.dceLogsIngestionEndpoint }
+      { name: 'TELEMETRY_EXPORT_DCR_IMMUTABLE_ID', value: telemetryExport.outputs.dcrImmutableId }
+    ]
+  }
+}
 
 output registryLoginServer string = core.outputs.registryLoginServer
 output apiFqdn string = coreApps[0].outputs.fqdn
