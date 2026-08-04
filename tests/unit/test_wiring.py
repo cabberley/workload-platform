@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from cli.wiring import (
+    ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK,
     ENV_ALERT_WEBHOOK_URL,
     ENV_SUBSCRIPTION_ID,
     ENV_SYSTEM_PULSE_BASE_URL,
@@ -35,6 +36,114 @@ def test_build_client_registry_empty_config_never_raises_and_is_partial():
 def test_build_client_registry_includes_notifier_when_webhook_configured():
     registry = build_client_registry(config={ENV_ALERT_WEBHOOK_URL: FAKE_WEBHOOK_URL})
     assert "notifier" in registry
+
+
+# --------------------------------------------------------------------------------------
+# HTTPS enforcement (#84): a non-HTTPS webhook URL is REJECTED fail-closed at composition time.
+# --------------------------------------------------------------------------------------
+def test_build_client_registry_rejects_cleartext_http_webhook():
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "http://alerts.evil.invalid/hook"})
+
+
+def test_build_client_registry_rejects_scheme_less_webhook():
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "alerts.internal.invalid/hook"})
+
+
+def test_build_client_registry_rejects_invalid_port_at_composition():
+    # R1 MED 3: a malformed port fails closed at composition time, not late inside httpx at send().
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "https://alerts.internal.invalid:bad/hook"})
+
+
+def test_build_client_registry_invalid_port_error_is_sanitized():
+    # R1 MED 2: a leaking urlparse/.port ValueError (which can echo user:token@host) must not reach
+    # the surfaced error — a constant, URL-free message is raised instead.
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError) as excinfo:
+        build_client_registry(
+            config={ENV_ALERT_WEBHOOK_URL: "https://user:SECRET123@alerts.evil.invalid:bad/hook"}
+        )
+    message = str(excinfo.value)
+    for secret in ("SECRET123", "user", "alerts.evil.invalid", "bad", "/hook"):
+        assert secret not in message
+    assert excinfo.value.__cause__ is None
+
+
+def test_build_client_registry_error_does_not_leak_url_path():
+    # No-PII: the fail-closed error must not echo the path/query (which may carry a token).
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError) as excinfo:
+        build_client_registry(
+            config={ENV_ALERT_WEBHOOK_URL: "http://alerts.evil.invalid/hook?token=SECRET123"}
+        )
+    assert "SECRET123" not in str(excinfo.value)
+    assert "/hook" not in str(excinfo.value)
+
+
+def test_build_client_registry_loopback_http_rejected_without_flag():
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "http://127.0.0.1:9000/hook"})
+
+
+def test_build_client_registry_loopback_http_accepted_with_flag():
+    registry = build_client_registry(
+        config={
+            ENV_ALERT_WEBHOOK_URL: "http://127.0.0.1:9000/hook",
+            ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK: "true",
+        }
+    )
+    assert "notifier" in registry
+
+
+def test_build_client_registry_localhost_http_accepted_with_flag():
+    registry = build_client_registry(
+        config={
+            ENV_ALERT_WEBHOOK_URL: "http://localhost:9000/hook",
+            ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK: "1",
+        }
+    )
+    assert "notifier" in registry
+
+
+def test_build_client_registry_spoofed_loopback_rejected_even_with_flag():
+    # Spoofed-loopback guard: an attacker host that merely *contains* a loopback token must NOT be
+    # treated as loopback, even with the opt-out set — cleartext to it stays rejected.
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    for spoofed in ("http://127.0.0.1.evil.com/hook", "http://localhost.evil.com/hook"):
+        with pytest.raises(InsecureWebhookError):
+            build_client_registry(
+                config={
+                    ENV_ALERT_WEBHOOK_URL: spoofed,
+                    ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK: "true",
+                }
+            )
 
 
 def test_build_client_registry_includes_system_pulse_when_base_url_configured():
