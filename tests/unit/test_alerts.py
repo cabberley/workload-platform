@@ -21,7 +21,9 @@ from modules.alerts.channels import (
 )
 from modules.alerts.module import (
     AlertsModule,
+    channel_egresses_out_of_boundary,
     load_ops_routing,
+    opaque_finding_id,
     route,
     weight_by_blast_radius,
 )
@@ -33,7 +35,38 @@ from shared.module_base import ModuleContext
 # Synthetic doubles (no Azure, no network).
 # --------------------------------------------------------------------------------------
 class FakeChannel:
-    """Records every routed notification instead of sending it. Injected as the notifier."""
+    """Records every routed notification instead of sending it. Injected as the notifier.
+
+    Declares ``egresses_out_of_boundary = False`` so it doubles as the IN-BOUNDARY channel stub:
+    the module keeps the raw ``findingId`` for it (proving the opaque-id policy is boundary-gated,
+    not a blanket hash).
+    """
+
+    egresses_out_of_boundary = False
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def send(self, notification: Mapping[str, Any]) -> DeliveryResult:
+        self.sent.append(dict(notification))
+        return DeliveryResult(channel=str(notification["channel"]), delivered=True)
+
+
+class EgressChannel:
+    """OUT-OF-BOUNDARY channel stub (like ``WebhookChannel``): findingId must be opaqued."""
+
+    egresses_out_of_boundary = True
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    def send(self, notification: Mapping[str, Any]) -> DeliveryResult:
+        self.sent.append(dict(notification))
+        return DeliveryResult(channel=str(notification["channel"]), delivered=True)
+
+
+class MarkerlessChannel:
+    """Channel with NO boundary marker — the module must fail closed and opaque the id."""
 
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
@@ -231,6 +264,141 @@ def test_run_no_state_is_noop() -> None:
     result = AlertsModule().run(ModuleContext(), scope={})
     assert result.ok is True
     assert result.extra["notifications"] == []
+
+
+# --------------------------------------------------------------------------------------
+# Opaque/sanitized finding ids for out-of-boundary egress (#78).
+# --------------------------------------------------------------------------------------
+def _egress_finding() -> Finding:
+    # Mirrors the real quality_checks id format "{rule}::{node.id}" so the raw id embeds node.id.
+    node = "/synthetic/rg/db-node-01"
+    return Finding(id=f"require-tag::{node}", module="quality_checks", title="tag check",
+                   passed=False, nodeId=node, severity=Severity.medium, blastRadius=6)
+
+
+def test_opaque_finding_id_is_deterministic_bounded_hex() -> None:
+    fid = "require-tag::/synthetic/rg/db-node-01"
+    token = opaque_finding_id(fid)
+    assert token == opaque_finding_id(fid)  # deterministic
+    assert len(token) == 64
+    assert token == token.lower()
+    assert all(c in "0123456789abcdef" for c in token)  # lowercase hex, control-free
+
+
+def test_opaque_finding_id_hides_raw_id_and_node_id() -> None:
+    node = "/synthetic/rg/db-node-01"
+    fid = f"require-tag::{node}"
+    token = opaque_finding_id(fid)
+    assert token != fid
+    assert node not in token
+    assert "db-node-01" not in token
+    assert fid not in token
+
+
+def test_opaque_finding_id_is_domain_separated() -> None:
+    import hashlib
+
+    fid = "require-tag::/synthetic/rg/db-node-01"
+    plain = hashlib.sha256(fid.encode("utf-8")).hexdigest()  # NO domain prefix
+    assert opaque_finding_id(fid) != plain  # domain separation changes the token space
+
+
+def test_opaque_finding_id_handles_surrogate_and_unicode() -> None:
+    # A lone surrogate (as json/yaml can yield) must hash without raising (errors="surrogatepass").
+    assert len(opaque_finding_id("rule::" + chr(0xD800))) == 64
+    assert len(opaque_finding_id("rule::/synthetic/café-\u3053\u3093")) == 64
+
+
+def test_channel_egresses_out_of_boundary_fail_closed() -> None:
+    assert channel_egresses_out_of_boundary(EgressChannel()) is True
+    assert channel_egresses_out_of_boundary(FakeChannel()) is False  # explicit in-boundary
+    assert channel_egresses_out_of_boundary(MarkerlessChannel()) is True  # missing marker
+    assert channel_egresses_out_of_boundary(None) is True  # no notifier
+    assert channel_egresses_out_of_boundary(WebhookChannel(
+        "https://alerts.internal.invalid/hook", transport=_boom_transport())) is True
+
+    class NonBoolMarker:
+        egresses_out_of_boundary = "no"  # not a bool -> unreadable -> fail closed
+
+        def send(self, notification: Mapping[str, Any]) -> DeliveryResult:  # pragma: no cover
+            return DeliveryResult(channel="x", delivered=True)
+
+    assert channel_egresses_out_of_boundary(NonBoolMarker()) is True
+
+
+def test_run_opaques_finding_id_for_out_of_boundary_channel() -> None:
+    finding = _egress_finding()  # escalates to critical -> "page"
+    channel = EgressChannel()
+    ctx = ModuleContext(state=FakeState({"epic": [finding]}),
+                        clients={"notifier": channel}, packs=FakeOpsPacks([_ops_pack()]))
+
+    AlertsModule().run(ctx, scope={})
+
+    assert len(channel.sent) == 1
+    sent = channel.sent[0]
+    assert set(sent.keys()) == {"findingId", "severity", "channel", "runbook"}  # allowlist intact
+    outbound = sent["findingId"]
+    assert outbound == opaque_finding_id(finding.id)  # opaque token, not the raw id
+    assert outbound != finding.id
+    assert finding.nodeId not in outbound  # node id never crosses the boundary
+    assert finding.id not in outbound
+    assert len(outbound) == 64 and outbound == outbound.lower()
+    assert all(c in "0123456789abcdef" for c in outbound)
+
+
+def test_run_opaque_finding_id_is_deterministic_across_runs() -> None:
+    finding = _egress_finding()
+
+    def _deliver_once() -> str:
+        channel = EgressChannel()
+        ctx = ModuleContext(state=FakeState({"epic": [finding]}),
+                            clients={"notifier": channel}, packs=FakeOpsPacks([_ops_pack()]))
+        AlertsModule().run(ctx, scope={})
+        return str(channel.sent[0]["findingId"])
+
+    assert _deliver_once() == _deliver_once()  # external dedup still works
+
+
+def test_run_keeps_raw_finding_id_for_in_boundary_channel() -> None:
+    # An explicitly in-boundary channel (marker False) keeps the raw id — policy is boundary-gated.
+    finding = _egress_finding()
+    channel = FakeChannel()
+    ctx = ModuleContext(state=FakeState({"epic": [finding]}),
+                        clients={"notifier": channel}, packs=FakeOpsPacks([_ops_pack()]))
+
+    AlertsModule().run(ctx, scope={})
+
+    assert channel.sent[0]["findingId"] == finding.id  # raw id retained in boundary
+
+
+def test_run_fails_closed_and_opaques_when_marker_missing() -> None:
+    # A channel with NO boundary marker is treated as out-of-boundary (fail closed) -> opaqued.
+    finding = _egress_finding()
+    channel = MarkerlessChannel()
+    ctx = ModuleContext(state=FakeState({"epic": [finding]}),
+                        clients={"notifier": channel}, packs=FakeOpsPacks([_ops_pack()]))
+
+    AlertsModule().run(ctx, scope={})
+
+    outbound = channel.sent[0]["findingId"]
+    assert outbound == opaque_finding_id(finding.id)
+    assert outbound != finding.id
+    assert finding.nodeId not in outbound
+
+
+def test_run_audit_keeps_raw_finding_id_even_when_egressed_opaque() -> None:
+    # The IN-BOUNDARY audit trail keeps the raw id for correlation/dedup even though the OUTBOUND
+    # copy was opaqued for the out-of-boundary channel.
+    finding = _egress_finding()
+    channel = EgressChannel()
+    ctx = ModuleContext(state=FakeState({"epic": [finding]}),
+                        clients={"notifier": channel}, packs=FakeOpsPacks([_ops_pack()]))
+
+    result = AlertsModule().run(ctx, scope={})
+
+    audit = result.extra["notifications"][0]
+    assert audit["findingId"] == finding.id  # raw id preserved in-boundary
+    assert channel.sent[0]["findingId"] != finding.id  # but opaqued outbound
 
 
 # --------------------------------------------------------------------------------------

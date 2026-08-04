@@ -4,7 +4,7 @@ from modules.alerts.channels import (
     WebhookChannel,
     build_webhook_channel,
 )
-from modules.alerts.module import AlertsModule
+from modules.alerts.module import AlertsModule, opaque_finding_id
 
 __all__ = [
     "AlertsModule",
@@ -12,4 +12,5 @@ __all__ = [
     "NotificationChannel",
     "WebhookChannel",
     "build_webhook_channel",
+    "opaque_finding_id",
 ]
