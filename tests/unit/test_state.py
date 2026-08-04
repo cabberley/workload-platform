@@ -954,6 +954,7 @@ class _FakeDownloader:
 class _FakeContainer:
     def __init__(self) -> None:
         self.blobs: dict[str, bytes] = {}
+        self.writes: list[tuple[str, bool]] = []
         self.lock = threading.Lock()
 
     def download_blob(self, name: str, *, encoding: str | None = None) -> _FakeDownloader:
@@ -968,6 +969,7 @@ class _FakeContainer:
         from azure.core.exceptions import ResourceExistsError
 
         with self.lock:
+            self.writes.append((name, overwrite))
             if name in self.blobs and not overwrite:
                 raise ResourceExistsError(f"blob exists {name}")
             self.blobs[name] = bytes(data)
@@ -1104,3 +1106,41 @@ def test_azure_empty_estate_clears_via_manifest() -> None:
     assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1", "lb-web"]
     store.commit_run("epic", _run_result(estate=[]))
     assert store.get_estate("epic") == []
+
+
+@azure_only
+def test_azure_write_blob_is_create_if_absent() -> None:
+    # Issue #81: blob writes are write-once (create-if-absent). The SDK-level upload must use
+    # overwrite=False so an in-place clobber of a committed artifact fails closed rather than
+    # silently overwriting — backing the storage-layer immutability/versioning posture.
+    from azure.core.exceptions import ResourceExistsError
+
+    store, _service, container = _azure_store()
+    store._write_blob("state/x/deadbeef.json", "first")
+    # Every real write went through overwrite=False (no unconditional clobber anywhere).
+    assert container.writes == [("state/x/deadbeef.json", False)]
+    # Re-writing the SAME name is rejected (write-once), not silently overwritten.
+    with pytest.raises(ResourceExistsError):
+        store._write_blob("state/x/deadbeef.json", "second")
+    # The original bytes are intact — the second (clobbering) write never landed.
+    assert container.blobs["state/x/deadbeef.json"] == b"first"
+
+
+@azure_only
+def test_azure_commit_uses_unconditional_free_write_once_blobs() -> None:
+    # The commit path addresses each component blob by a UNIQUE version-scoped name, so create-if-
+    # absent never collides; and the manifest UPDATE path (a Table entity, not a blob) still works
+    # across repeated commits — the create-if-absent blob change is contract-safe.
+    store, _service, container = _azure_store()
+    store.commit_run("epic", _run_result(estate=_nodes(), findings=[
+        _finding("q1", "quality_checks", passed=True),
+    ]))
+    # A second commit (manifest update path) succeeds and merges — no blob-name collision.
+    store.commit_run("epic", _run_result(findings=[_finding("q2", "quality_checks", passed=False)]))
+    assert sorted(f.id for f in store.get_findings("epic")) == ["q1", "q2"]
+    # No write ever used overwrite=True: every blob upload is create-if-absent (write-once).
+    assert container.writes, "expected at least one blob write"
+    assert all(overwrite is False for _name, overwrite in container.writes)
+    # All version-scoped names are unique (write-once guarantee, no clobber).
+    names = [name for name, _overwrite in container.writes]
+    assert len(names) == len(set(names))
