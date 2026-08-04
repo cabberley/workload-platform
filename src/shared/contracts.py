@@ -5,11 +5,14 @@ Do not fork these shapes in modules — import them. See `.github/copilot-instru
 """
 from __future__ import annotations
 
+import json
+import unicodedata
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def _utcnow() -> datetime:
@@ -25,6 +28,14 @@ class SourceReference(BaseModel):
     kind: str = Field(description="resource | metric | log | pack | connector")
     id: str = Field(description="Azure resource id, metric name, pack id, etc.")
     detail: str | None = None
+
+
+# The supported provenance kinds. A finding's evidence is only *attributable* when at least one of
+# its references names a known kind AND a non-blank id (see ``shared.provenance``); a present-but-
+# empty/unknown reference does not satisfy the provenance guarantee (fail closed).
+SOURCE_REFERENCE_KINDS: frozenset[str] = frozenset(
+    {"resource", "metric", "log", "pack", "connector"}
+)
 
 
 class AgentResponse(BaseModel):
@@ -264,6 +275,144 @@ class DriftReport(BaseModel):
         default_factory=list,
         description="Estate node ids present in the previous snapshot but gone now",
     )
+
+
+# --------------------------------------------------------------------------------------
+# Audit trail — tamper-evident, append-only record of consequential actions (issue #59).
+#
+# An ``AuditEvent`` records WHO (a non-PII principal id), did WHAT (``action``), to WHICH subject,
+# with WHICH pack + version, and the RESULT (success/failure) at a timestamp. It is deliberately
+# minimal and **PII-free by construction**: every id-bearing field is validated to reject emails,
+# names, whitespace/free-text (log bodies), and Azure resource *paths* (``/subscriptions/`` …).
+# Persisted append-only through the SAME state layer as every other read model (see
+# ``shared.state``), so it works on BOTH the local and Azure backends. The model is ``frozen`` so a
+# constructed event cannot be mutated in place, reinforcing the append-only, tamper-evident intent.
+# --------------------------------------------------------------------------------------
+class AuditAction(StrEnum):
+    """The consequential actions the platform records in its audit trail."""
+
+    pack_import = "pack.import"
+    pack_verify = "pack.verify"
+    pack_assign = "pack.assign"
+    run_executed = "run.executed"
+    finding_emitted = "finding.emitted"
+    module_enabled = "module.enabled"
+    module_disabled = "module.disabled"
+
+
+class AuditResult(StrEnum):
+    """The outcome of an audited action — fail-closed callers record ``failure`` on any error."""
+
+    success = "success"
+    failure = "failure"
+
+
+# Substrings that betray PII, a log body, or an Azure resource *path*, and must never leak into an
+# audit record. Matched case-insensitively. ``@`` catches emails; the resource-path markers catch a
+# subscription/resource-group/provider id being smuggled into a free-text field.
+_AUDIT_FORBIDDEN_SUBSTRINGS = ("/subscriptions/", "/resourcegroups/", "/providers/", "@")
+_AUDIT_MAX_LEN = 256
+
+
+def is_audit_safe(value: str) -> bool:
+    """Return ``True`` iff ``value`` is a bounded, PII-free identifier fit for an audit record.
+
+    Fail-closed: the value is FIRST NFKC-normalized (so Unicode compatibility forms — e.g. a
+    fullwidth ``＠`` or fullwidth ``／`` — canonicalize to their ASCII equivalents and cannot slip a
+    disguised email / resource *path* past the checks), then rejects the empty string, anything
+    longer than :data:`_AUDIT_MAX_LEN`, any whitespace or Unicode ``Other`` (``C*``) character, and
+    any of the :data:`_AUDIT_FORBIDDEN_SUBSTRINGS` (emails and Azure resource *paths*). A
+    non-``str`` is never safe.
+
+    The ``C*`` rejection covers the WHOLE "Other" group, not just controls: ``Cc`` (C0 0x00-0x1F,
+    DEL 0x7F, C1 0x80-0x9F), ``Cf`` (format chars — e.g. U+202E RIGHT-TO-LEFT OVERRIDE, U+200B
+    ZERO WIDTH SPACE, U+200E/200F LRM/RLM, U+FEFF BOM — which SURVIVE NFKC and would otherwise
+    persist invisibly / deceptively), ``Cs`` (surrogates), ``Co`` (private-use), and ``Cn``
+    (unassigned). None of these are legitimate in an audit identifier. Ordinary letters/marks/
+    punctuation are untouched, so accented text (e.g. ``café`` = ``Ll``) still passes.
+    """
+    if not isinstance(value, str):
+        return False
+    value = unicodedata.normalize("NFKC", value)
+    if not value or len(value) > _AUDIT_MAX_LEN:
+        return False
+    if any(ch.isspace() or unicodedata.category(ch)[0] == "C" for ch in value):
+        return False
+    lowered = value.lower()
+    return not any(marker in lowered for marker in _AUDIT_FORBIDDEN_SUBSTRINGS)
+
+
+def _assert_audit_safe(value: str, *, field: str) -> str:
+    """Return the NFKC-canonical ``value`` if audit-safe, else raise ``ValueError`` (fail closed).
+
+    The value is NFKC-normalized and the normalized (canonical) form is what gets persisted, so a
+    later read can never see an un-normalized Unicode-compatibility variant of a field. The error
+    names only the offending *field* — never the rejected value — so a validation failure cannot
+    itself leak the PII/free-text it just refused.
+    """
+    normalized = unicodedata.normalize("NFKC", value) if isinstance(value, str) else value
+    if not is_audit_safe(normalized):
+        raise ValueError(
+            f"AuditEvent.{field} is not a bounded, PII-free identifier (fail closed)"
+        )
+    return normalized
+
+
+class AuditEvent(BaseModel):
+    """One append-only, PII-free audit record of a consequential action.
+
+    Every id-bearing field is validated PII-free at construction (see :func:`is_audit_safe`), so a
+    record carrying an email, a name, a log body, or an Azure resource *path* can never be built —
+    the audit surface fails closed rather than persisting sensitive data. ``frozen`` makes the
+    record immutable once created (tamper-evident / append-only in spirit); the storage layer
+    enforces append-only at rest.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(default_factory=lambda: uuid4().hex, description="Opaque unique event id")
+    actor: str = Field(
+        description="Non-PII principal id (object id / principal id) — never a name or email"
+    )
+    action: AuditAction
+    subject: str = Field(
+        description="Non-PII id of the acted-on subject (module name, pack id, workload id)"
+    )
+    packId: str | None = Field(default=None, description="Pack id involved, if any")
+    packVersion: str | None = Field(default=None, description="Pack version involved, if any")
+    result: AuditResult
+    recordedAt: datetime = Field(default_factory=_utcnow)
+    # Tamper-evidence (issue #59, hash chaining). Populated by the storage layer at append time —
+    # NOT by callers — so they are excluded from :meth:`canonical_bytes` (an event's identity is its
+    # own fields, independent of where it lands in the chain). ``prevHash`` links to the previous
+    # entry's ``entryHash`` (or the genesis anchor for the first event); ``entryHash`` is the
+    # SHA-256 over this event's canonical bytes concatenated with ``prevHash``.
+    prevHash: str | None = Field(default=None, description="entryHash of the previous chain entry")
+    entryHash: str | None = Field(default=None, description="SHA-256 chain hash of this entry")
+
+    @field_validator("id", "actor", "subject")
+    @classmethod
+    def _validate_required_ids(cls, value: str, info: Any) -> str:
+        return _assert_audit_safe(value, field=str(info.field_name))
+
+    @field_validator("packId", "packVersion")
+    @classmethod
+    def _validate_optional_ids(cls, value: str | None, info: Any) -> str | None:
+        if value is None:
+            return None
+        return _assert_audit_safe(value, field=str(info.field_name))
+
+    def canonical_bytes(self) -> bytes:
+        """Return a stable UTF-8 serialization of the event's identity fields (excluding hashes).
+
+        Deterministic by construction — recursively sorted keys, compact separators, and a
+        JSON-mode dump (so ``recordedAt`` is a fixed ISO-8601 string) — mirroring the canonical
+        serialization used for pack version identity (``packs_engine.canonical.canonical_bytes``)
+        and graph revisions (``shared.blast_radius.graph_revision``). ``prevHash``/``entryHash`` are
+        excluded so the hash covers only the logical event, never the chain linkage itself.
+        """
+        payload = self.model_dump(mode="json", exclude={"prevHash", "entryHash"})
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 # --------------------------------------------------------------------------------------

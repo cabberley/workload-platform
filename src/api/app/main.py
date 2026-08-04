@@ -15,8 +15,11 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 
+from shared.audit import AuditEmitter, resolve_actor
 from shared.blast_radius import compute_impact, graph_revision
 from shared.contracts import (
+    AuditAction,
+    AuditResult,
     DriftReport,
     Finding,
     HealthState,
@@ -25,6 +28,7 @@ from shared.contracts import (
     ReadinessReport,
     ResourceNode,
     WorkloadGraph,
+    is_audit_safe,
 )
 from shared.module_base import build_default_registry, run_module
 from shared.observability import (
@@ -38,6 +42,7 @@ from shared.observability import (
     process_metrics,
     store_reachable_probe,
 )
+from shared.provenance import ProvenanceError
 from shared.state import (
     ReadOnlyState,
     StateStore,
@@ -118,6 +123,88 @@ def get_store() -> StateStore:
 StoreDep = Annotated[StateStore, Depends(get_store)]
 
 
+def get_audit_emitter(store: StoreDep) -> AuditEmitter:
+    """Return an audit emitter bound to the single-writer store (issue #59).
+
+    Built per request over the same ``StoreDep`` the endpoints use, so a test overriding
+    ``get_store`` with an isolated backend automatically audits into that same backend.
+    """
+    return AuditEmitter(store)
+
+
+AuditDep = Annotated[AuditEmitter, Depends(get_audit_emitter)]
+
+
+def _finding_emitted_subject(workload: str, count: int) -> str:
+    """The exact PII-free subject a ``finding.emitted`` event carries: workload id + finding count.
+
+    Kept as the single source of truth so the pre-write validation checks the *same* string the
+    emitter will later build (never drifting apart).
+    """
+    return f"{workload}#count={count}"
+
+
+def _run_executed_subject(module: str) -> str:
+    """The exact subject a ``run.executed`` event carries: the module identity.
+
+    Single source of truth so the pre-write validation checks the SAME string the emitter later
+    builds (they can never drift apart).
+    """
+    return module
+
+
+def _require_auditable_run_subject(module: str) -> None:
+    """Reject (422) unless the derived ``run.executed`` subject is audit-safe — before any write.
+
+    ``run.executed`` is emitted with the module identity as its subject. A non-audit-safe module id
+    (PII / control chars / resource *path* / oversized) would commit the run and THEN drop the
+    ``run.executed`` event (state persisted, audit lost). We validate the exact derived subject at
+    the boundary and fail closed instead: no un-auditable run is ever persisted.
+    """
+    if not is_audit_safe(_run_executed_subject(module)):
+        raise HTTPException(
+            status_code=422,
+            detail="module id is not a bounded, PII-free identifier (fail closed)",
+        )
+
+
+def _require_auditable_findings_subject(workload: str, count: int) -> None:
+    """Reject (422) unless the DERIVED ``finding.emitted`` subject is audit-safe — before any write.
+
+    A findings write derives a ``finding.emitted`` audit subject (``<workload>#count=N``) from the
+    workload id. If that derived subject is PII/oversized/control-bearing (including a workload id
+    that is individually ≤256 but whose ``#count=N`` suffix pushes it over the limit), the event
+    would fail closed and be silently dropped — persisting findings we cannot audit (and letting a
+    PII/oversized workload id into state). Validating the exact derived subject (which is a strict
+    superset of validating the raw workload id) fails closed at the boundary: no un-auditable
+    findings write is ever accepted.
+    """
+    if not is_audit_safe(_finding_emitted_subject(workload, count)):
+        raise HTTPException(
+            status_code=422,
+            detail="workload id is not a bounded, PII-free identifier (fail closed)",
+        )
+
+
+def _emit_findings_persisted(
+    audit: AuditEmitter, *, actor: str, workload: str, count: int
+) -> None:
+    """Emit a PII-free ``finding.emitted`` event AFTER findings were successfully persisted (#59).
+
+    The subject encodes ONLY the non-PII workload id and a COUNT of findings
+    (``<workload>#count=N``) — never a resource id, log body, or other free text. Provenance is
+    enforced at the persistence choke point BEFORE the write, so reaching here means the write
+    succeeded; the fail-closed emitter then records the event best-effort and never disrupts the
+    request (emit-after-write, not a two-phase transaction — see ADR 0006).
+    """
+    audit.emit(
+        actor=actor,
+        action=AuditAction.finding_emitted,
+        subject=_finding_emitted_subject(workload, count),
+        result=AuditResult.success,
+    )
+
+
 # The packs engine and edge-client registry are built once per process and injected into modules
 # the API runs in-process, mirroring `get_store`. They are cached and exposed as FastAPI
 # dependencies so tests can override them with fakes via `app.dependency_overrides`. Both are
@@ -133,7 +220,13 @@ def get_packs() -> object | None:
     if not _packs_built:
         from cli.wiring import build_packs_engine
 
-        _packs = build_packs_engine()
+        engine = build_packs_engine()
+        if engine is not None:
+            # The API is the single writer, so it (not the store-less composition root) gives the
+            # pack-verify trust gate a store-backed audit emitter — a fail-closed rejection of a
+            # tampered/invalid pack is then recorded to the append-only audit log (issue #59).
+            engine.attach_audit_emitter(AuditEmitter(get_store()))
+        _packs = engine
         _packs_built = True
     return _packs
 
@@ -305,11 +398,13 @@ class RunRequest(BaseModel):
 def run_module_endpoint(
     name: str,
     req: RunRequest,
+    request: Request,
     store: StoreDep,
     packs: PacksDep,
     clients: ClientsDep,
     metrics: MetricsDep,
     tracer: TracerDep,
+    audit: AuditDep,
 ) -> ModuleRunResult:
     """Run a single module by name (also how the ACA Job worker's compute is exercised in-process).
 
@@ -325,11 +420,20 @@ def run_module_endpoint(
     module: the run is wrapped in a tracing span (no-op unless an exporter is wired) and its count
     + duration + outcome are recorded on the in-process metrics registry with bounded, PII-free
     labels (module name + ``ok``/``error`` outcome only).
+
+    Audit (issue #59): the executed run is recorded as a ``run.executed`` event — actor = the
+    non-PII principal id from the request (else ``system``), subject = the module name, result =
+    success/failure — to the append-only audit log, in the ``finally`` so a failed run is audited
+    too. Auditing never disrupts the run (the emitter swallows its own errors).
     """
     try:
         module = registry.get(name)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # Validate the derived run.executed subject (the module id) before any write, so a run whose
+    # audit event would be dropped is never persisted (defense in depth; registered names are safe).
+    _require_auditable_run_subject(name)
+    actor = resolve_actor(request.headers)
     started = perf_counter()
     ok = False
     with tracer.start_span("module.run", attributes={"module": name}) as span:
@@ -339,13 +443,29 @@ def run_module_endpoint(
             )
             workload = req.scope.get("workload")
             if workload:
+                # Validate the exact derived finding.emitted subject before any write (fail closed).
+                _require_auditable_findings_subject(workload, len(result.findings))
                 store.commit_run(workload, result)  # API is the single writer
+                if result.findings:
+                    _emit_findings_persisted(
+                        audit, actor=actor, workload=workload, count=len(result.findings)
+                    )
             ok = result.ok
             return result
+        except ProvenanceError as exc:
+            # Fail closed: an un-provenanced finding is rejected at the persistence gate; surface a
+            # clean 422 (never a 500) and persist nothing. The run is still audited in ``finally``.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             duration_ms = (perf_counter() - started) * 1000.0
             span.set_attribute("outcome", "ok" if ok else "error")
             metrics.record_module_run(name, ok=ok, duration_ms=duration_ms)
+            audit.emit(
+                actor=actor,
+                action=AuditAction.run_executed,
+                subject=_run_executed_subject(name),
+                result=AuditResult.success if ok else AuditResult.failure,
+            )
 
 
 # --------------------------------------------------------------------------------------
@@ -356,9 +476,40 @@ def run_module_endpoint(
 # leaves state unchanged.
 # --------------------------------------------------------------------------------------
 @app.post("/api/workloads/{workload}/results")
-def submit_results(workload: str, result: ModuleRunResult, store: StoreDep) -> dict[str, object]:
-    """Accept a validated ``ModuleRunResult`` and persist estate/graph/findings atomically."""
-    return {"workload": workload, "persisted": store.commit_run(workload, result)}
+def submit_results(
+    workload: str,
+    result: ModuleRunResult,
+    request: Request,
+    store: StoreDep,
+    audit: AuditDep,
+) -> dict[str, object]:
+    """Accept a validated ``ModuleRunResult`` and persist estate/graph/findings atomically.
+
+    This is how the compute-only ACA worker hands a completed run to the API (the single writer),
+    so the executed run is audited here too (issue #59): a ``run.executed`` event, subject = the
+    result's module, result = success/failure from ``result.ok``. Findings persist through the
+    central provenance gate (an un-provenanced finding fails closed with a 422 and NOTHING is
+    written); on success a PII-free ``finding.emitted`` event is also recorded. Auditing never
+    blocks the write.
+    """
+    actor = resolve_actor(request.headers)
+    # Validate BOTH derived audit subjects (run.executed + finding.emitted) before any write, so a
+    # non-audit-safe module id or workload id can never persist state whose audit event is dropped.
+    _require_auditable_run_subject(result.module)
+    _require_auditable_findings_subject(workload, len(result.findings))
+    try:
+        persisted = store.commit_run(workload, result)
+    except ProvenanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit.emit(
+        actor=actor,
+        action=AuditAction.run_executed,
+        subject=_run_executed_subject(result.module),
+        result=AuditResult.success if result.ok else AuditResult.failure,
+    )
+    if result.findings:
+        _emit_findings_persisted(audit, actor=actor, workload=workload, count=len(result.findings))
+    return {"workload": workload, "persisted": persisted}
 
 
 @app.post("/api/workloads/{workload}/estate")
@@ -376,9 +527,30 @@ def put_graph(workload: str, graph: WorkloadGraph, store: StoreDep) -> dict[str,
 
 
 @app.post("/api/workloads/{workload}/findings")
-def add_findings(workload: str, findings: list[Finding], store: StoreDep) -> dict[str, int]:
-    """Upsert findings into the current set for ``workload``."""
-    store.add_findings(workload, findings)
+def add_findings(
+    workload: str,
+    findings: list[Finding],
+    request: Request,
+    store: StoreDep,
+    audit: AuditDep,
+) -> dict[str, int]:
+    """Upsert findings into the current set for ``workload``.
+
+    Findings persist through the central provenance gate (issue #59): a finding without evidence /
+    sourceReferences fails closed with a 422 and NOTHING is written on either backend. On a
+    successful write a PII-free ``finding.emitted`` event (subject = ``<workload>#count=N``) is
+    recorded to the append-only audit log; auditing never blocks the write.
+    """
+    # Validate the exact derived finding.emitted subject before any write (fail closed).
+    _require_auditable_findings_subject(workload, len(findings))
+    try:
+        store.add_findings(workload, findings)
+    except ProvenanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if findings:
+        _emit_findings_persisted(
+            audit, actor=resolve_actor(request.headers), workload=workload, count=len(findings)
+        )
     return {"count": len(findings)}
 
 
