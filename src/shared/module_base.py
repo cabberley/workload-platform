@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 
 from shared.contracts import ModuleManifest, ModuleRunResult
+from shared.provenance import enforce_finding_provenance
 from shared.state import ReadableState
 
 
@@ -85,11 +86,25 @@ def run_module(
     dependency_graph actually see the content they consume (previously dropped here — issue #24).
     """
     ctx = ModuleContext(packs=packs, state=state, clients=clients)
-    return module.run(ctx, scope=scope)
+    result = module.run(ctx, scope=scope)
+    # Provenance completeness (issue #59): a module must not emit a finding without evidence.
+    # Enforced here at the emission boundary so an un-provenanced finding fails closed BEFORE it
+    # can reach the API single writer / durable state.
+    enforce_finding_provenance(result.findings)
+    return result
 
 
 class ModuleRegistry:
-    """Discovers and holds the enabled modules; used by the API core and worker."""
+    """Discovers and holds the enabled modules; used by the API core and worker.
+
+    TODO(human): audit ``module.enabled`` / ``module.disabled`` (issue #59). A module's
+    ``enabled`` state is today a STATIC field on its ``ModuleManifest`` (read at
+    :meth:`enabled_modules`); there is no runtime enable/disable *toggle* path to emit from. When a
+    toggle is introduced (a registry mutator or an API endpoint that flips a module on/off), emit
+    an ``AuditAction.module_enabled`` / ``module_disabled`` event through a store-backed
+    ``AuditEmitter`` at that mutation — actor = the operator's principal id, subject = the module
+    name, result = success/failure. Do NOT invent a toggle subsystem here just to emit.
+    """
 
     def __init__(self) -> None:
         self._modules: dict[str, Module] = {}

@@ -165,7 +165,8 @@ def test_api_state_reader_roundtrips_full_readable_state(wired):
     assert client.post("/api/workloads/epic/graph", json=graph).status_code == 200
     findings = [
         {"id": "f1", "module": "quality_checks", "title": "t", "passed": False,
-         "severity": "high", "nodeId": "vm1"}
+         "severity": "high", "nodeId": "vm1",
+         "evidence": [{"kind": "resource", "id": "vm1"}]}
     ]
     assert client.post("/api/workloads/epic/findings", json=findings).status_code == 200
     # Snapshot so the two NEW previous-* endpoints have data to serve.

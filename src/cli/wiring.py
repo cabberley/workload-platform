@@ -59,6 +59,15 @@ def build_packs_engine() -> PacksEngine | None:
     TODO(human): source the pack signing secret from Key Vault (by identity) and pass it as
     ``PacksEngine(root, signing_secret=...)`` so signatures — not just content hashes — are
     verified before execution. Keep the secret out of code/config literals.
+
+    TODO(human): audit ``pack.import`` and ``pack.assign`` (issue #59). These are HELD behind the
+    pack-import/admission decision (#37): there is no import/assign subsystem to emit from yet.
+    When #37 lands, construct the engine (or the import service) with a store-backed
+    ``AuditEmitter`` (as the API does via ``PacksEngine.attach_audit_emitter``) and emit
+    ``AuditAction.pack_import`` on admission (with the success-path ``pack.verify``) and
+    ``AuditAction.pack_assign`` when a pack is bound to a workload — actor = the importing
+    principal id, subject/packId/packVersion = the admitted pack. Do NOT build the held subsystem
+    here just to emit.
     """
     root = os.environ.get(ENV_CONTENT_ROOT, _DEFAULT_CONTENT_ROOT)
     try:

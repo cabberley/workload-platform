@@ -27,6 +27,7 @@ from shared.contracts import (
     ResourceNode,
     ScaleProfile,
     Severity,
+    SourceReference,
     WorkloadGraph,
 )
 from shared.module_base import Module, ModuleContext, run_module
@@ -71,7 +72,12 @@ def _graph() -> WorkloadGraph:
 
 
 def _finding(fid: str, module: str, *, passed: bool | None) -> Finding:
-    return Finding(id=fid, module=module, title=fid, passed=passed, severity=Severity.high)
+    # Every finding carries provenance (issue #59): the run-module emission guard rejects a finding
+    # without ``evidence`` (fail closed), so synthetic fixtures cite a synthetic source reference.
+    return Finding(
+        id=fid, module=module, title=fid, passed=passed, severity=Severity.high,
+        evidence=[SourceReference(kind="resource", id=f"node-{fid}")],
+    )
 
 
 def _azure_tables_installed() -> bool:

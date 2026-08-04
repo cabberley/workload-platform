@@ -132,7 +132,12 @@ def verify_signature_structure(pack: dict[str, object], signature: PackSignature
         recomputed = hashlib.sha256(_canonical(pack)).hexdigest()
     except (TypeError, ValueError):
         return False
-    return hmac.compare_digest(recomputed, signature.canonical_digest)
+    # A real canonical digest is ASCII hex; a non-ASCII value (e.g. a lone surrogate smuggled via
+    # JSON) can never match and would make ``hmac.compare_digest`` raise ``TypeError``. Guard with
+    # ``.isascii()`` so it fails closed (``False``) instead of raising out of the fail-closed path.
+    return signature.canonical_digest.isascii() and hmac.compare_digest(
+        recomputed, signature.canonical_digest
+    )
 
 
 def verify_pack(pack: dict[str, object], signature: PackSignature, verifier: Verifier) -> bool:
