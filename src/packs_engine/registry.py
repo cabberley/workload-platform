@@ -22,7 +22,7 @@ body-only ``sha256`` integrity/trust hash. See :mod:`packs_engine.canonical`.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "entries": [
     {
       "id": "epic-core",
@@ -30,11 +30,18 @@ body-only ``sha256`` integrity/trust hash. See :mod:`packs_engine.canonical`.
       "type": "workload",
       "digest": "<sha256-hex>",
       "createdAt": "2026-01-01T00:00:00+00:00",
-      "signature": null
+      "signature": "<compact-json serialized PackSignature, or null>",
+      "keyId": "<signing key id, or null>"
     }
   ]
 }
 ```
+
+``signature`` is the deterministically-serialized detached
+:class:`~shared.contracts.PackSignature` that was verified against the pinned trust bundle at
+admission (issue #89, R2), and ``keyId`` selects the pinned public key at runtime. A ``null``
+``signature``/``keyId`` (or a v1 index) is a legacy-untrusted entry the runtime resolver fails
+closed.
 """
 from __future__ import annotations
 
@@ -45,16 +52,26 @@ import re
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from packs_engine.canonical import canonical_digest
-from shared.contracts import PackType
+from shared.contracts import PackSignature, PackType
 
 DEFAULT_INDEX_PATH = Path("content/registry/index.json")
-INDEX_SCHEMA_VERSION = 1
+# Bumped 1 -> 2 for issue #89 (R2): a v2 entry additionally persists the detached Ed25519 pack
+# signature + its ``key_id`` so the runtime resolver can INDEPENDENTLY re-verify the signature
+# against the pinned trust bundle (digest match alone is integrity, not trust). A v1 (pre-#89)
+# index is still parseable for backward compatibility, but every v1 entry is flagged
+# legacy-untrusted (no verifiable detached signature) so the runtime fails it closed.
+INDEX_SCHEMA_VERSION = 2
+# Index schema versions this build can parse. Only the current version writes a trustworthy
+# detached signature; older versions parse but resolve fail-closed (legacy-untrusted).
+SUPPORTED_INDEX_VERSIONS: frozenset[int] = frozenset({1, 2})
 
 # A registry digest is a lowercase hex SHA-256 (64 hex chars).
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -216,13 +233,21 @@ class PackRef:
 # --------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class RegistryEntry:
-    """A single published, content-addressed pack version."""
+    """A single published, content-addressed pack version.
+
+    ``signature`` holds the deterministically-serialized detached :class:`PackSignature` that was
+    verified against the pinned trust bundle at admission (issue #89, R2); ``key_id`` names the
+    signing key so the runtime can select the pinned PUBLIC key and INDEPENDENTLY re-verify the
+    signature. A ``None`` ``signature``/``key_id`` marks a legacy-untrusted entry (a v1 index, or a
+    pre-#89/hand-crafted entry) which the runtime resolver fails closed.
+    """
 
     ref: PackRef
     type: PackType
     digest: str
     createdAt: datetime
     signature: str | None = None
+    key_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -232,7 +257,30 @@ class RegistryEntry:
             "digest": self.digest,
             "createdAt": self.createdAt.isoformat(),
             "signature": self.signature,
+            "keyId": self.key_id,
         }
+
+    def detached_signature(self) -> PackSignature | None:
+        """Reconstruct the persisted detached :class:`PackSignature`, or ``None`` if untrusted.
+
+        Fail-closed: returns ``None`` (so the runtime resolver SKIPS the entry) when the entry
+        carries no persisted detached signature or ``key_id`` (a legacy/pre-#89 or hand-crafted
+        entry), or when the stored ``signature`` string is not a well-formed serialized
+        :class:`PackSignature`. A returned envelope is re-verified against the pinned trust bundle
+        by the caller — reconstruction here is NOT itself a trust decision.
+        """
+        if self.signature is None or self.key_id is None:
+            return None
+        try:
+            data = json.loads(self.signature)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            return PackSignature(**data)
+        except (ValidationError, TypeError):
+            return None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> RegistryEntry:
@@ -253,15 +301,52 @@ class RegistryEntry:
             signature = data.get("signature")
             if signature is not None and not isinstance(signature, str):
                 raise ValueError("entry 'signature' must be a string or null")
+            key_id = data.get("keyId")
+            if key_id is not None and not isinstance(key_id, str):
+                raise ValueError("entry 'keyId' must be a string or null")
             return cls(
                 ref=PackRef(id=pack_id, version=version),
                 type=pack_type,
                 digest=digest,
                 createdAt=created,
                 signature=signature,
+                key_id=key_id,
             )
         except (KeyError, ValueError, TypeError, InvalidVersionError) as exc:
             raise CorruptRegistryError(f"Invalid registry entry: {data!r} ({exc})") from exc
+
+
+def _serialize_pack_signature(signature: PackSignature) -> str:
+    """Serialize a :class:`PackSignature` deterministically for on-disk persistence.
+
+    Compact, key-sorted JSON so an identical signature always serializes to identical bytes (stable
+    diffs, and a byte-for-byte idempotent re-publish of the same content+signature).
+    """
+    return json.dumps(signature.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_publish_signature(
+    signature: PackSignature | str | None,
+) -> tuple[str | None, str | None]:
+    """Return the ``(serialized detached signature, key_id)`` to persist on a registry entry.
+
+    ``None`` -> a legacy/untrusted entry (both fields ``None``): the runtime resolver fails such an
+    entry closed because it carries no verifiable detached signature. A :class:`PackSignature` (or
+    its already-serialized compact JSON) is stored deterministically together with its ``key_id`` so
+    the runtime can select the pinned public key and re-verify the signature against the trust root.
+    """
+    if signature is None:
+        return None, None
+    if isinstance(signature, str):
+        try:
+            sig = PackSignature(**json.loads(signature))
+        except (json.JSONDecodeError, ValueError, TypeError, ValidationError) as exc:
+            raise ValueError(
+                f"publish: signature string is not a serialized PackSignature ({exc})"
+            ) from exc
+    else:
+        sig = signature
+    return _serialize_pack_signature(sig), sig.key_id
 
 
 def parse_registry_index(
@@ -270,26 +355,37 @@ def parse_registry_index(
     """Validate a JSON-parsed registry index and return its entries keyed by ref. Fail closed.
 
     Single source of truth for what a *valid* pack registry index is: object shape, ``int`` schema
-    ``version`` equal to :data:`INDEX_SCHEMA_VERSION`, a list of well-formed entries, and no
-    duplicate ``id@version`` ref. Reused by :meth:`PackRegistry._load` AND the pack-validate CI gate
+    ``version`` in :data:`SUPPORTED_INDEX_VERSIONS`, a list of well-formed entries, and no duplicate
+    ``id@version`` ref. Reused by :meth:`PackRegistry._load` AND the pack-validate CI gate
     (``scripts/validate_packs.py``) so the two can never diverge on what counts as a valid index.
     Raises :class:`CorruptRegistryError` on any violation.
+
+    Backward compatibility (issue #89, R2): a pre-#89 v1 index still parses, but every v1 entry is
+    flagged legacy-untrusted — its ``signature``/``key_id`` are cleared to ``None`` (a v1
+    ``signature`` is the legacy HMAC, never a trust-bundle-verifiable detached signature) so the
+    runtime resolver fails it closed rather than mistaking legacy data for a verified import.
     """
     if not isinstance(raw, dict):
         raise CorruptRegistryError(f"{source} is not a JSON object")
     version = raw.get("version")
-    if type(version) is not int or version != INDEX_SCHEMA_VERSION:
+    if type(version) is not int or version not in SUPPORTED_INDEX_VERSIONS:
         raise CorruptRegistryError(
             f"{source} has missing/unsupported schema version {version!r} "
-            f"(expected int {INDEX_SCHEMA_VERSION})"
+            f"(expected int in {sorted(SUPPORTED_INDEX_VERSIONS)})"
         )
     if not isinstance(raw.get("entries"), list):
         raise CorruptRegistryError(f"{source} has a non-list 'entries'")
+    is_legacy_index = version < INDEX_SCHEMA_VERSION
     entries: dict[PackRef, RegistryEntry] = {}
     for item in raw["entries"]:
         if not isinstance(item, dict):
             raise CorruptRegistryError(f"Registry entry is not an object: {item!r}")
         entry = RegistryEntry.from_dict(item)
+        if is_legacy_index:
+            # A v1 (pre-#89) index predates persisted detached signatures: strip any recorded
+            # signature/key_id so the entry is treated as legacy-untrusted and fails closed at
+            # runtime resolution (never activated on a digest match alone).
+            entry = replace(entry, signature=None, key_id=None)
         if entry.ref in entries:
             raise CorruptRegistryError(f"Duplicate registry entry for {entry.ref}")
         entries[entry.ref] = entry
@@ -370,10 +466,23 @@ class PackRegistry:
         os.replace(str(tmp), str(self.index_path))
 
     # ---- public API -------------------------------------------------------------------
-    def publish(self, pack: dict[str, Any], *, created_at: datetime | None = None) -> RegistryEntry:
+    def publish(
+        self,
+        pack: dict[str, Any],
+        *,
+        created_at: datetime | None = None,
+        signature: PackSignature | str | None = None,
+    ) -> RegistryEntry:
         """Publish a pack version. Immutable: same ref + different digest raises.
 
         Returns the (new or existing) entry. Re-publishing identical content is a no-op.
+
+        ``signature`` is the detached :class:`PackSignature` that was verified against the pinned
+        trust bundle at admission (issue #89, R2). It is persisted (deterministically serialized,
+        with its ``key_id``) on the entry so the runtime resolver can INDEPENDENTLY re-verify the
+        signature against the pinned trust root. ``None`` (the default) records a legacy-untrusted
+        entry that the runtime fails closed — callers on a trusted admission path (e.g.
+        ``cli.packs_studio.cmd_export``) MUST pass the verified signature.
         """
         manifest = pack.get("manifest")
         if not isinstance(manifest, dict):
@@ -388,6 +497,7 @@ class PackRegistry:
         ref = PackRef(id=str(pack_id), version=str(version))
         SemVer.parse(ref.version)  # fail closed on non-semver versions
         digest = canonical_digest(pack)
+        stored_signature, key_id = _normalize_publish_signature(signature)
 
         # Serialize the whole read-check-write under an inter-process lock, and RE-LOAD the
         # latest state inside the lock so a concurrent publisher's entry is always seen.
@@ -408,7 +518,8 @@ class PackRegistry:
                 type=pack_type,
                 digest=digest,
                 createdAt=created_at or datetime.now(UTC),
-                signature=manifest.get("signature"),
+                signature=stored_signature,
+                key_id=key_id,
             )
             entries[ref] = entry
             self._save(entries)

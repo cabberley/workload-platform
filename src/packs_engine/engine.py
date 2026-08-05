@@ -13,13 +13,18 @@ allowed to execute. Unknown/invalid signature => fail closed (refuse).
    injected, each pack's :attr:`~shared.contracts.PackManifest.pack_signature` is verified against
    the pack's *canonical bytes* via :func:`shared.signing.verify_pack`. A missing or invalid
    detached signature fails closed (:class:`PackVerificationError`).
-3. **Trust-root import admission (issue #89)** — :meth:`PacksEngine.verify_pack_for_import` is the
-   customer-side, verification-only, **keyless** trust root for IMPORTED packs. Microsoft signs
-   packs OFFLINE; this platform only verifies, selecting a pinned Ed25519 **PUBLIC** key from a
-   trust bundle (:class:`~shared.signing.PackVerifier`) by the signature's ``key_id``. The import/
-   assign subsystem (#37) calls it BEFORE a pack enters the registry/content store (#44); the #44
-   load-time path then trusts the recorded digest precisely because this gate verified the
-   signature at admission. Fail-closed: unknown key id / empty bundle / bad signature => reject.
+3. **Trust-root import admission + runtime re-verification (issue #89)** —
+   :meth:`PacksEngine.verify_pack_for_import` is the customer-side, verification-only, **keyless**
+   trust root for IMPORTED packs. Microsoft signs packs OFFLINE; this platform only verifies,
+   selecting a pinned Ed25519 **PUBLIC** key from a trust bundle
+   (:class:`~shared.signing.PackVerifier`) by the signature's ``key_id``. The import/assign
+   subsystem (#37) calls it BEFORE a pack enters the registry/content store (#44). **R2
+   (defence-in-depth):** :meth:`PacksEngine._resolve_imported_packs` no longer trusts the recorded
+   digest transitively — it INDEPENDENTLY re-verifies each imported pack's persisted detached
+   signature against the SAME pinned bundle at load time (digest match is integrity, not trust), so
+   a legacy/pre-fix or attacker-crafted ``dist`` that recorded a digest without a pinned-verified
+   signature is rejected fail-closed. Fail-closed everywhere: unknown key id / empty bundle / bad
+   signature / signature-less legacy entry / no trust root wired => reject.
 
 Gates (1)/(2) apply to packs loaded from the content-root filesystem; gate (3) guards the import
 path. When **no** verifier is injected for a gate, that gate is inert and today's behavior is
@@ -330,12 +335,21 @@ class PacksEngine:
         * ``canonical_digest(loaded) != registry.digest`` (tampered/mismatched bytes);
         * the loaded manifest's ``id``/``version`` does not match the registry entry's ref (the
           bytes claim a different identity than the entry that authorized them);
-        * the loaded manifest is malformed or its type does not match the entry.
+        * the loaded manifest is malformed or its type does not match the entry;
+        * **no trust root is wired** (``self._import_verifier is None``), the entry carries **no
+          persisted detached signature/key_id** (a legacy/pre-#89 or hand-crafted entry), the
+          signature's ``key_id`` is **not pinned** in the trust bundle, or the **signature does not
+          verify** against the pinned public key (issue #89, R2).
 
-        The digest re-verification is the trust gate here: because the registry digest was recorded
-        only AFTER a successful signature verification on import, bytes whose recomputed canonical
-        digest matches that digest are exactly the verified content — no separate signature check is
-        needed (and the stored canonical bytes deliberately exclude the volatile signature fields).
+        The digest re-verification proves **integrity** (the stored bytes ARE the recorded content),
+        but integrity is not trust. The runtime therefore INDEPENDENTLY re-verifies the persisted
+        detached signature against the **pinned trust bundle** (``self._import_verifier``) — the
+        SAME trust root the exporter/import-admission gate uses — instead of transitively trusting
+        the registry digest. This closes the reviewer-found bypass where a legacy/pre-fix or
+        attacker-crafted ``dist`` (a ``registry/index.json`` + ``store/`` written WITHOUT the
+        pinned admission gate) would be activated on a digest match alone, even though the pinned
+        trust root rejects the signer. A signature-less (legacy) entry stays fail-closed until it
+        is re-exported through the pinned admission gate.
 
         Two store entries can never share one ``id@version`` with differing content: the registry
         rejects a re-publish of an existing ``id@version`` under a different digest
@@ -391,6 +405,19 @@ class PacksEngine:
                 continue
             if manifest.type != entry.type:
                 continue  # registry type must match the loaded manifest -> fail closed
+            # Runtime trust-root re-verification (issue #89, R2). The digest match above is
+            # INTEGRITY, not trust: a legacy/pre-fix or attacker-crafted dist could carry a digest
+            # that was never backed by a signature verified against the pinned bundle. Re-verify the
+            # persisted detached signature against the pinned trust root INDEPENDENTLY, and fail
+            # closed (skip, never execute) on any of: no trust root wired, a legacy/signature-less
+            # entry, an unpinned key_id, or a signature that does not verify.
+            if self._import_verifier is None:
+                continue  # no trust root -> cannot verify imports -> fail closed
+            signature = entry.detached_signature()
+            if signature is None:
+                continue  # legacy/untrusted entry (no verifiable detached signature) -> fail closed
+            if not self._import_verifier.verify_pack(raw, signature):
+                continue  # signature does not verify against the pinned bundle -> fail closed
             resolved.append(Pack(manifest=manifest, body=raw.get("body", {}), imported=True))
         return resolved
 
@@ -451,9 +478,11 @@ class PacksEngine:
         Call this **BEFORE** a pack is admitted to the registry/content store (#44) and activated —
         it is the clean extension hook the import/assign subsystem (#37) will call at admission, and
         it does NOT depend on #37's parked WIP. The #44 store deliberately holds *signature-free*
-        canonical bytes and re-verifies them by digest at load time; the digest is trustworthy ONLY
-        because this gate verified the signature at import — so signature verification belongs here,
-        at admission, not at load.
+        canonical bytes; the detached signature verified here is persisted on the registry entry so
+        the runtime resolver can INDEPENDENTLY re-verify it against the same pinned bundle at load
+        time (issue #89, R2 — :meth:`_resolve_imported_packs`). Admission verifies the signature at
+        the write boundary; the runtime re-verifies it at read time — digest match is integrity, not
+        trust.
 
         Fail closed (raises :class:`PackVerificationError`) when: no trust root is wired, the
         manifest is malformed, the detached signature is missing, the ``key_id`` is not pinned in

@@ -743,7 +743,10 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     registry = PackRegistry(index_path=dist / "registry" / "index.json")
     try:
-        entry = registry.publish(pack)
+        # Persist the SAME detached signature we just verified against the pinned trust bundle, so
+        # the runtime resolver can INDEPENDENTLY re-verify it against the pinned trust root (issue
+        # #89, R2) rather than trusting the registry digest transitively.
+        entry = registry.publish(pack, signature=signature)
     except (ImmutableVersionError, InvalidVersionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

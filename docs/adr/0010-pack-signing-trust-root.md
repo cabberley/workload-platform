@@ -53,28 +53,39 @@ keyless verification, using detached Ed25519 and a bundled trust root of pinned 
    remove the retired one. A future "bundle refreshed via **signed** pack-registry metadata" path is
    a documented extension **hook** — remote fetch is deliberately **not** built now.
 
-5. **Enforced fail-closed at every registry/store WRITE (admission), not at runtime load.** The
-   pinned trust root gates **every path that records a registry digest** the runtime later trusts:
-   - **Export / registry-write (live today):** [`cli.packs_studio.cmd_export`](../../src/cli/packs_studio.py)
-     loads the pinned bundle via [`build_pack_import_verifier`](../../src/cli/wiring.py) (honouring
-     `$WP_TRUST_BUNDLE_PATH`, overridable per-run with `--trust-bundle`) and verifies the pack
-     against it **before** `registry.publish` + `content_store.put`. A caller-supplied
-     `--public-key` is only an optional, non-authoritative self-consistency pre-check — it can
-     **never** substitute for the pinned-bundle verification. Default (no bundle) = empty =
-     reject-all, so an untrusted/unpinned pack can never be written into a runtime-trusted registry.
-   - **Customer import (#37, parked):** [`PacksEngine.verify_pack_for_import`](../../src/packs_engine/engine.py)
-     is the SAME fail-closed gate (same `TrustBundleVerifier`), ready for the #37 import subsystem to
-     call at admission before it publishes/stores.
+5. **Enforced fail-closed as TWO layers — admission (write) AND runtime resolution (read).** The
+   pinned trust root gates both the paths that record a registry digest and the runtime that
+   activates a recorded digest:
+   - **(i) Admission at every registry/store WRITE.**
+     [`cli.packs_studio.cmd_export`](../../src/cli/packs_studio.py) loads the pinned bundle via
+     [`build_pack_import_verifier`](../../src/cli/wiring.py) (honouring `$WP_TRUST_BUNDLE_PATH`,
+     overridable per-run with `--trust-bundle`) and verifies the pack against it **before**
+     `registry.publish` + `content_store.put`. It also **persists the verified detached signature**
+     (serialized `PackSignature` + `key_id`) onto the registry entry so the runtime can re-check it.
+     A caller-supplied `--public-key` is only an optional, non-authoritative self-consistency
+     pre-check. The customer import path (#37, parked) will reuse the SAME gate,
+     [`PacksEngine.verify_pack_for_import`](../../src/packs_engine/engine.py).
+   - **(ii) Independent re-verification at runtime resolution (read) — issue #89, R2.**
+     [`PacksEngine._resolve_imported_packs`](../../src/packs_engine/engine.py) no longer trusts the
+     recorded digest transitively. After re-verifying the store bytes against the recorded digest
+     (**integrity**) and binding them to the entry ref, it **re-verifies the persisted detached
+     signature against the same pinned bundle** (`self._import_verifier`) before activating the
+     pack. Fail-closed (skip, never execute) when: no trust root is wired, the entry carries no
+     persisted detached signature/`key_id` (legacy — a v1 index, or a pre-#89/hand-crafted entry),
+     the `key_id` is unpinned, or the signature does not verify.
 
-   This closes the reviewer-found bypass where `cmd_export` verified against a **caller-supplied**
-   key (an attacker could sign with their own key, export, and produce a runtime-trusted registry).
-   The #44 store deliberately holds *signature-excluded* canonical bytes and re-verifies them by
-   digest at load time; that digest is trustworthy **only because** admission verified the signature
-   at the write boundary — so signature verification belongs at admission, not at load.
-   `build_pack_import_verifier` **always** returns a verifier (never `None`): an empty/missing/corrupt
-   bundle yields a **reject-all** verifier, so admission is fail-closed *by construction* until real
-   Microsoft public keys are pinned. Fail-closed on: no/empty/unavailable bundle, malformed manifest
-   or signature, a blank/unknown/unpinned `key_id`, or a signature that does not verify.
+   This closes **two** reviewer-found bypasses: (a) `cmd_export` verifying against a
+   **caller-supplied** key (an attacker signs with their own key, exports, and produces a
+   runtime-trusted registry); and (b) a **legacy/pre-fix or attacker-crafted `dist`** (a
+   `registry/index.json` + `store/` written WITHOUT the pinned admission gate) being activated at
+   runtime on a **digest match alone**, even though the pinned trust root rejects the signer. Digest
+   match is now treated as **integrity, not trust**: trust requires the signature to verify against
+   the pinned bundle at BOTH the write boundary and the read boundary. `build_pack_import_verifier`
+   **always** returns a verifier (never `None`): an empty/missing/corrupt bundle yields a
+   **reject-all** verifier, so both layers are fail-closed *by construction* until real Microsoft
+   public keys are pinned. Legacy signature-less entries stay rejected until re-exported through the
+   pinned admission gate. The registry index schema is bumped **v1 → v2** to carry the persisted
+   signature/`key_id`; a v1 index still parses but every entry is flagged legacy-untrusted.
 
 6. **Removed the misleading KV *signing* stubs.** `KeyVaultSigner`/`KeyVaultVerifier` are deleted
    from `signing.py`. No Key Vault signing-key provisioning is introduced. The verification-only
@@ -102,12 +113,15 @@ accept that the **customer side never signs**.
 
 - **+** In-boundary, **keyless**, fail-closed trust root: the customer platform holds only public
   keys, performs no KV signing op, and rejects every unverified import by construction.
-- **+** The trust root is now **real and enforced at the registry/store write boundary**
-  (`cmd_export` today via `build_pack_import_verifier`; #37's customer import path will reuse
-  `verify_pack_for_import`), not a `NotImplementedError` stub. Runtime activation trusts the
-  registry digest **because admission verified the signature against the pinned bundle** — the
-  earlier caller-supplied-key bypass at export is closed. Docs are corrected (#44 no longer credited
-  with signing-key wiring). No runtime Key Vault role is required for pack signing.
+- **+** The trust root is now **real and enforced as two fail-closed layers**: admission at the
+  registry/store write boundary (`cmd_export` today via `build_pack_import_verifier`; #37's customer
+  import path will reuse `verify_pack_for_import`) **persists** the verified detached signature, and
+  runtime resolution (`_resolve_imported_packs`) **independently re-verifies** that persisted
+  signature against the pinned bundle before activation — not a `NotImplementedError` stub. Digest
+  match is integrity, not trust, so the earlier caller-supplied-key bypass at export **and** the
+  legacy/crafted-`dist` "digest-match activates" bypass at runtime are both closed. Docs are
+  corrected (#44 no longer credited with signing-key wiring). No runtime Key Vault role is required
+  for pack signing.
 - **+** Rotation is a data change (publish a public key into the bundle), not a code/redeploy of a
   key provider; a remote signed-metadata refresh is a forward-compatible extension hook.
 - **−** Until Microsoft publishes real signing **public** keys into `config/trust-bundle.json`, the

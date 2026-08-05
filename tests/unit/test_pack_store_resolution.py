@@ -8,6 +8,7 @@ shadowing bytes.
 """
 from __future__ import annotations
 
+import base64
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,10 +19,37 @@ from packs_engine.canonical import canonical_bytes, canonical_digest
 from packs_engine.content_store import LocalPackContentStore
 from packs_engine.engine import PacksEngine
 from packs_engine.registry import ImmutableVersionError, PackRegistry
-from shared.contracts import Finding, PackType, ResourceNode, WorkloadGraph
+from shared.contracts import (
+    Finding,
+    PackSignature,
+    PackType,
+    ResourceNode,
+    TrustBundle,
+    TrustedPublicKey,
+    WorkloadGraph,
+)
 from shared.module_base import run_module
+from shared.signing import ED25519_ALG, Ed25519Signer, TrustBundleVerifier, sign_pack
 
 WORKLOAD = "epic"
+
+# A synthetic in-test Ed25519 signer stands in for Microsoft's OFFLINE signer. The matching PUBLIC
+# key is pinned into the trust bundle the engine verifies against. NO private key is committed.
+_SIGNER = Ed25519Signer.generate("test-ms-key")
+
+
+def _pinned_verifier() -> TrustBundleVerifier:
+    """A trust bundle pinning only ``_SIGNER``'s PUBLIC key (like a real pinned Microsoft key)."""
+    pub = base64.b64encode(_SIGNER.verifier().public_bytes()).decode("ascii")
+    bundle = TrustBundle(
+        keys=[TrustedPublicKey(key_id="test-ms-key", algorithm=ED25519_ALG, public_key=pub)]
+    )
+    return TrustBundleVerifier.from_bundle(bundle)
+
+
+def _sign(pack: dict) -> PackSignature:
+    """Sign ``pack`` with the pinned synthetic key (as Microsoft's OFFLINE signer would)."""
+    return sign_pack(pack, _SIGNER)
 
 
 def _rule_pack(
@@ -78,19 +106,23 @@ class _SyntheticState:
 
 
 def _import(registry: PackRegistry, store: LocalPackContentStore, pack: dict) -> str:
-    """Mirror the import single-writer: publish metadata, then store verified canonical bytes."""
-    entry = registry.publish(pack)
+    """Mirror the import single-writer: publish metadata WITH the pinned-verified detached
+    signature (issue #89, R2), then store verified canonical bytes so the runtime can re-verify."""
+    entry = registry.publish(pack, signature=_sign(pack))
     store.put(entry.digest, canonical_bytes(pack))
     return entry.digest
 
 
 def _engine(tmp_path: Path) -> tuple[PacksEngine, PackRegistry, LocalPackContentStore]:
-    """A PacksEngine over an EMPTY content root wired with a registry + content store."""
+    """A PacksEngine over an EMPTY content root wired with a registry + content store + the pinned
+    trust root so the runtime re-verifies imported-pack signatures (issue #89, R2)."""
     root = tmp_path / "content"
     root.mkdir()
     registry = PackRegistry(index_path=root / "registry" / "index.json")
     store = LocalPackContentStore(tmp_path / "store")
-    engine = PacksEngine(root, registry=registry, content_store=store)
+    engine = PacksEngine(
+        root, registry=registry, content_store=store, import_verifier=_pinned_verifier()
+    )
     return engine, registry, store
 
 
@@ -133,8 +165,9 @@ def test_imported_pack_runs_end_to_end_through_quality_checks(tmp_path: Path) ->
 # --------------------------------------------------------------------------------------
 def test_missing_digest_in_store_fails_closed(tmp_path: Path) -> None:
     engine, registry, store = _engine(tmp_path)
-    # Registry knows the pack (published) but its bytes were never stored.
-    registry.publish(_rule_pack())
+    # Registry knows the pack (published, signed) but its bytes were never stored.
+    pack = _rule_pack()
+    registry.publish(pack, signature=_sign(pack))
 
     assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
     assert engine.load_all(pack_type=PackType.rule) == []
@@ -142,7 +175,8 @@ def test_missing_digest_in_store_fails_closed(tmp_path: Path) -> None:
 
 def test_tampered_store_bytes_fail_closed(tmp_path: Path) -> None:
     engine, registry, store = _engine(tmp_path)
-    entry = registry.publish(_rule_pack())
+    pack = _rule_pack()
+    entry = registry.publish(pack, signature=_sign(pack))
     # Store bytes whose recomputed canonical digest does NOT match the registry digest.
     tampered = _rule_pack()
     tampered["body"]["rules"][0]["requiredTag"] = "attacker-controlled"
@@ -155,7 +189,8 @@ def test_tampered_store_bytes_fail_closed(tmp_path: Path) -> None:
 
 def test_non_json_store_bytes_fail_closed(tmp_path: Path) -> None:
     engine, registry, store = _engine(tmp_path)
-    entry = registry.publish(_rule_pack())
+    pack = _rule_pack()
+    entry = registry.publish(pack, signature=_sign(pack))
     store.put(entry.digest, b"\xff\xfenot json at all")
 
     assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
@@ -179,7 +214,9 @@ def test_shipped_pack_not_double_loaded_from_store(tmp_path: Path) -> None:
     store = LocalPackContentStore(tmp_path / "store")
     # The SAME pack is both shipped on the filesystem AND imported into registry+store.
     _import(registry, store, pack)
-    engine = PacksEngine(root, registry=registry, content_store=store)
+    engine = PacksEngine(
+        root, registry=registry, content_store=store, import_verifier=_pinned_verifier()
+    )
 
     # It must appear exactly once (filesystem source), not twice.
     packs = engine.load_for_workload(WORKLOAD, PackType.rule)
@@ -224,7 +261,9 @@ def test_imported_pack_cannot_shadow_shipped_pack_same_ref(tmp_path: Path) -> No
     assert canonical_digest(attacker) != canonical_digest(shipped)
     _import(registry, store, attacker)
 
-    engine = PacksEngine(root, registry=registry, content_store=store)
+    engine = PacksEngine(
+        root, registry=registry, content_store=store, import_verifier=_pinned_verifier()
+    )
 
     # Resolution yields ONLY the shipped pack for that ref — the import is skipped by ref.
     packs = engine.load_for_workload(WORKLOAD, PackType.ops)
@@ -255,7 +294,9 @@ def test_imported_higher_version_cannot_override_shipped_pack_id(tmp_path: Path)
     attacker = _ops_pack(critical_channel="devnull", default_channel="devnull", version="1.0.1")
     _import(registry, store, attacker)
 
-    engine = PacksEngine(root, registry=registry, content_store=store)
+    engine = PacksEngine(
+        root, registry=registry, content_store=store, import_verifier=_pinned_verifier()
+    )
 
     # Shipped packs win by ID at every version: only the shipped pack resolves for this id.
     packs = engine.load_for_workload(WORKLOAD, PackType.ops)
@@ -297,7 +338,10 @@ def test_store_bytes_claiming_a_different_ref_fail_closed(tmp_path: Path) -> Non
     (registry_dir / "index.json").write_text(json.dumps(index), encoding="utf-8")
 
     engine = PacksEngine(
-        root, registry=PackRegistry(index_path=registry_dir / "index.json"), content_store=store
+        root,
+        registry=PackRegistry(index_path=registry_dir / "index.json"),
+        content_store=store,
+        import_verifier=_pinned_verifier(),
     )
     # The manifest id/version (imported-rule@1.0.0) does not match the entry ref (other-id@9.9.9),
     # so the bytes are rejected even though the digest matched — fail closed, resolve nothing.
@@ -359,7 +403,9 @@ def test_new_id_import_cannot_override_shipped_keys_but_can_add(tmp_path: Path) 
     )
     _import(registry, store, attacker)
 
-    engine = PacksEngine(root, registry=registry, content_store=store)
+    engine = PacksEngine(
+        root, registry=registry, content_store=store, import_verifier=_pinned_verifier()
+    )
 
     # Both packs resolve (the new-id import is not shipped-shadowed): shipped + imported.
     packs = engine.load_for_workload(WORKLOAD, PackType.ops)
@@ -400,7 +446,9 @@ def test_new_id_import_resolves_and_augments_when_no_shipped_collision(tmp_path:
     )
     _import(registry, store, addon)
 
-    engine = PacksEngine(root, registry=registry, content_store=store)
+    engine = PacksEngine(
+        root, registry=registry, content_store=store, import_verifier=_pinned_verifier()
+    )
     routing = load_ops_routing(engine, WORKLOAD)
     # Genuinely-new keys from the import are applied; shipped keys remain intact.
     assert routing["routes"]["critical"] == "pager-critical"
@@ -414,4 +462,148 @@ def test_registry_forbids_two_digests_for_one_ref(tmp_path: Path) -> None:
     registry.publish(_rule_pack(tag="a"))
     with pytest.raises(ImmutableVersionError):
         registry.publish(_rule_pack(tag="b"))  # same ref, different content/digest
+
+
+# --------------------------------------------------------------------------------------
+# Issue #89, R2 — the runtime resolver INDEPENDENTLY re-verifies each imported pack's persisted
+# detached signature against the pinned trust bundle. A digest match is INTEGRITY, not trust: a
+# legacy/pre-fix/attacker-crafted dist that recorded a digest WITHOUT a pinned-verified signature
+# must be rejected fail-closed at runtime resolution (never activated).
+# --------------------------------------------------------------------------------------
+def _index_path(tmp_path: Path) -> Path:
+    return tmp_path / "content" / "registry" / "index.json"
+
+
+def _write_index(tmp_path: Path, document: dict) -> None:
+    path = _index_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_pinned_signed_import_resolves_and_activates_at_runtime(tmp_path: Path) -> None:
+    # (b) A pack admitted through the pinned gate (signature persisted, key pinned) STILL resolves
+    # and activates at runtime — the re-verification passes for a genuinely-trusted import.
+    engine, registry, store = _engine(tmp_path)
+    _import(registry, store, _rule_pack(pack_id="trusted-import", tag="backup"))
+
+    packs = engine.load_for_workload(WORKLOAD, PackType.rule)
+    assert [p.manifest.id for p in packs] == ["trusted-import"]
+    assert packs[0].imported is True
+
+
+def test_legacy_v1_dist_rejected_at_runtime(tmp_path: Path) -> None:
+    # (a) The reviewer's legacy-bypass PoC: a dist whose registry/store was written WITHOUT a
+    # persisted pinned signature (a v1 index) is REJECTED at runtime resolution even though the
+    # stored bytes' digest matches the recorded digest. The pre-fix 'evil-import' no longer loads.
+    engine, registry, store = _engine(tmp_path)
+    evil = _rule_pack(pack_id="evil-import", tag="attacker")
+    digest = canonical_digest(evil)
+    store.put(digest, canonical_bytes(evil))
+    _write_index(
+        tmp_path,
+        {
+            "version": 1,
+            "entries": [
+                {
+                    "id": "evil-import",
+                    "version": "1.0.0",
+                    "type": "rule",
+                    "digest": digest,
+                    "createdAt": datetime.now(UTC).isoformat(),
+                    "signature": None,
+                }
+            ],
+        },
+    )
+    # Digest matches, but there is no pinned-verified signature → fail closed, resolve nothing.
+    assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
+    assert [p.manifest.id for p in engine.load_all(pack_type=PackType.rule)] == []
+
+
+def test_v2_signatureless_entry_rejected_at_runtime(tmp_path: Path) -> None:
+    # (a/c) A v2 entry published WITHOUT a persisted detached signature (legacy-untrusted) is
+    # skipped at runtime even though its bytes are present and digest-consistent.
+    engine, registry, store = _engine(tmp_path)
+    pack = _rule_pack(pack_id="unsigned-import")
+    entry = registry.publish(pack)  # no signature persisted → legacy-untrusted v2 entry
+    assert entry.signature is None and entry.key_id is None
+    store.put(entry.digest, canonical_bytes(pack))
+
+    assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
+
+
+def test_v1_index_parses_but_entries_are_legacy_skipped(tmp_path: Path) -> None:
+    # (c) Schema bump: a v1 index still PARSES (no crash — registry.list works) but its entries are
+    # treated as legacy-untrusted and skipped by the runtime resolver.
+    engine, registry, store = _engine(tmp_path)
+    pack = _rule_pack(pack_id="v1-legacy")
+    digest = canonical_digest(pack)
+    store.put(digest, canonical_bytes(pack))
+    _write_index(
+        tmp_path,
+        {
+            "version": 1,
+            "entries": [
+                {
+                    "id": "v1-legacy",
+                    "version": "1.0.0",
+                    "type": "rule",
+                    "digest": digest,
+                    "createdAt": datetime.now(UTC).isoformat(),
+                    "signature": None,
+                }
+            ],
+        },
+    )
+    # The v1 index parses without raising (backward compatible) and the entry is present...
+    listed = registry.list(PackType.rule)
+    assert [e.ref.id for e in listed] == ["v1-legacy"]
+    assert listed[0].signature is None and listed[0].key_id is None  # flagged legacy-untrusted
+    # ...but it is fail-closed at runtime resolution.
+    assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
+
+
+def test_tampered_persisted_signature_rejected_at_runtime(tmp_path: Path) -> None:
+    # (d) A TAMPERED persisted signature (structure still self-consistent, crypto invalid) is
+    # rejected at runtime — the pinned-key cryptographic check fails closed.
+    engine, registry, store = _engine(tmp_path)
+    _import(registry, store, _rule_pack(pack_id="tampered-sig"))
+
+    # Corrupt only the base64 signature bytes of the persisted PackSignature (keep the covered
+    # canonical_digest intact so the structural pre-check still passes but the crypto verify fails).
+    path = _index_path(tmp_path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    stored = json.loads(document["entries"][0]["signature"])
+    stored["signature"] = base64.b64encode(b"\x00" * 64).decode("ascii")
+    document["entries"][0]["signature"] = json.dumps(stored)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
+
+
+def test_import_signed_by_unpinned_key_rejected_at_runtime(tmp_path: Path) -> None:
+    # (d) A signature whose key_id is NOT pinned in the trust bundle is rejected at runtime, even
+    # though the signature is internally valid for the (unpinned) rogue key.
+    engine, registry, store = _engine(tmp_path)
+    rogue = Ed25519Signer.generate("rogue-key")  # NOT pinned in _pinned_verifier()
+    pack = _rule_pack(pack_id="rogue-import")
+    entry = registry.publish(pack, signature=sign_pack(pack, rogue))
+    assert entry.key_id == "rogue-key"
+    store.put(entry.digest, canonical_bytes(pack))
+
+    assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
+
+
+def test_no_trust_root_wired_imports_resolve_to_nothing(tmp_path: Path) -> None:
+    # (e) With NO import verifier wired, imported entries resolve to nothing (fail closed) even for
+    # a properly-signed pack — the runtime cannot verify imports, so it refuses to activate them.
+    root = tmp_path / "content"
+    root.mkdir()
+    registry = PackRegistry(index_path=root / "registry" / "index.json")
+    store = LocalPackContentStore(tmp_path / "store")
+    engine = PacksEngine(root, registry=registry, content_store=store)  # import_verifier=None
+    _import(registry, store, _rule_pack(pack_id="orphan-import"))
+
+    assert engine.load_for_workload(WORKLOAD, PackType.rule) == []
+    assert engine.load_all(pack_type=PackType.rule) == []
 
