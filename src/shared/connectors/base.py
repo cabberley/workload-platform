@@ -10,7 +10,7 @@ import random
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -23,6 +23,21 @@ _T = TypeVar("_T")
 # free. Either returns ``None`` when it cannot mint a credential — the connector then fails closed.
 TokenProvider = Callable[[], str | None]
 CredentialProvider = Callable[[], object | None]
+
+
+@runtime_checkable
+class SecretProvider(Protocol):
+    """Keyless runtime-secret resolver seam (e.g. Key Vault by Managed Identity, issue #85).
+
+    ``get_secret`` returns the secret string, or **raises to fail closed** when a configured vault
+    cannot supply the named secret. Modelled as a structural Protocol so this connector base stays
+    free of any Azure SDK — a connector depends only on this shape, not on the concrete
+    ``shared.secret_provider.KeyVaultSecretProvider``. Injected by the composition root; ``None``
+    ⇒ no vault wired, so :func:`resolve_bearer_token` uses the documented local-dev env-var
+    fallback.
+    """
+
+    def get_secret(self, name: str) -> str: ...
 
 # An injectable, keyless observer seam for connector fail-closed events (issue #60). A zero-arg
 # callback the composition root/API can wire (e.g. ``lambda: metrics.record_connector_fail_closed(
@@ -50,20 +65,39 @@ class FetchResult(BaseModel):
     )
 
 
-def resolve_bearer_token(provider: TokenProvider | None, token_env: str) -> str | None:
-    """Resolve a bearer token in the connectors' canonical order — pure but for one env read.
+def resolve_bearer_token(
+    provider: TokenProvider | None,
+    token_env: str,
+    *,
+    secret_provider: SecretProvider | None = None,
+    secret_name: str | None = None,
+) -> str | None:
+    """Resolve a bearer token in the connectors' canonical, keyless order.
 
-    Order: (a) an injected ``provider`` (e.g. Managed Identity) wins if it returns a truthy token;
-    (b) else a Key Vault-backed token from ``os.environ[token_env]`` (the env holds the *name*, the
-    value is the secret injected at runtime); (c) else ``None`` → the caller fails closed and makes
-    no network call. The token is only ever returned to the immediate caller — never logged.
+    Order:
+      (a) an injected ``provider`` (e.g. Managed Identity) wins if it returns a truthy token;
+      (b) else, when a Key Vault provider is wired, a **Key Vault-backed secret** read BY identity
+          via ``secret_provider.get_secret(secret_name)`` (issue #85). This path is authoritative in
+          Azure — a configured vault that cannot supply the secret **fails closed** (``get_secret``
+          raises), never falling through to the env value;
+      (c) else the documented **local-development** fallback: the Key Vault-backed
+          ``os.environ[token_env]`` (the env holds the *name*; the value is the secret injected at
+          runtime). Used ONLY when no Key Vault provider is configured, so existing local/CI
+          workflows keep working. Absent ⇒ ``None`` → the caller fails closed and makes no network
+          call.
 
-    A raising ``provider`` propagates; callers guard it (via :func:`fail_closed`) and fail closed.
+    The token is only ever returned to the immediate caller — never logged. A raising ``provider``
+    or a fail-closed ``secret_provider`` propagates; callers guard it (via :func:`fail_closed`) and
+    fail closed.
     """
     if provider is not None:
         token = provider()
         if token:
             return token
+    if secret_provider is not None and secret_name is not None:
+        # A configured vault is authoritative and fail-closed: get_secret raises on missing/
+        # inaccessible rather than silently degrading to the local-dev env fallback below.
+        return secret_provider.get_secret(secret_name)
     env_token = os.environ.get(token_env)
     if env_token:
         return env_token

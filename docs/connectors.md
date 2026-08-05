@@ -23,7 +23,8 @@ don't re-derive them:
 |------------------------------|----------------|
 | `FetchResult` | The single fetch envelope: `available` / `raw` / `error` (error **class name only**). |
 | `TokenProvider` / `CredentialProvider` | Keyless seams — an injected Managed-Identity provider, or a Key Vault-backed token **env var name**. |
-| `resolve_bearer_token(provider, token_env)` | Canonical order: injected provider wins → `os.environ[token_env]` → `None`. |
+| `SecretProvider` | Keyless seam — a Key Vault-backed provider (`get_secret(name)`) resolving secrets by Managed Identity at composition/fetch time ([`shared/secret_provider.py`](../src/shared/secret_provider.py)). |
+| `resolve_bearer_token(provider, token_env, *, secret_provider, secret_name)` | Canonical order: injected Managed-Identity provider wins → Key Vault `secret_provider.get_secret(secret_name)` (authoritative, fail-closed) → `os.environ[token_env]` (local-dev fallback) → `None`. |
 | `run_with_retries(fn, *, attempts, base_delay_s, max_delay_s, sleep, rng, retry_on)` | Bounded exponential backoff **with jitter**; retries only `retry_on` exceptions; deterministic via injected `sleep`/`rng`. |
 | `fail_closed(fn)` | Converts **any** exception into `FetchResult(available=False, error=type(exc).__name__)`; passes a success through. |
 
@@ -31,8 +32,10 @@ don't re-derive them:
 
 - **Fail closed.** No credential → `error="NoCredential"` and **no** network call. Any error →
   `available=False`, error **class name only** — never a body, message, or token.
-- **Keyless.** Never embed a secret/key/connection string. Env vars hold **names**, resolved to
-  Key Vault-backed values at runtime, or use an injected Managed-Identity provider.
+- **Keyless.** Never embed a secret/key/connection string. In Azure, secrets/tokens resolve from
+  **Key Vault by Managed Identity** (fail-closed via the `SecretProvider`); env vars hold **names**
+  and serve only as a documented **local-dev fallback** when no Key Vault URI is configured
+  (see [ADR 0012](adr/0012-key-vault-secret-injection.md)), or use an injected Managed-Identity provider.
 - **Bounded.** TLS verify on, a finite timeout, and bounded retry (`attempts` exhausted ⇒ still
   fails closed). Retry only *transient* transport errors; a 5xx or malformed payload fails closed
   at once.

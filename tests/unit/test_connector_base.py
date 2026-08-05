@@ -66,6 +66,60 @@ def test_resolve_bearer_token_none_when_nothing_resolves(monkeypatch: pytest.Mon
 
 
 # --------------------------------------------------------------------------------------
+# resolve_bearer_token — Key Vault secret provider seam (issue #85)
+# --------------------------------------------------------------------------------------
+class _FakeSecretProvider:
+    """Minimal ``SecretProvider``: returns a value, or raises to fail closed on a missing secret."""
+
+    def __init__(self, secrets: dict[str, str]) -> None:
+        self._secrets = secrets
+        self.calls: list[str] = []
+
+    def get_secret(self, name: str) -> str:
+        self.calls.append(name)
+        if name not in self._secrets:
+            raise RuntimeError("missing secret (fail closed)")
+        return self._secrets[name]
+
+
+def test_resolve_bearer_token_uses_secret_provider_over_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_TOKEN_ENV, "env-token")
+    provider = _FakeSecretProvider({"the-secret": "kv-token"})
+    out = resolve_bearer_token(
+        None, _TOKEN_ENV, secret_provider=provider, secret_name="the-secret"
+    )
+    # A wired Key Vault provider is authoritative — the env value is NOT consulted.
+    assert out == "kv-token"
+    assert provider.calls == ["the-secret"]
+
+
+def test_resolve_bearer_token_injected_provider_still_wins_over_secret_provider() -> None:
+    provider = _FakeSecretProvider({"the-secret": "kv-token"})
+    out = resolve_bearer_token(
+        lambda: "mi-token", _TOKEN_ENV, secret_provider=provider, secret_name="the-secret"
+    )
+    assert out == "mi-token"
+    assert provider.calls == []  # the injected MI token short-circuits before Key Vault
+
+
+def test_resolve_bearer_token_secret_provider_missing_fails_closed() -> None:
+    # A configured vault that cannot supply the secret raises — never silently falls through to env.
+    provider = _FakeSecretProvider({})
+    with pytest.raises(RuntimeError, match="fail closed"):
+        resolve_bearer_token(None, _TOKEN_ENV, secret_provider=provider, secret_name="absent")
+
+
+def test_resolve_bearer_token_env_fallback_when_no_secret_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_TOKEN_ENV, "env-token")
+    # No secret_provider wired (local dev) ⇒ the env-var fallback is used.
+    assert resolve_bearer_token(None, _TOKEN_ENV, secret_name="unused") == "env-token"
+
+
+# --------------------------------------------------------------------------------------
 # run_with_retries — deterministic, never sleeps for real
 # --------------------------------------------------------------------------------------
 def test_run_with_retries_succeeds_first_try_without_sleeping() -> None:
@@ -393,6 +447,59 @@ def test_system_pulse_genuinely_empty_envelope_is_available() -> None:
     assert result.available is True
     assert result.raw == []
     assert sp_to_signals(result) == []
+
+
+# --------------------------------------------------------------------------------------
+# System Pulse — token acquired via the Key Vault secret provider (issue #85)
+# --------------------------------------------------------------------------------------
+class _FakeSecretProviderSP:
+    def __init__(self, secrets: dict[str, str]) -> None:
+        self._secrets = secrets
+        self.calls: list[str] = []
+
+    def get_secret(self, name: str) -> str:
+        self.calls.append(name)
+        if name not in self._secrets:
+            raise RuntimeError("missing secret (fail closed)")
+        return self._secrets[name]
+
+
+def test_system_pulse_acquires_token_via_secret_provider() -> None:
+    seen_auth: dict[str, str] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen_auth["value"] = request.headers.get("Authorization", "")
+        return httpx.Response(200, json={"signals": [synthetic_signal_raw()]})
+
+    provider = _FakeSecretProviderSP({"system-pulse-read-token": "kv-token"})
+    client = SystemPulseClient(
+        _sp_config(token_secret_name="system-pulse-read-token"),
+        client=httpx.Client(transport=httpx.MockTransport(handle)),
+        secret_provider=provider,
+        sleep=RecordingSleep(),
+        rng=random.Random(0),
+    )
+    result = client.fetch_raw()
+    assert result.available is True
+    assert provider.calls == ["system-pulse-read-token"]
+    # The Key Vault-resolved token is used to build the bearer header (never logged/returned).
+    assert seen_auth["value"] == "Bearer kv-token"
+
+
+def test_system_pulse_secret_provider_missing_token_fails_closed() -> None:
+    # A configured vault that cannot supply the token fails closed at the edge (available=False),
+    # carrying only the error class name — no token, no message.
+    provider = _FakeSecretProviderSP({})
+    client = SystemPulseClient(
+        _sp_config(token_secret_name="system-pulse-read-token"),
+        client=httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(200, json=[]))),
+        secret_provider=provider,
+        sleep=RecordingSleep(),
+        rng=random.Random(0),
+    )
+    result = client.fetch_raw()
+    assert result.available is False
+    assert result.error == "RuntimeError"
 
 
 # --------------------------------------------------------------------------------------
