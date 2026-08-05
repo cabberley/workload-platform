@@ -88,3 +88,26 @@ jobs:
         run: |
           pip install bandit
           bandit -r src -ll -x tests || true   # advisory; CodeQL is the gate
+
+  compliance:
+    name: compliance guardrails (no-PII-egress · data-residency)
+    # HITRUST CSF alignment (issue #63): assert no PII crosses the egress boundary and that all
+    # infrastructure is single-region (data residency). Both checks fail closed. The no-PII audit
+    # introspects the real Pydantic egress models, so the package is installed; the residency check
+    # is stdlib-only and prefers compiling bicep to ARM with `az bicep build` (offline, no creds —
+    # az ships on ubuntu-latest), falling back to a fail-closed static scan if `az` is absent.
+    # See docs/compliance/hitrust-control-map.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package (for egress-model introspection)
+        run: python -m pip install -e .
+      - name: No PII on egress contracts (HITRUST 09/13 — transmission & privacy)
+        run: python scripts/audit_no_pii_egress.py
+        env:
+          PYTHONPATH: src
+      - name: Data residency — single-region infrastructure (HITRUST 07)
+        run: python scripts/check_data_residency.py
