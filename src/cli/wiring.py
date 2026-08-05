@@ -34,8 +34,10 @@ from pydantic import ValidationError
 from packs_engine.content_store import PackContentStore, build_pack_content_store
 from packs_engine.engine import PacksEngine
 from packs_engine.registry import PackRegistry
+from shared.connectors import SecretProvider
 from shared.contracts import TrustBundle
 from shared.observability import connector_fail_closed_observer
+from shared.secret_provider import build_secret_provider, resolve_secret
 from shared.signing import TrustBundleVerifier
 
 # Env var *names* the composition root reads. Values are supplied at runtime by identity / Key
@@ -49,6 +51,11 @@ ENV_ALERT_WEBHOOK_URL = "WP_ALERT_WEBHOOK_URL"
 ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK = "WP_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK"
 ENV_SYSTEM_PULSE_BASE_URL = "SYSTEM_PULSE_BASE_URL"
 SYSTEM_PULSE_TOKEN_ENV = "SYSTEM_PULSE_READ_TOKEN"  # noqa: S105 - env var *name*, not a secret
+# The Key Vault secret *name* the System Pulse read token is stored under (issue #85). Only the
+# non-secret name lives in code; the value is read BY the Managed Identity from Key Vault at
+# composition time (keyless). Matches the secretRef wired in
+# ``infra/bicep/modules/module-app.bicep``.
+SYSTEM_PULSE_TOKEN_SECRET = "system-pulse-read-token"  # noqa: S105 - KV secret *name*, not a secret
 # Azure Monitor connector (aiops). A Log Analytics workspace id gates the logs edge; the metrics
 # edge additionally needs a regional endpoint + namespace. All are Key Vault-backed *values*; only
 # the env var names live in code (keyless — Managed Identity supplies the credential).
@@ -219,8 +226,11 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     * ``"notifier"`` (alerts) — needs ``$WP_ALERT_WEBHOOK_URL`` (a Key Vault-backed value); the URL
       MUST be ``https://`` (cleartext rejected unless it is a loopback sink and
       ``$WP_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK`` is set).
-    * ``"system_pulse"`` (aiops) — needs ``$SYSTEM_PULSE_BASE_URL``; the read token is resolved at
-      the edge from the Key Vault-backed ``$SYSTEM_PULSE_READ_TOKEN`` (never embedded here).
+    * ``"system_pulse"`` (aiops) — needs ``$SYSTEM_PULSE_BASE_URL``; the read token is resolved
+      keyless BY identity from Key Vault (secret ``system-pulse-read-token``) when
+      ``$WP_KEY_VAULT_URI`` is configured, else from the documented local-dev
+      ``$SYSTEM_PULSE_READ_TOKEN`` env fallback. **Fail closed:** a configured vault that cannot
+      supply the required token REFUSES to start (issue #85).
     * ``"azure_monitor"`` (aiops) — needs ``$AZURE_MONITOR_WORKSPACE_ID`` (Log Analytics workspace,
       for the aggregated logs edge) **and** a keyless credential; optional
       ``$AZURE_MONITOR_RESOURCE_IDS`` / ``$AZURE_MONITOR_METRICS_ENDPOINT`` /
@@ -237,11 +247,15 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     cfg: Mapping[str, str] = config if config is not None else os.environ
     registry: dict[str, object] = {}
     credential = _build_credential()
+    # Keyless runtime-secret resolver (issue #85): a Key Vault provider when ``$WP_KEY_VAULT_URI``
+    # is configured (secrets read BY Managed Identity), else ``None`` so connectors use the
+    # documented local-dev env-var fallback. Built once and injected where a secret/token is used.
+    secret_provider = build_secret_provider(config=cfg)
 
     _add_resource_graph(registry, credential)
     _add_network(registry, cfg, credential)
     _add_notifier(registry, cfg)
-    _add_system_pulse(registry, cfg)
+    _add_system_pulse(registry, cfg, secret_provider)
     _add_azure_monitor(registry, cfg, credential)
     _add_telemetry_exporter(registry, cfg, credential)
 
@@ -315,16 +329,49 @@ def _add_notifier(registry: dict[str, object], cfg: Mapping[str, str]) -> None:
     )
 
 
-def _add_system_pulse(registry: dict[str, object], cfg: Mapping[str, str]) -> None:
-    """aiops' System Pulse connector — read token resolved at the edge from a Key Vault env."""
+def _add_system_pulse(
+    registry: dict[str, object],
+    cfg: Mapping[str, str],
+    secret_provider: SecretProvider | None,
+) -> None:
+    """aiops' System Pulse connector — read token resolved keyless from Key Vault (issue #85).
+
+    The read token is resolved BY identity through the injected ``secret_provider`` when a Key Vault
+    URI is configured (``$WP_KEY_VAULT_URI``), else from the documented local-dev
+    ``$SYSTEM_PULSE_READ_TOKEN`` env fallback. **Fail closed at composition (guardrail #4):** when a
+    vault IS configured but cannot supply the required token, this REFUSES to start
+    (``SecretResolutionError`` propagates) rather than wiring a connector that would silently fail
+    closed at every fetch. An absent base URL leaves the key absent (module fails closed on lookup);
+    a missing/unimportable SDK omits the connector (fail soft).
+    """
     base_url = (cfg.get(ENV_SYSTEM_PULSE_BASE_URL) or "").strip()
     if not base_url:
         return
+    # Fail closed at composition when a vault is configured: prove the required token is resolvable
+    # NOW, so a misconfigured/inaccessible vault refuses to start rather than degrading silently at
+    # runtime. Deliberately OUTSIDE the try/except below so ``SecretResolutionError`` propagates.
+    if secret_provider is not None:
+        resolve_secret(
+            secret_provider,
+            SYSTEM_PULSE_TOKEN_SECRET,
+            SYSTEM_PULSE_TOKEN_ENV,
+            config=cfg,
+            required=True,
+        )
     try:
         from modules.aiops.connectors.system_pulse import SystemPulseClient, SystemPulseConfig
 
         registry["system_pulse"] = SystemPulseClient(
-            SystemPulseConfig(base_url=base_url, token_env=SYSTEM_PULSE_TOKEN_ENV),
+            SystemPulseConfig(
+                base_url=base_url,
+                token_env=SYSTEM_PULSE_TOKEN_ENV,
+                # Route the token through Key Vault (by identity) only when a vault is wired; else
+                # the connector uses the local-dev ``token_env`` fallback.
+                token_secret_name=(
+                    SYSTEM_PULSE_TOKEN_SECRET if secret_provider is not None else None
+                ),
+            ),
+            secret_provider=secret_provider,
             # Keyless observer (issue #60): a real fail-closed fetch increments
             # connector_fail_closed_total{module="aiops"} on the process registry the API exposes.
             fail_closed_observer=connector_fail_closed_observer("aiops"),

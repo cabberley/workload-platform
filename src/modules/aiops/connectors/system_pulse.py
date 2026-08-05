@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from shared.connectors import (
     FailClosedObserver,
     FetchResult,
+    SecretProvider,
     TokenProvider,
     fail_closed,
     resolve_bearer_token,
@@ -126,6 +127,10 @@ class SystemPulseConfig(BaseModel):
     metrics_path: str = "/v1/metrics"
     timeout_s: float = Field(default=10.0, gt=0.0)
     token_env: str = DEFAULT_TOKEN_ENV
+    # The Key Vault secret *name* (never a value) the read token is stored under, resolved BY
+    # identity through an injected ``SecretProvider`` (issue #85). ``None`` ⇒ no vault wired, so the
+    # connector uses the local-dev ``token_env`` fallback. Only the name lives in config (keyless).
+    token_secret_name: str | None = None
     # Bounded retry-with-jitter for transient transport errors (issue #45). Defaults are
     # conservative and never change fail-closed behaviour: after ``retries`` attempts the edge
     # still fails closed. Only transient ``httpx.TransportError``s are retried (see
@@ -281,10 +286,12 @@ class SystemPulseClient:
     """Thin, read-only System Pulse client. Fail-closed; never sends an unauthenticated request.
 
     Auth resolution order: (a) an injected ``credential_provider`` (e.g. Managed Identity) wins;
-    (b) else a Key Vault-backed read token from ``config.token_env``; (c) if neither yields a
-    token, :meth:`fetch_raw` fails closed with ``error="NoCredential"`` and performs **no**
-    network call. Inject ``client`` (an ``httpx.Client`` on ``httpx.MockTransport``) and/or
-    ``credential_provider`` to keep everything testable without touching the network.
+    (b) else a Key Vault-backed read token read BY identity via an injected ``secret_provider``
+    (from ``config.token_secret_name``, issue #85) — a configured vault that cannot supply it fails
+    closed; (c) else the local-dev ``config.token_env`` fallback. If none yields a token,
+    :meth:`fetch_raw` fails closed with ``error="NoCredential"`` and performs **no** network call.
+    Inject ``client`` (an ``httpx.Client`` on ``httpx.MockTransport``), ``credential_provider``,
+    and/or ``secret_provider`` to keep everything testable without touching the network or a vault.
     """
 
     def __init__(
@@ -293,6 +300,7 @@ class SystemPulseClient:
         *,
         client: httpx.Client | None = None,
         credential_provider: TokenProvider | None = None,
+        secret_provider: SecretProvider | None = None,
         fail_closed_observer: FailClosedObserver | None = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
@@ -300,6 +308,9 @@ class SystemPulseClient:
         self._config = config
         self._client = client
         self._credential_provider = credential_provider
+        # Keyless Key Vault seam (issue #85): resolves the read token by identity. None ⇒ no vault
+        # configured, so resolution falls back to the local-dev ``token_env``.
+        self._secret_provider = secret_provider
         # Optional, keyless observer (issue #60): invoked when a fetch fails closed so the event
         # can be counted at the composition root, without this connector importing any registry.
         # Default None ⇒ no-op; an observer error never breaks fail-closed (guarded in fail_closed).
@@ -328,11 +339,17 @@ class SystemPulseClient:
     def _fetch(self, *, metric_names: Sequence[str] | None) -> FetchResult:
         """Resolve the credential and perform the bounded, retried read. May raise; guarded above.
 
-        Credential resolution order: injected provider wins, else Key Vault-backed env, else None →
-        fail closed with ``error="NoCredential"`` and **no** network call. The token is only ever
-        used to build the auth header — never logged or returned in a :class:`FetchResult`.
+        Credential resolution order: injected provider wins, else a Key Vault-backed secret read by
+        identity (``secret_provider``), else the local-dev ``token_env``, else None → fail closed
+        with ``error="NoCredential"`` and **no** network call. The token is only ever used to build
+        the auth header — never logged or returned in a :class:`FetchResult`.
         """
-        token = resolve_bearer_token(self._credential_provider, self._config.token_env)
+        token = resolve_bearer_token(
+            self._credential_provider,
+            self._config.token_env,
+            secret_provider=self._secret_provider,
+            secret_name=self._config.token_secret_name,
+        )
         if not token:
             return FetchResult(available=False, error="NoCredential")
         # TLS verification on, bounded timeout — never an insecure request.

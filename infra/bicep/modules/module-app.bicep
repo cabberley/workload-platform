@@ -37,6 +37,12 @@ param httpConcurrency int = 0
 @description('Extra env vars')
 param envVars array = []
 
+@description('Key Vault resource URI (e.g. https://<vault>.vault.azure.net) backing secretRefs. Empty => no Key Vault-backed secrets and no WP_KEY_VAULT_URI injected.')
+param keyVaultUri string = ''
+
+@description('Key Vault-backed secrets to inject by identity (issue #85). Each item: { secretRefName, secretName, envVar } — a container secret named secretRefName sourced from keyVaultUri/secrets/secretName, surfaced to the app as env var envVar via secretRef. Never a plaintext value here.')
+param keyVaultSecrets array = []
+
 // Assemble this module's KEDA scale rules from its declared triggers (keyless queue auth via MI).
 var queueRules = empty(queueName) ? [] : [
   {
@@ -76,6 +82,25 @@ var httpRules = httpConcurrency == 0 ? [] : [
 ]
 var scaleRules = concat(queueRules, cpuRules, httpRules)
 
+// Key Vault-backed secrets (issue #85). Each declared secret becomes a container-app `secret` that
+// ACA resolves from Key Vault BY the app's user-assigned Managed Identity (keyless — no plaintext
+// value in the template), exposed to the container as an env var via `secretRef`. This is what
+// finally EXERCISES the `Key Vault Secrets User` role granted in core.bicep. When `keyVaultUri` is
+// set we also inject the non-secret `WP_KEY_VAULT_URI` so the app-side provider (shared/secret_provider.py)
+// can additionally resolve required secrets by identity at composition time (fail closed).
+var kvSecrets = [for s in keyVaultSecrets: {
+  name: s.secretRefName
+  keyVaultUrl: '${keyVaultUri}/secrets/${s.secretName}'
+  identity: identityId
+}]
+var kvSecretEnv = [for s in keyVaultSecrets: {
+  name: s.envVar
+  secretRef: s.secretRefName
+}]
+var kvUriEnv = empty(keyVaultUri) ? [] : [
+  { name: 'WP_KEY_VAULT_URI', value: keyVaultUri }
+]
+
 resource app 'Microsoft.App/containerApps@2025-01-01' = {
   name: 'wp-${moduleName}'
   location: location
@@ -87,6 +112,8 @@ resource app 'Microsoft.App/containerApps@2025-01-01' = {
     managedEnvironmentId: environmentId
     configuration: {
       activeRevisionsMode: 'Single'
+      // Key Vault-backed secrets resolved by the app identity (empty => none). Never plaintext.
+      secrets: kvSecrets
       registries: [
         { server: '${registry}.azurecr.io', identity: identityId }
       ]
@@ -106,7 +133,7 @@ resource app 'Microsoft.App/containerApps@2025-01-01' = {
           env: concat([
             { name: 'AZURE_CLIENT_ID', value: identityClientId }
             { name: 'WP_MODULE', value: moduleName }
-          ], envVars)
+          ], kvUriEnv, kvSecretEnv, envVars)
         }
       ]
       scale: {

@@ -110,6 +110,10 @@ module coreApps 'modules/module-app.bicep' = [for s in coreServices: {
     cpu: s.cpu
     memoryGi: s.mem
     httpConcurrency: s.http
+    // The API is the intended runtime-secret reader (holds Key Vault Secrets User); thread the vault
+    // URI so its app-side provider can resolve secrets by identity. The web SPA reads NO runtime
+    // secret and holds no KV role, so it is deliberately excluded (least privilege, issue #85).
+    keyVaultUri: s.name == 'api' ? core.outputs.keyVaultUri : ''
   }
 }]
 
@@ -144,6 +148,17 @@ module serviceApps 'modules/module-app.bicep' = [for m in serviceModules: {
     memoryGi: m.mem
     queueName: m.queue
     cpuUtilization: m.cpuUtil
+    // aiops reads the System Pulse read token from Key Vault BY the worker Managed Identity (issue
+    // #85): the vault URI drives both the ACA `secretRef` below and the app-side provider, which
+    // fails closed if the configured vault cannot supply the token. Other modules need no KV secret.
+    keyVaultUri: m.name == 'aiops' ? core.outputs.keyVaultUri : ''
+    keyVaultSecrets: m.name == 'aiops' ? [
+      {
+        secretRefName: 'system-pulse-read-token'
+        secretName: 'system-pulse-read-token'
+        envVar: 'SYSTEM_PULSE_READ_TOKEN'
+      }
+    ] : []
   }
 }]
 

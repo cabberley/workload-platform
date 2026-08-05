@@ -501,6 +501,10 @@ output storageName string = storage.name
 // assignments against to enforce the API-only-writer boundary (issue #79 brownfield fix).
 output storageAccountId string = storage.id
 output keyVaultName string = keyVault.name
+// Key Vault resource URI (a non-secret URL, e.g. https://<vault>.vault.azure.net). Threaded to the
+// container apps as the non-secret ``$WP_KEY_VAULT_URI`` and used to build Key Vault-backed
+// ``secretRef`` references so runtime secrets are read BY identity, never as plaintext (issue #85).
+output keyVaultUri string = keyVault.properties.vaultUri
 output logAnalyticsId string = logAnalytics.id
 output logAnalyticsName string = logAnalytics.name
 output registryName string = registry.name

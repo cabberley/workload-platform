@@ -168,6 +168,75 @@ def test_build_client_registry_includes_system_pulse_when_base_url_configured():
     assert "system_pulse" in registry
 
 
+# --------------------------------------------------------------------------------------
+# Key Vault secret injection (#85): composition resolves the connector token BY identity when a
+# vault URI is configured, and FAILS CLOSED when the vault cannot supply a required secret.
+# --------------------------------------------------------------------------------------
+class _FakeKvSecret:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _FakeKvClient:
+    """A ``SecretClient``-shaped stub injected in place of the real Azure SDK (no network)."""
+
+    def __init__(self, secrets: dict[str, str]) -> None:
+        self._secrets = secrets
+
+    def get_secret(self, name: str) -> _FakeKvSecret:
+        if name not in self._secrets:
+            raise KeyError(name)  # stands in for azure ResourceNotFoundError → fail closed
+        return _FakeKvSecret(self._secrets[name])
+
+
+def test_build_client_registry_system_pulse_uses_key_vault_when_configured(monkeypatch):
+    from shared.secret_provider import ENV_KEY_VAULT_URI, KeyVaultSecretProvider
+
+    fake = _FakeKvClient({"system-pulse-read-token": "kv-token"})
+    monkeypatch.setattr(KeyVaultSecretProvider, "_client_or_build", lambda self: fake)
+    registry = build_client_registry(
+        config={
+            ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid",
+            ENV_KEY_VAULT_URI: "https://wp-vault.vault.azure.net",
+        }
+    )
+    assert "system_pulse" in registry
+    client = registry["system_pulse"]
+    # The connector is wired to resolve BY identity through the provider (keyless).
+    assert client._secret_provider is not None
+    assert client._config.token_secret_name == "system-pulse-read-token"
+
+
+def test_build_client_registry_fail_closed_when_vault_missing_required_token(monkeypatch):
+    from shared.secret_provider import (
+        ENV_KEY_VAULT_URI,
+        KeyVaultSecretProvider,
+        SecretResolutionError,
+    )
+
+    fake = _FakeKvClient({})  # vault configured but the required token is absent
+    monkeypatch.setattr(KeyVaultSecretProvider, "_client_or_build", lambda self: fake)
+    # Composition must REFUSE to start rather than wire a silently-broken connector.
+    with pytest.raises(SecretResolutionError):
+        build_client_registry(
+            config={
+                ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid",
+                ENV_KEY_VAULT_URI: "https://wp-vault.vault.azure.net",
+            }
+        )
+
+
+def test_build_client_registry_system_pulse_env_fallback_when_no_vault():
+    # No $WP_KEY_VAULT_URI ⇒ no provider ⇒ the connector uses the documented local-dev env fallback
+    # (no fail-closed), keeping existing local/CI workflows working unchanged.
+    registry = build_client_registry(
+        config={ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid"}
+    )
+    client = registry["system_pulse"]
+    assert client._secret_provider is None
+    assert client._config.token_secret_name is None
+
+
 def test_wired_system_pulse_fail_closed_increments_process_metric():
     """MED 3: the composition root wires a registry-backed fail-closed observer into System Pulse.
 
