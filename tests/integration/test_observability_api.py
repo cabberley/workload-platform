@@ -212,6 +212,42 @@ def test_unknown_module_run_still_404_and_no_metric(client) -> None:
     assert c.get("/api/metrics").json()["counters"] == []
 
 
+def test_metrics_egress_drops_unknown_and_redacts_pii_labels(client) -> None:
+    # Issue #91: the raw registry accepts arbitrary label maps, but /api/metrics projects onto the
+    # bounded MetricsSnapshotView — unexpected keys are dropped and free-form values redacted, so no
+    # caller-injected PII can egress even though it lives in the in-process registry.
+    c, metrics = client
+    metrics.increment(
+        "module_runs_total",
+        labels={
+            "module": "discovery",  # allow-listed key, PII-free value → survives
+            "outcome": "/subscriptions/abc/resourceGroups/rg",  # allowed key, PII value → redacted
+            "email": "alice@contoso.com",  # unknown key → dropped
+        },
+    )
+    metrics.observe_duration(
+        "module_run_duration_ms",
+        12.0,
+        labels={"module": "discovery", "customer": "acme@corp.com"},
+    )
+    body = c.get("/api/metrics").json()
+    counter = next(s for s in body["counters"] if s["name"] == "module_runs_total")
+    # Unknown key dropped; only the allow-list survives.
+    assert set(counter["labels"]) <= {"module", "outcome"}
+    assert "email" not in counter["labels"]
+    assert counter["labels"]["module"] == "discovery"
+    # The Azure resource path value is not proven PII-free → coerced to the redaction placeholder.
+    assert counter["labels"]["outcome"] == "[redacted]"
+    duration = next(d for d in body["durations"] if d["name"] == "module_run_duration_ms")
+    assert set(duration["labels"]) <= {"module", "outcome"}
+    assert "customer" not in duration["labels"]
+    # The raw PII text never appears anywhere in the serialized egress payload.
+    serialized = c.get("/api/metrics").text
+    assert "alice@contoso.com" not in serialized
+    assert "acme@corp.com" not in serialized
+    assert "/subscriptions/" not in serialized
+
+
 # --------------------------------------------------------------------------------------
 # Tracing — request-boundary seam emits a PII-free span when an exporter is wired.
 # --------------------------------------------------------------------------------------

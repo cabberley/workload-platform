@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
@@ -392,6 +393,217 @@ def _assert_audit_safe(value: str, *, field: str) -> str:
     return normalized
 
 
+# The placeholder a value is coerced to when it cannot be *proven* PII-free-and-bounded on egress.
+# Egress redaction reuses the SAME sanitized-string gate that guards audit subjects/finding ids
+# (:func:`is_audit_safe`) — it does NOT fork a second notion of "safe" — so a value only survives
+# unredacted when it is a bounded, PII-free identifier; anything else becomes this constant.
+REDACTED = "[redacted]"
+
+
+def redact_value(value: Any) -> str:
+    """PURE egress redaction: return the NFKC-canonical ``value`` iff provably PII-free, else drop.
+
+    Reuses the platform's single sanitized-string gate (:func:`is_audit_safe`) so a free-form value
+    that could carry PII, a log body, an Azure resource *path*, an email, control/format characters,
+    or is oversized is coerced to :data:`REDACTED` rather than echoed. A bounded, PII-free
+    identifier (e.g. ``"discovery"``, ``"ok"``, ``"production"``) passes through as its canonical
+    form. Deterministic and I/O-free so it can run inside a Pydantic validator at the serialization
+    boundary — never echoing caller-supplied free-form text unredacted.
+    """
+    if not isinstance(value, str):
+        return REDACTED
+    normalized = unicodedata.normalize("NFKC", value)
+    return normalized if is_audit_safe(normalized) else REDACTED
+
+
+# The EXACT platform/module-DEFINED schema field names that may appear as mapping KEYS inside
+# ``ModuleRunResult.extra`` and its nested ``model_dump`` structures. This is a strict, exhaustive
+# ALLOW-LIST derived from the fixed keys the modules write (grep ``extra=`` under ``src/modules/*``)
+# plus the schema field names of every model those modules ``model_dump`` INTO ``extra``
+# (``DriftReport`` / ``Finding`` / ``SourceReference`` / ``AgentResponse``). A key survives egress
+# ONLY when it is an exact member here: default-DENY. A "structurally valid" token proves NOTHING —
+# an SSN ``123-45-6789`` is structurally valid — so a customer-/workload-DERIVED key (e.g. the
+# per-scope ``extra.drift.<scope>`` workload id, an ``emittedByStream`` stream name) is NOT in this
+# set and is redacted to a positional placeholder. VALUES are still redacted by
+# :func:`redact_tree`'s leaf rules regardless of whether the key survives.
+PLATFORM_SAFE_STRUCTURAL_KEYS: frozenset[str] = frozenset(
+    {
+        # reassessments.module — extra + its nested ``summary`` dict
+        "summary", "drift", "cadence", "workloads",
+        "newFailures", "recovered", "stillFailing", "addedNodes", "removedNodes",
+        # dependency_graph.module
+        "topSpofs", "unresolvedMembers",
+        # quality_checks.module / aiops.module
+        "surfacedNotes",
+        # telemetry_export.module
+        "configured", "emittedByStream", "emitted", "errors",
+        # discovery.module
+        "nodeCount", "classifiedCount", "skippedRows",
+        # aiops.module
+        "rca", "sourcesAvailable", "sourcesUnavailable", "sourcesPartial", "packSources",
+        # alerts.module
+        "notifications",
+        # DriftReport schema fields (``extra.drift.<scope>`` = DriftReport.model_dump)
+        "workload",
+        # Finding schema fields (nested in newFailures/recovered/stillFailing + rca sourceRefs)
+        "id", "module", "title", "passed", "severity", "nodeId", "blastRadius", "evidence",
+        "packId", "packVersion", "detail", "createdAt",
+        # SourceReference schema fields
+        "kind",
+        # AgentResponse schema fields (aiops ``rca`` = list of AgentResponse.model_dump)
+        "agentName", "taskType", "inputSummary", "findings", "risks", "recommendations",
+        "sourceReferences", "confidence", "nextActions", "generatedAt",
+    }
+)
+
+# Tag KEYS the PLATFORM itself writes and whose VALUES are therefore platform-controlled (not
+# customer free-form) and may egress verbatim. This is an explicit ALLOW-LIST: the default is to
+# redact every customer tag value. The platform does not currently stamp any resource tag of its
+# own (discovered ``ResourceNode.tags`` are ALL customer-authored Azure tags), so this is
+# intentionally EMPTY — every tag value is redacted. Add a key here ONLY when the platform is the
+# proven writer of that tag; do not invent entries to let customer values through.
+PLATFORM_SAFE_TAG_KEYS: frozenset[str] = frozenset()
+
+# Prefix for the opaque, cardinality-preserving placeholder a redacted mapping KEY is replaced with.
+# The suffix is the key's POSITIONAL index within its mapping — derived from POSITION, never from
+# the key's value/content — so distinct customer keys keep distinct placeholders (they never
+# collide) while the placeholder text itself carries none of the original (possibly-PII) key.
+_REDACTED_KEY_PREFIX = "redacted_key_"
+
+# Fail-closed recursion bound for :func:`redact_tree` — a structure deeper than this (or a cycle)
+# yields the sentinel rather than recursing without limit.
+_MAX_REDACT_DEPTH = 64
+
+
+def _redact_key(key: Any, index: int, allow: frozenset[str]) -> str:
+    """Return ``key`` iff it is an EXACT member of the platform-owned ``allow`` list, else a
+    positional opaque placeholder.
+
+    Default-DENY: a mapping key is customer-controlled/-derived and can itself carry PII (an email,
+    an MRN, an SSN, a patient name), and being *structurally valid* proves nothing. A key therefore
+    survives ONLY when it is — by RAW, EXACT equality (no Unicode/NFKC folding) — a member of
+    ``allow`` (a set of fixed, platform/module-defined schema field names); otherwise it becomes
+    ``f"{_REDACTED_KEY_PREFIX}{index}"``. Matching the raw key exactly is deliberate: a
+    customer-crafted Unicode variant (e.g. a fullwidth ``ｄｅｔａｉｌ``) must NOT be folded into an
+    ASCII platform key ``detail`` — folding would let it impersonate a platform key AND collide with
+    a real ``detail`` in the same mapping, silently overwriting a value. The placeholder is derived
+    from the key's POSITION (never its content), so distinct keys stay distinct and no PII key text
+    egresses. Idempotent: a placeholder is not in ``allow`` and re-redacts to the same positional
+    placeholder.
+    """
+    if isinstance(key, str) and key in allow:
+        return key
+    return f"{_REDACTED_KEY_PREFIX}{index}"
+
+
+def redact_tree(value: Any, _depth: int = 0, _seen: frozenset[int] | None = None) -> Any:
+    """Recursively DEFAULT-REDACT the free-form surface of a nested structure for egress.
+
+    Default-DENY: in a PHI context any leaf could be a patient name/MRN/SSN and any customer-derived
+    mapping KEY (or unknown object) could carry PII, so a leaf is preserved ONLY when it is
+    *provably* one of the explicitly-safe scalar types, and a mapping KEY survives ONLY when it is
+    an exact member of :data:`PLATFORM_SAFE_STRUCTURAL_KEYS`:
+
+    * **Safe scalar leaves (preserved):** :class:`enum.Enum` members (incl. ``StrEnum`` — checked
+      BEFORE ``str`` so a ``str``-subclass Enum is kept while a plain ``str`` is redacted),
+      ``bool``, ``int``, ``float`` and ``None``.
+    * **Containers (recursed):** ``dict``/``Mapping`` (keys sanitized via :func:`_redact_key`; a
+      value is recursed/preserved ONLY beneath an exact allow-listed platform key — under any
+      untrusted/redacted key the value is redacted wholesale, since default-DENY grants no schema
+      knowledge of it), ``list``/``tuple`` (→ list), and ``set``/``frozenset`` (ELEMENTS redacted
+      too — a set of redaction sentinels legitimately collapses; a redacted element that is no
+      longer hashable collapses to :data:`REDACTED`).
+    * **Anything else (redacted):** ``str``, ``bytes``, a Pydantic ``BaseModel``, a dataclass, or
+      any other object → :data:`REDACTED`. Unknown objects are NEVER introspected/serialized (their
+      ``__str__``/``model_dump`` could leak PHI).
+
+    Deterministic and I/O-free so it can run at the serialization boundary; idempotent because
+    :data:`REDACTED` re-redacts to itself and positional placeholder keys are stable. Fail-closed
+    against deep/cyclic input: past :data:`_MAX_REDACT_DEPTH` levels, or on a container already on
+    the current path, it returns :data:`REDACTED` rather than recursing unbounded.
+    """
+    seen = _seen if _seen is not None else frozenset()
+    if _depth > _MAX_REDACT_DEPTH:
+        return REDACTED
+    # An Enum member (StrEnum IS a str) is a bounded, platform-defined value — preserve it before
+    # the ``str`` leaf rule redacts it.
+    if isinstance(value, Enum):
+        return value
+    # Explicitly-safe scalar leaves. bool is an int subclass so covered here; None by identity.
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        if id(value) in seen:
+            return REDACTED
+        branch = seen | {id(value)}
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            safe_key = _redact_key(key, index, PLATFORM_SAFE_STRUCTURAL_KEYS)
+            # Default-DENY: a value is recursed/preserved ONLY beneath an exact allow-listed
+            # platform key. Under an untrusted/redacted key we have NO schema knowledge of the
+            # value, so even a safe scalar (a numeric SSN ``123456789``) must be redacted
+            # wholesale — never recursed. Test allow-list membership directly (not
+            # ``safe_key == key``) so a crafted key equal to ``redacted_key_<index>`` cannot spoof.
+            if isinstance(key, str) and key in PLATFORM_SAFE_STRUCTURAL_KEYS:
+                result[safe_key] = redact_tree(item, _depth + 1, branch)
+            else:
+                result[safe_key] = REDACTED
+        return result
+    if isinstance(value, (list, tuple)):
+        if id(value) in seen:
+            return REDACTED
+        branch = seen | {id(value)}
+        return [redact_tree(item, _depth + 1, branch) for item in value]
+    if isinstance(value, (set, frozenset)):
+        if id(value) in seen:
+            return REDACTED
+        branch = seen | {id(value)}
+        elements: list[Any] = []
+        for item in value:
+            redacted_item = redact_tree(item, _depth + 1, branch)
+            # A set element must stay hashable; a redacted container (dict/list) is not, so it
+            # collapses to the sentinel (default-deny, safe).
+            try:
+                hash(redacted_item)
+            except TypeError:
+                redacted_item = REDACTED
+            elements.append(redacted_item)
+        return set(elements) if isinstance(value, set) else frozenset(elements)
+    # Default-DENY: str/bytes/BaseModel/dataclass/arbitrary object — never introspected — is
+    # coerced to the sentinel rather than serialized.
+    return REDACTED
+
+
+def redact_node_tags(node: ResourceNode) -> ResourceNode:
+    """Return an egress COPY of ``node`` with its customer-controlled tags DEFAULT-REDACTED.
+
+    Azure tags are customer-authored, so both keys and values can carry PII — redaction is
+    default-DENY, keyed on the explicit :data:`PLATFORM_SAFE_TAG_KEYS` allow-list:
+
+    * Every tag KEY is sanitized via :func:`_redact_key`: it survives ONLY when it is an exact
+      member of :data:`PLATFORM_SAFE_TAG_KEYS` (keys the PLATFORM proves it writes); otherwise it
+      is replaced by a positional opaque placeholder so a PII key (e.g. ``alice@contoso.com``, or a
+      "structurally valid" ``123-45-6789``) can never egress verbatim.
+    * Every tag VALUE is redacted to :data:`REDACTED` unless its key is in the same allow-list. The
+      allow-list is currently EMPTY, so in practice every customer tag key becomes a placeholder and
+      every value is redacted.
+
+    Applied to a COPY at the API response boundary only — the stored/ingested estate and the copy
+    used for internal impact/graph analysis keep the raw keys and values.
+    """
+    if not node.tags:
+        return node
+    redacted: dict[str, str] = {}
+    for index, (key, value) in enumerate(node.tags.items()):
+        safe_key = _redact_key(key, index, PLATFORM_SAFE_TAG_KEYS)
+        # Preserve the value ONLY when the raw key is an exact allow-listed platform-owned key.
+        # Otherwise redact. Test the raw key directly (not ``safe_key``) so a crafted key equal to
+        # ``redacted_key_<index>`` cannot spoof preservation. Positional placeholders stay distinct.
+        preserve = isinstance(key, str) and key in PLATFORM_SAFE_TAG_KEYS
+        redacted[safe_key] = value if preserve else REDACTED
+    return node.model_copy(update={"tags": redacted})
+
+
 class AuditEvent(BaseModel):
     """One append-only, PII-free audit record of a consequential action.
 
@@ -514,3 +726,115 @@ class MetricsSnapshot(BaseModel):
 
     counters: list[MetricSample] = Field(default_factory=list)
     durations: list[DurationSample] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------------------
+# Bounded egress projections of the metrics snapshot (issue #91).
+#
+# The in-process :class:`MetricsRegistry` is a *generic* counter/duration store: its
+# ``increment``/``observe_duration`` accept arbitrary label maps, so the raw :class:`MetricSample`/
+# :class:`DurationSample` contracts keep a free-form ``dict[str, str]`` label type. That free-form
+# key type is statically UNBOUNDED, so exposing the raw snapshot on ``/api/metrics`` is a tracked
+# no-PII-egress gap. These VIEW models are the bounded projection the API serialises instead: the
+# label KEY type is the closed :class:`MetricLabelKey` allow-list (so emitted keys are statically
+# enumerable) and every label VALUE is coerced through :func:`redact_value`. In production only the
+# sanctioned ``module``/``outcome`` labels are ever emitted, so this projection is loss-free for
+# real traffic while dropping any unexpected (potentially unbounded/PII-bearing) label on egress.
+# --------------------------------------------------------------------------------------
+class MetricLabelKey(StrEnum):
+    """Allow-list of metric label KEYS permitted to cross the egress boundary (bounded, non-PII).
+
+    These are exactly the sanctioned, low-cardinality labels the domain helpers emit
+    (``record_module_run`` → ``{module, outcome}``; ``record_connector_fail_closed`` →
+    ``{module}``). A closed enum makes the emitted key set statically enumerable, so the audited
+    egress surface is bounded; any other label key is dropped on egress (fail closed).
+    """
+
+    module = "module"
+    outcome = "outcome"
+
+
+_METRIC_LABEL_KEYS: frozenset[str] = frozenset(k.value for k in MetricLabelKey)
+
+
+def bound_labels(raw: Any) -> dict[str, str]:
+    """PURE: project a free-form label map onto the bounded egress shape (drop + redact).
+
+    Keys not on the :class:`MetricLabelKey` allow-list are DROPPED; each surviving value is coerced
+    through :func:`redact_value` so no free-form label value can egress unredacted. Non-mapping
+    input yields an empty map (fail closed). Deterministic and I/O-free (runs in a validator).
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        str(key): redact_value(value)
+        for key, value in raw.items()
+        if str(key) in _METRIC_LABEL_KEYS
+    }
+
+
+class MetricSampleView(BaseModel):
+    """Bounded egress projection of :class:`MetricSample` (allow-listed keys, redacted values)."""
+
+    name: str
+    labels: dict[MetricLabelKey, str] = Field(default_factory=dict)
+    value: int = Field(ge=0)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def _bound_labels(cls, value: Any) -> dict[str, str]:
+        return bound_labels(value)
+
+    @classmethod
+    def from_sample(cls, sample: MetricSample) -> MetricSampleView:
+        return cls.model_validate(
+            {"name": sample.name, "labels": sample.labels, "value": sample.value}
+        )
+
+
+class DurationSampleView(BaseModel):
+    """Bounded egress projection of :class:`DurationSample` (allow-listed keys, redacted values)."""
+
+    name: str
+    labels: dict[MetricLabelKey, str] = Field(default_factory=dict)
+    count: int = Field(ge=0)
+    totalMs: float = Field(ge=0.0)
+    minMs: float = Field(ge=0.0)
+    maxMs: float = Field(ge=0.0)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def _bound_labels(cls, value: Any) -> dict[str, str]:
+        return bound_labels(value)
+
+    @classmethod
+    def from_sample(cls, sample: DurationSample) -> DurationSampleView:
+        return cls.model_validate(
+            {
+                "name": sample.name,
+                "labels": sample.labels,
+                "count": sample.count,
+                "totalMs": sample.totalMs,
+                "minMs": sample.minMs,
+                "maxMs": sample.maxMs,
+            }
+        )
+
+
+class MetricsSnapshotView(BaseModel):
+    """Bounded egress projection of :class:`MetricsSnapshot` served at ``/api/metrics``.
+
+    Identical wire shape to :class:`MetricsSnapshot` (``counters``/``durations`` lists) but every
+    sample's labels are projected onto the bounded :class:`MetricLabelKey` allow-list with redacted
+    values, so the serialized egress surface is statically bounded and PII-free.
+    """
+
+    counters: list[MetricSampleView] = Field(default_factory=list)
+    durations: list[DurationSampleView] = Field(default_factory=list)
+
+    @classmethod
+    def from_snapshot(cls, snapshot: MetricsSnapshot) -> MetricsSnapshotView:
+        return cls(
+            counters=[MetricSampleView.from_sample(s) for s in snapshot.counters],
+            durations=[DurationSampleView.from_sample(s) for s in snapshot.durations],
+        )
