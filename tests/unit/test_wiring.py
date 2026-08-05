@@ -5,7 +5,10 @@ No secret literals appear here — only Key Vault-backed env var names/values.
 """
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Mapping
+
+import pytest
 
 from cli.wiring import (
     ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK,
@@ -19,6 +22,18 @@ from shared.module_base import Module, ModuleContext, build_default_registry, ru
 
 # A synthetic, clearly-fake webhook value (a Key Vault-backed URL in production) — not a secret.
 FAKE_WEBHOOK_URL = "https://alerts.internal.invalid/hook"
+
+
+# Issue #95: require_https_webhook now resolves a webhook DNS name and range-blocks SSRF-sensitive
+# targets, failing closed on an unresolvable host. FAKE_WEBHOOK_URL's synthetic ``.invalid`` host is
+# deliberately unresolvable, so resolve every DNS name to a fixed PUBLIC address here to keep these
+# composition-root tests hermetic/offline (patches only the validator's thin resolver wrapper).
+@pytest.fixture(autouse=True)
+def _stub_public_dns(monkeypatch):
+    monkeypatch.setattr(
+        "modules.alerts.channels._resolve_host_ips",
+        lambda _host: [ipaddress.ip_address("93.184.216.34")],
+    )
 
 
 # --------------------------------------------------------------------------------------
