@@ -13,15 +13,15 @@ import pytest
 
 from packs_engine.canonical import canonical_digest
 from packs_engine.engine import PacksEngine, PackVerificationError
-from shared.contracts import PackSignature
+from shared.contracts import PackSignature, TrustBundle, TrustedPublicKey
 from shared.signing import (
     ED25519_ALG,
     Ed25519Signer,
     Ed25519Verifier,
-    KeyVaultSigner,
-    KeyVaultVerifier,
     PackSignatureError,
+    PackVerifier,
     Signer,
+    TrustBundleVerifier,
     Verifier,
     sign_pack,
     verify_pack,
@@ -50,8 +50,7 @@ def test_providers_satisfy_protocols():
     signer = Ed25519Signer.generate("kid-1")
     assert isinstance(signer, Signer)
     assert isinstance(signer.verifier(), Verifier)
-    assert isinstance(KeyVaultSigner("kv-key"), Signer)
-    assert isinstance(KeyVaultVerifier("kv-key"), Verifier)
+    assert isinstance(TrustBundleVerifier.reject_all(), PackVerifier)
 
 
 def test_sign_pack_envelope_is_self_describing():
@@ -245,16 +244,89 @@ def test_loader_refuses_wrong_key_when_verifier_injected(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------------------
-# Key Vault stub — real typed provider, fail-closed TODO(human)
+# Trust bundle verifier (issue #89) — customer-side, keyless, verification-only, fail-closed.
 # --------------------------------------------------------------------------------------
-def test_keyvault_signer_raises_not_implemented():
-    with pytest.raises(NotImplementedError, match="TODO\\(human\\)"):
-        KeyVaultSigner("kv-signing-key").sign(b"data")
+def _bundle_entry(signer: Ed25519Signer, key_id: str) -> TrustedPublicKey:
+    pub = signer._private_key.public_key().public_bytes_raw()  # 32-byte raw public key
+    return TrustedPublicKey(
+        key_id=key_id, algorithm=ED25519_ALG, public_key=base64.b64encode(pub).decode("ascii")
+    )
 
 
-def test_keyvault_verifier_raises_not_implemented():
-    with pytest.raises(NotImplementedError, match="TODO\\(human\\)"):
-        KeyVaultVerifier("kv-signing-key").verify(b"data", b"sig")
+def test_trust_bundle_verifier_happy_path_known_key_verifies():
+    signer = Ed25519Signer.generate("ms-pack-signing-2026a")
+    pack = _pack()
+    sig = sign_pack(pack, signer)
+    bundle = TrustBundle(keys=[_bundle_entry(signer, "ms-pack-signing-2026a")])
+    verifier = TrustBundleVerifier.from_bundle(bundle)
+    assert verifier.key_ids() == frozenset({"ms-pack-signing-2026a"})
+    assert verifier.verify_pack(pack, sig) is True
+
+
+def test_trust_bundle_verifier_unknown_key_id_rejects():
+    signer = Ed25519Signer.generate("known")
+    pack = _pack()
+    sig = sign_pack(pack, signer)  # signature.key_id == "known"
+    other = Ed25519Signer.generate("other")
+    bundle = TrustBundle(keys=[_bundle_entry(other, "other")])  # "known" not pinned
+    assert TrustBundleVerifier.from_bundle(bundle).verify_pack(pack, sig) is False
+
+
+def test_trust_bundle_verifier_empty_bundle_rejects():
+    signer = Ed25519Signer.generate("k")
+    pack = _pack()
+    sig = sign_pack(pack, signer)
+    assert TrustBundleVerifier.from_bundle(TrustBundle(keys=[])).verify_pack(pack, sig) is False
+    assert TrustBundleVerifier.reject_all().verify_pack(pack, sig) is False
+
+
+def test_trust_bundle_verifier_wrong_key_for_id_rejects():
+    """A pinned key under the RIGHT id but the WRONG key material must reject (fail closed)."""
+    signer = Ed25519Signer.generate("kid")
+    pack = _pack()
+    sig = sign_pack(pack, signer)  # signed by `signer`, key_id == "kid"
+    impostor = Ed25519Signer.generate("kid")  # different key, SAME id
+    bundle = TrustBundle(keys=[_bundle_entry(impostor, "kid")])
+    assert TrustBundleVerifier.from_bundle(bundle).verify_pack(pack, sig) is False
+
+
+def test_trust_bundle_verifier_tampered_pack_rejects():
+    signer = Ed25519Signer.generate("kid")
+    pack = _pack(body_x=1)
+    sig = sign_pack(pack, signer)
+    bundle = TrustBundle(keys=[_bundle_entry(signer, "kid")])
+    verifier = TrustBundleVerifier.from_bundle(bundle)
+    tampered = copy.deepcopy(pack)
+    tampered["body"]["x"] = 999
+    assert verifier.verify_pack(tampered, sig) is False
+
+
+def test_trust_bundle_verifier_malformed_or_unsupported_entries_are_skipped():
+    good = Ed25519Signer.generate("good")
+    pack = _pack()
+    sig = sign_pack(pack, good)
+    bundle = TrustBundle(
+        keys=[
+            TrustedPublicKey(key_id="bad-b64", algorithm=ED25519_ALG, public_key="not!base64!"),
+            TrustedPublicKey(key_id="short", algorithm=ED25519_ALG, public_key=base64.b64encode(
+                b"too-short").decode("ascii")),
+            TrustedPublicKey(key_id="wrong-alg", algorithm="rsa-pss", public_key=base64.b64encode(
+                b"\x00" * 32).decode("ascii")),
+            _bundle_entry(good, "good"),
+        ]
+    )
+    verifier = TrustBundleVerifier.from_bundle(bundle)
+    # Only the well-formed ed25519 entry survives; the rest are skipped (fail closed per key).
+    assert verifier.key_ids() == frozenset({"good"})
+    assert verifier.verify_pack(pack, sig) is True
+
+
+def test_trust_bundle_verifier_duplicate_key_id_is_rejected():
+    a = Ed25519Signer.generate("dup")
+    b = Ed25519Signer.generate("dup")
+    bundle = TrustBundle(keys=[_bundle_entry(a, "dup"), _bundle_entry(b, "dup")])
+    with pytest.raises(PackSignatureError, match="duplicate key id"):
+        TrustBundleVerifier.from_bundle(bundle)
 
 
 def test_ed25519_verifier_from_public_bytes_roundtrip():

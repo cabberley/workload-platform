@@ -113,6 +113,40 @@ class PackManifest(BaseModel):
     author: str = "microsoft"
 
 
+class TrustedPublicKey(BaseModel):
+    """One pinned Ed25519 PUBLIC key in the trust bundle (issue #89) — provenance, never a secret.
+
+    The customer platform is **verification-only and keyless**: it holds Microsoft's distributed
+    PUBLIC keys and NEVER any private key. The verifier selects the entry whose ``key_id`` matches a
+    pack signature's ``key_id`` (:class:`PackSignature`) and checks the detached signature with it.
+    Rotation = publish a new ``key_id`` + ``public_key`` into the bundle; retire by removing it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str = Field(description="Key id matching PackSignature.key_id (never a secret)")
+    algorithm: str = Field(default="ed25519", description="Signature algorithm; only 'ed25519'")
+    public_key: str = Field(description="Base64 raw 32-byte Ed25519 PUBLIC key (never a secret)")
+
+
+class TrustBundle(BaseModel):
+    """The pinned set of trusted Ed25519 PUBLIC keys used to verify imported packs (issue #89).
+
+    A bundled, in-boundary trust root: Microsoft signs packs **OFFLINE**; this platform only
+    **VERIFIES** with the public keys pinned here. **Fail-closed by construction** — an EMPTY bundle
+    trusts nothing, so every pack import is rejected until real keys are pinned. Distribution today
+    is a bundled file loaded at composition; a future "bundle updated via signed pack-registry
+    metadata" path is a clean extension (a documented hook — remote fetch is NOT built here).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = Field(default=1, description="Bundle format version")
+    keys: list[TrustedPublicKey] = Field(
+        default_factory=list, description="Pinned trusted public keys, keyed by key id"
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Module manifest / scaling — what makes modules independently scalable.
 # --------------------------------------------------------------------------------------

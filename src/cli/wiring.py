@@ -23,15 +23,20 @@ Guardrails honoured here:
 """
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
+from pydantic import ValidationError
+
 from packs_engine.content_store import PackContentStore, build_pack_content_store
 from packs_engine.engine import PacksEngine
 from packs_engine.registry import PackRegistry
+from shared.contracts import TrustBundle
 from shared.observability import connector_fail_closed_observer
+from shared.signing import TrustBundleVerifier
 
 # Env var *names* the composition root reads. Values are supplied at runtime by identity / Key
 # Vault — only the names live in code (keyless).
@@ -60,6 +65,56 @@ ENV_TELEMETRY_EXPORT_DCR_IMMUTABLE_ID = "TELEMETRY_EXPORT_DCR_IMMUTABLE_ID"
 
 _DEFAULT_CONTENT_ROOT = "content"
 _WEBHOOK_TIMEOUT_S = 10.0
+# Bundled trust root (issue #89): the pinned Ed25519 PUBLIC keys used to verify imported packs.
+# A file path (overridable by env for a future signed-metadata refresh path); its VALUE is public
+# key material only — never a secret. Absent/empty/corrupt ⇒ a reject-all verifier (fail closed).
+ENV_TRUST_BUNDLE_PATH = "WP_TRUST_BUNDLE_PATH"
+_DEFAULT_TRUST_BUNDLE_PATH = "config/trust-bundle.json"
+
+
+def build_pack_import_verifier(*, config: Mapping[str, str] | None = None) -> TrustBundleVerifier:
+    """Load the pinned trust bundle and build the keyless, fail-closed pack-import verifier (#89).
+
+    This is the customer-side, **verification-only** trust root: it loads a bundled set of trusted
+    Ed25519 **PUBLIC** keys (``$WP_TRUST_BUNDLE_PATH``, default ``config/trust-bundle.json``) and
+    returns a :class:`~shared.signing.TrustBundleVerifier` that the engine's import-admission gate
+    (:meth:`packs_engine.engine.PacksEngine.verify_pack_for_import`) uses to verify a pack's
+    detached signature before it is registered/stored (#44) and activated.
+
+    **Always returns a verifier — never ``None``** — so import is *fail-closed by construction*: a
+    missing, empty, or corrupt bundle yields a reject-all verifier
+    (:meth:`~shared.signing.TrustBundleVerifier.reject_all`) that rejects every pack until
+    Microsoft's public keys are pinned into the bundle. The bundle holds only public key material
+    (no secret is ever read here), keeping the platform keyless.
+
+    TODO(human): a future "bundle refreshed via **signed** pack-registry metadata" path is a clean
+    extension — resolve/verify an updated bundle from the registry and rebuild this verifier. Remote
+    fetch is deliberately NOT built here; the bundled file remains the pinned trust root today.
+    """
+    cfg: Mapping[str, str] = config if config is not None else os.environ
+    path = Path(cfg.get(ENV_TRUST_BUNDLE_PATH, _DEFAULT_TRUST_BUNDLE_PATH))
+    bundle = _load_trust_bundle_or_empty(path)
+    try:
+        return TrustBundleVerifier.from_bundle(bundle)
+    except Exception:  # noqa: BLE001 - any malformed bundle (e.g. duplicate key id) -> reject all
+        return TrustBundleVerifier.reject_all()
+
+
+def _load_trust_bundle_or_empty(path: Path) -> TrustBundle:
+    """Read + validate the trust bundle file, or an EMPTY (reject-all) bundle on any problem.
+
+    Fail-closed: a missing file, unreadable bytes, non-JSON content, or a schema-invalid bundle all
+    degrade to an empty :class:`~shared.contracts.TrustBundle` (trusts nothing) rather than raising,
+    so a misconfigured trust root rejects every import instead of crashing wiring or trusting packs.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return TrustBundle(keys=[])
+    try:
+        return TrustBundle.model_validate(raw)
+    except ValidationError:
+        return TrustBundle(keys=[])
 
 
 def build_packs_engine() -> PacksEngine | None:
@@ -70,16 +125,24 @@ def build_packs_engine() -> PacksEngine | None:
     rather than crashing. Never raises.
 
     TODO(human): source the pack signing secret from Key Vault (by identity) and pass it as
-    ``PacksEngine(root, signing_secret=...)`` so signatures — not just content hashes — are
-    verified before execution. Keep the secret out of code/config literals.
+    ``PacksEngine(root, signing_secret=...)`` so the legacy HMAC gate — not just content hashes —
+    is verified before execution. Keep the secret out of code/config literals. (The #89 trust root
+    is keyless and needs NO Key Vault key: the customer platform only VERIFIES imported packs with
+    pinned Ed25519 PUBLIC keys — see ``build_pack_import_verifier`` below.)
 
-    TODO(human): audit ``pack.import`` and ``pack.assign`` (issue #59). These are HELD behind the
-    pack-import/admission decision (#37): there is no import/assign subsystem to emit from yet.
-    When #37 lands, construct the engine (or the import service) with a store-backed
-    ``AuditEmitter`` (as the API does via ``PacksEngine.attach_audit_emitter``) and emit
+    TODO(human): audit ``pack.import`` and ``pack.assign`` (issue #59) and emit their audit events.
+    The #89 trust root is now ENFORCED at admission: the registry/store WRITE boundary
+    (``cli.packs_studio.cmd_export`` today) verifies every pack against the pinned trust bundle via
+    ``build_pack_import_verifier`` BEFORE ``registry.publish`` + ``store.put`` — so the runtime's
+    "registry digest => trusted" invariant (:meth:`PacksEngine._resolve_imported_packs`) holds
+    because admission proved the signature. What remains HELD behind #37 is the customer-facing
+    import/assign SUBSYSTEM (nothing to emit from yet): when #37 lands, construct the import
+    service with a store-backed ``AuditEmitter`` (as the API does via
+    ``PacksEngine.attach_audit_emitter``), call ``engine.verify_pack_for_import(pack)`` (the SAME
+    fail-closed trust-root gate wired below, reusing the SAME ``TrustBundleVerifier``) before
+    ``registry.publish`` + ``store.put`` on the customer import path, and emit
     ``AuditAction.pack_import`` on admission (with the success-path ``pack.verify``) and
-    ``AuditAction.pack_assign`` when a pack is bound to a workload — actor = the importing
-    principal id, subject/packId/packVersion = the admitted pack. Do NOT build the held subsystem
+    ``AuditAction.pack_assign`` when a pack is bound to a workload. Do NOT build the held subsystem
     here just to emit.
     """
     root = os.environ.get(ENV_CONTENT_ROOT, _DEFAULT_CONTENT_ROOT)
@@ -95,7 +158,16 @@ def build_packs_engine() -> PacksEngine | None:
         # (the selector raises) — a misconfiguration we refuse rather than silently downgrade.
         registry = PackRegistry(index_path=Path(root) / "registry" / "index.json")
         content_store = _build_pack_content_store_or_none()
-        return PacksEngine(root, registry=registry, content_store=content_store)
+        # Issue #89: the customer-side, keyless trust root for imported packs. Always present and
+        # fail-closed (reject-all until real Microsoft public keys are pinned), so the import
+        # admission gate never silently trusts an unverified pack.
+        import_verifier = build_pack_import_verifier()
+        return PacksEngine(
+            root,
+            registry=registry,
+            content_store=content_store,
+            import_verifier=import_verifier,
+        )
     except OSError:
         return None
 

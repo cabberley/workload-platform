@@ -12,11 +12,13 @@ the signing provider (#35 ``sign_pack`` / ``Ed25519Signer``) and the real capabi
 Guardrails honoured here:
 
 * **In-boundary / keyless.** Signing uses an ephemeral in-process :class:`Ed25519Signer` - no
-  secret, no network. The Key Vault signer stays a fail-closed ``TODO(human)`` stub in
-  ``shared.signing`` and is deliberately not used here.
+  secret, no network. The customer platform NEVER signs (Microsoft signs OFFLINE); there is no Key
+  Vault signing key, and ``export`` verifies packs against the pinned, verification-only trust
+  bundle (public keys only) — see issue #89 / ADR 0010.
 * **Fail closed.** ``validate`` exits non-zero on any schema error; ``test`` refuses a pack type
-  with no runnable module; ``export`` refuses an invalid or unsigned pack and lets the registry's
-  immutability guard reject a mutated re-publish of an existing ``id@version``.
+  with no runnable module; ``export`` refuses an invalid or unsigned pack, refuses a pack whose
+  signature does not verify against the **pinned trust bundle** (never a caller-supplied key), and
+  lets the registry's immutability guard reject a mutated re-publish of an existing ``id@version``.
 * **No Azure in ``test``.** The real modules run against an in-process synthetic estate and an
   in-process telemetry source - there is no ``DefaultAzureCredential`` and no SDK call anywhere.
 * **Pure vs I/O.** Starter-body generation, the synthetic estate, and the bundle envelope are pure
@@ -39,6 +41,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from cli.wiring import ENV_TRUST_BUNDLE_PATH, build_pack_import_verifier
 from packs_engine import (
     ImmutableVersionError,
     InvalidVersionError,
@@ -419,11 +422,13 @@ def _is_contained(path: Path, base: Path) -> bool:
 
 
 def _resolve_public_key(explicit: str | None, pack_path: Path) -> tuple[bytes | None, str | None]:
-    """Resolve the base64 raw Ed25519 public key used to verify ``pack_path``. Fail closed.
+    """Resolve an OPTIONAL base64 raw Ed25519 public key for a self-consistency pre-check.
 
     Resolution order: an explicit ``--public-key`` / ``$WP_PACK_PUBLIC_KEY`` value wins, else the
-    ``<pack>.pubkey`` sidecar written by ``sign``. Returns ``(raw_bytes, None)`` on success or
-    ``(None, error)`` when no valid 32-byte key can be resolved.
+    ``<pack>.pubkey`` sidecar written by ``sign``. This key is **never** the admission trust root
+    (the PINNED trust bundle is — see :func:`cmd_export`); it is only an early cross-check. Returns
+    ``(raw_bytes, None)`` when a key resolves, ``(None, None)`` when none is available (skip the
+    optional check), or ``(None, error)`` when a provided key is malformed (fail closed).
     """
     source = explicit or os.environ.get(_PUBLIC_KEY_ENV)
     if source:
@@ -431,10 +436,7 @@ def _resolve_public_key(explicit: str | None, pack_path: Path) -> tuple[bytes | 
     else:
         sidecar = pack_path.with_name(pack_path.name + _PUBKEY_SUFFIX)
         if not sidecar.is_file():
-            return None, (
-                f"no verification key: provide --public-key / ${_PUBLIC_KEY_ENV} or a "
-                f"'{sidecar.name}' sidecar (from 'wp-packs sign')"
-            )
+            return None, None  # no optional key available -> skip the non-authoritative pre-check
         try:
             data = json.loads(sidecar.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -602,9 +604,10 @@ def cmd_sign(args: argparse.Namespace) -> int:
             print(f"  - {err}", file=sys.stderr)
         return 1
 
-    # Keyless, ephemeral in-process Ed25519 signer - no secret, no network. The Key Vault signer
-    # stays a fail-closed TODO(human) stub in shared.signing and is intentionally not used here.
-    signer = Ed25519Signer.generate()
+    # Keyless, ephemeral in-process Ed25519 signer - no secret, no network. ``--key-id`` names the
+    # signing key so the SAME id is recorded in the signature and pinned (as a PUBLIC key) in the
+    # trust bundle the exporter/runtime verify against; the private key is ephemeral, never written.
+    signer = Ed25519Signer.generate(args.key_id)
     signature = sign_pack(pack, signer)
     pack.setdefault("manifest", {})["pack_signature"] = signature.model_dump(mode="json")
     # The PUBLIC key is provenance, not a secret: persist it (base64 raw) so 'export' and any
@@ -661,6 +664,15 @@ def cmd_export(args: argparse.Namespace) -> int:
         )
         return 1
     signature = PackSignature(**raw_sig)
+    # A signed pack MUST name its signing key so the PINNED trust bundle can select the matching
+    # PUBLIC key. A blank key_id can never be pinned -> reject before any registry/store write.
+    if not signature.key_id.strip():
+        print(
+            f"error: signed pack {pack_id!r} carries no key_id; the trust root cannot select a "
+            "verification key (fail closed)",
+            file=sys.stderr,
+        )
+        return 1
     # Structural self-consistency is only a cheap pre-check (right algorithm, well-formed base64,
     # covered digest matches the pack's canonical bytes) - NEVER sufficient on its own.
     if not verify_signature_structure(pack, signature):
@@ -670,20 +682,51 @@ def cmd_export(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    # Real, keyless cryptographic verification against public-key material. A forged signature with
-    # a correct canonical_digest passes the structural pre-check but MUST fail here (fail closed).
+    # OPTIONAL, non-authoritative self-consistency: if a --public-key / $WP_PACK_PUBLIC_KEY / pubkey
+    # sidecar is available, cross-check the signature against it. This can NEVER substitute for the
+    # PINNED-bundle verification below; it only catches an obviously mismatched sidecar early.
     raw_pub, key_err = _resolve_public_key(args.public_key, path)
-    if raw_pub is None:
-        print(f"error: cannot verify signature: {key_err} (fail closed)", file=sys.stderr)
+    if key_err is not None:
+        print(f"error: {key_err} (fail closed)", file=sys.stderr)
         return 1
-    if not verify_pack(pack, signature, Ed25519Verifier.from_public_bytes(raw_pub)):
+    if raw_pub is not None and not verify_pack(
+        pack, signature, Ed25519Verifier.from_public_bytes(raw_pub)
+    ):
         print(
-            f"error: pack signature failed cryptographic verification ({path}); "
-            "refusing to export (fail closed)",
+            f"error: pack signature failed the optional --public-key self-consistency check "
+            f"({path}); re-sign before export (fail closed)",
             file=sys.stderr,
         )
         return 1
-    public_b64 = base64.b64encode(raw_pub).decode("ascii")
+    # AUTHORITATIVE trust-root admission (issue #89): verify the detached signature against the
+    # PINNED trust bundle - the SAME trust root the runtime relies on. The runtime's
+    # "registry digest => trusted" invariant (see PacksEngine._resolve_imported_packs) holds ONLY
+    # because admission verified the signature here, at the registry/store write boundary. The
+    # bundle is loaded via the composition-root seam (honouring $WP_TRUST_BUNDLE_PATH; overridable
+    # per-run with --trust-bundle). Default (no bundle configured) = empty = reject-all, so an
+    # untrusted/unpinned pack can never be written into a runtime-trusted registry/store. Fail
+    # closed on an unknown/unpinned key_id, an empty/missing/corrupt bundle, or a bad signature.
+    trust_config = {ENV_TRUST_BUNDLE_PATH: args.trust_bundle} if args.trust_bundle else None
+    import_verifier = build_pack_import_verifier(config=trust_config)
+    if not import_verifier.verify_pack(pack, signature):
+        print(
+            f"error: pack {pack_id!r} signature did not verify against the PINNED trust bundle "
+            f"(key id {signature.key_id!r}); refusing to admit it to a runtime-trusted registry "
+            "(fail closed)",
+            file=sys.stderr,
+        )
+        return 1
+    # Provenance records the exact PINNED public key that AUTHORISED admission (selected from the
+    # trust bundle by key_id), never a caller-supplied key.
+    pinned_pub = import_verifier.public_bytes_for(signature.key_id)
+    if pinned_pub is None:  # unreachable after a successful verify_pack; fail closed regardless
+        print(
+            f"error: no pinned public key for {signature.key_id!r} in the trust bundle "
+            "(fail closed)",
+            file=sys.stderr,
+        )
+        return 1
+    public_b64 = base64.b64encode(pinned_pub).decode("ascii")
 
     dist = Path(args.dist) if args.dist else Path("dist")
     # Contain output paths BENEATH dist before any write (defence in depth over the id grammar).
@@ -759,6 +802,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sign = sub.add_parser("sign", help="sign a pack with an ephemeral Ed25519 key (keyless)")
     p_sign.add_argument("path", help="path to the pack JSON file")
     p_sign.add_argument("--out", help="output file (default: sign in place)")
+    p_sign.add_argument(
+        "--key-id",
+        dest="key_id",
+        default="ephemeral-ed25519",
+        help="signing key id recorded in the signature and pinned (as a PUBLIC key) in the trust "
+             "bundle the exporter/runtime verify against (default: ephemeral-ed25519)",
+    )
     p_sign.set_defaults(func=cmd_sign)
 
     p_export = sub.add_parser(
@@ -771,8 +821,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export.add_argument(
         "--public-key",
         dest="public_key",
-        help="base64 raw Ed25519 public key to verify with "
-             f"(else ${_PUBLIC_KEY_ENV} or the <pack>.pubkey sidecar)",
+        help="OPTIONAL base64 raw Ed25519 public key for a non-authoritative self-consistency "
+             f"pre-check (else ${_PUBLIC_KEY_ENV} or the <pack>.pubkey sidecar); NEVER the "
+             "admission trust root",
+    )
+    p_export.add_argument(
+        "--trust-bundle",
+        dest="trust_bundle",
+        help="path to the PINNED Ed25519 PUBLIC-key trust bundle the signature is verified against "
+             f"(else ${ENV_TRUST_BUNDLE_PATH} or config/trust-bundle.json; empty/missing = reject "
+             "all — fail closed)",
     )
     p_export.set_defaults(func=cmd_export)
 

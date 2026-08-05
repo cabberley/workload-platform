@@ -131,6 +131,10 @@ non-zero exit. Re-exporting identical content is idempotent.
 
 ## `TODO(human)`
 
-* **Real signing key.** The studio signs with an ephemeral Ed25519 key. The Azure Key Vault signer
-  (`shared.signing.KeyVaultSigner`) is a fail-closed `TODO(human)` stub; wire it (keyless, via
-  `DefaultAzureCredential`) so exported bundles carry a durable, org-trusted signature.
+* **Real signing key (offline, Microsoft-side).** The studio signs with an ephemeral Ed25519 key.
+  Per [ADR 0010](adr/0010-pack-signing-trust-root.md), production packs are signed **OFFLINE** with
+  Microsoft's Ed25519 private key held in Microsoft's own signing infrastructure — **outside** the
+  customer deployment (there is no Key Vault signing provider; Ed25519 is not a KV Keys algorithm).
+  Wire this offline signer into the pack-authoring/export pipeline so exported bundles carry a
+  durable, org-trusted signature; the customer platform then only VERIFIES with the pinned public
+  keys in `config/trust-bundle.json` (issue #89).

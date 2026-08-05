@@ -14,7 +14,12 @@ from pathlib import Path
 from cli.packs_studio import main
 from packs_engine import canonical_digest, validate_pack
 from shared.contracts import PackSignature
-from shared.signing import Ed25519Verifier, verify_pack, verify_signature_structure
+from shared.signing import (
+    Ed25519Signer,
+    Ed25519Verifier,
+    verify_pack,
+    verify_signature_structure,
+)
 
 
 def _scaffold(tmp_path: Path, pack_type: str, pack_id: str) -> Path:
@@ -25,6 +30,35 @@ def _scaffold(tmp_path: Path, pack_type: str, pack_id: str) -> Path:
 
 def _sign(path: Path) -> None:
     assert main(["sign", str(path)]) == 0
+
+
+def _trust_bundle_from_sidecar(pack_path: Path, dest: Path) -> Path:
+    """Pin the PUBLIC key ``sign`` wrote (its ``.pubkey`` sidecar) into a synthetic trust bundle.
+
+    Mirrors real Microsoft authoring: sign OFFLINE, publish the PUBLIC key + key_id into the pinned
+    trust bundle, then export/verify against it. NO private key is ever written to disk.
+    """
+    sidecar = json.loads(pack_path.with_name(pack_path.name + ".pubkey").read_text("utf-8"))
+    dest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "keys": [
+                    {
+                        "key_id": sidecar["keyId"],
+                        "algorithm": sidecar["algorithm"],
+                        "public_key": sidecar["publicKey"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dest
+
+
+def _export(path: Path, dist: Path, *, trust_bundle: Path) -> int:
+    return main(["export", str(path), "--dist", str(dist), "--trust-bundle", str(trust_bundle)])
 
 
 # --------------------------------------------------------------------------------------
@@ -140,7 +174,8 @@ def test_export_writes_bundle_and_registers_version(tmp_path: Path) -> None:
     path = _scaffold(tmp_path, "rule", "exportable")
     _sign(path)
     dist = tmp_path / "dist"
-    assert main(["export", str(path), "--dist", str(dist)]) == 0
+    tb = _trust_bundle_from_sidecar(path, tmp_path / "trust-bundle.json")
+    assert _export(path, dist, trust_bundle=tb) == 0
 
     bundle = dist / "exportable-0.1.0.wpack"
     sidecar = dist / "exportable-0.1.0.manifest.json"
@@ -162,7 +197,8 @@ def test_exported_bundle_is_independently_verifiable_with_its_public_key(tmp_pat
     path = _scaffold(tmp_path, "rule", "verifiable")
     _sign(path)
     dist = tmp_path / "dist"
-    assert main(["export", str(path), "--dist", str(dist)]) == 0
+    tb = _trust_bundle_from_sidecar(path, tmp_path / "trust-bundle.json")
+    assert _export(path, dist, trust_bundle=tb) == 0
 
     envelope = json.loads((dist / "verifiable-0.1.0.wpack").read_text(encoding="utf-8"))
     # The bundle carries the signer's PUBLIC key, so a downstream importer can verify with no
@@ -246,7 +282,9 @@ def test_export_enforces_version_immutability_on_mutated_republish(tmp_path: Pat
     path = _scaffold(tmp_path, "rule", "immutable")
     _sign(path)
     dist = tmp_path / "dist"
-    assert main(["export", str(path), "--dist", str(dist)]) == 0
+    tb = tmp_path / "trust-bundle.json"
+    _trust_bundle_from_sidecar(path, tb)
+    assert _export(path, dist, trust_bundle=tb) == 0
 
     # Mutate the body at the SAME id@version and re-sign so the signature matches the new content,
     # then re-export: the registry must reject the differing digest (fail closed).
@@ -255,5 +293,79 @@ def test_export_enforces_version_immutability_on_mutated_republish(tmp_path: Pat
     pack["manifest"].pop("pack_signature", None)
     path.write_text(json.dumps(pack), encoding="utf-8")
     _sign(path)
+    _trust_bundle_from_sidecar(path, tb)  # re-pin the freshly re-signed key so admission passes
 
-    assert main(["export", str(path), "--dist", str(dist)]) == 1
+    assert _export(path, dist, trust_bundle=tb) == 1
+
+
+# --------------------------------------------------------------------------------------
+# export trust-root ADMISSION (issue #89): the PINNED bundle — not a caller-supplied key —
+# gates every registry/store write, so the runtime's "registry digest => trusted" invariant holds.
+# --------------------------------------------------------------------------------------
+def _ms_trust_bundle(dest: Path, *, key_id: str = "ms-root-2026") -> Path:
+    """Write a synthetic 'Microsoft' trust bundle pinning ONE ephemeral PUBLIC key (keyless)."""
+    signer = Ed25519Signer.generate(key_id)
+    pub = base64.b64encode(signer.verifier().public_bytes()).decode("ascii")
+    dest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "keys": [{"key_id": key_id, "algorithm": "ed25519", "public_key": pub}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dest
+
+
+def test_export_rejects_pack_signed_by_key_not_in_pinned_bundle(tmp_path: Path) -> None:
+    # The reviewer's bypass: an attacker signs a pack with their OWN key and exports it. The pinned
+    # bundle holds only Microsoft's key, so the attacker's key_id is not pinned => reject, and
+    # NOTHING is written into the runtime-trusted registry/store (fail closed).
+    path = _scaffold(tmp_path, "rule", "attacker")
+    _sign(path)  # attacker key, key_id 'ephemeral-ed25519' — NOT in the Microsoft bundle
+    dist = tmp_path / "dist"
+    tb = _ms_trust_bundle(tmp_path / "ms-bundle.json")
+    assert main(["export", str(path), "--dist", str(dist), "--trust-bundle", str(tb)]) == 1
+    assert list(dist.rglob("*.wpack")) == []
+    assert not (dist / "registry" / "index.json").exists()
+    assert not (dist / "store").exists()
+
+
+def test_export_accepts_pack_signed_by_a_pinned_key(tmp_path: Path) -> None:
+    # key_id flows end to end: sign --key-id -> signature.key_id -> pinned bundle key_id -> verify.
+    path = _scaffold(tmp_path, "rule", "trusted")
+    assert main(["sign", str(path), "--key-id", "ms-root-2026"]) == 0
+    dist = tmp_path / "dist"
+    tb = _trust_bundle_from_sidecar(path, tmp_path / "trust-bundle.json")
+    assert _export(path, dist, trust_bundle=tb) == 0
+    assert (dist / "trusted-0.1.0.wpack").is_file()
+    # Provenance records the PINNED public key that authorised admission.
+    envelope = json.loads((dist / "trusted-0.1.0.wpack").read_text(encoding="utf-8"))
+    assert envelope["provenance"]["keyId"] == "ms-root-2026"
+
+
+def test_export_rejects_all_when_bundle_missing(tmp_path: Path) -> None:
+    # An empty/unavailable trust bundle is reject-all: a validly self-signed pack still cannot be
+    # admitted to a runtime-trusted registry (fail closed by construction).
+    path = _scaffold(tmp_path, "rule", "nobundle")
+    _sign(path)
+    dist = tmp_path / "dist"
+    missing = tmp_path / "does-not-exist.json"
+    assert main(["export", str(path), "--dist", str(dist), "--trust-bundle", str(missing)]) == 1
+    assert list(dist.rglob("*.wpack")) == []
+
+
+def test_export_rejects_signed_pack_with_blank_key_id(tmp_path: Path) -> None:
+    # Blank the key_id AFTER signing. canonical_bytes exclude pack_signature, so the structural
+    # digest still matches — proving the key_id guard (not the digest) is what rejects it: a
+    # signature the trust root cannot attribute to any pinned key can never be admitted.
+    path = _scaffold(tmp_path, "rule", "nokeyid")
+    _sign(path)
+    tb = _trust_bundle_from_sidecar(path, tmp_path / "trust-bundle.json")
+    pack = json.loads(path.read_text(encoding="utf-8"))
+    pack["manifest"]["pack_signature"]["key_id"] = ""
+    path.write_text(json.dumps(pack), encoding="utf-8")
+    dist = tmp_path / "dist"
+    assert main(["export", str(path), "--dist", str(dist), "--trust-bundle", str(tb)]) == 1
+    assert list(dist.rglob("*.wpack")) == []

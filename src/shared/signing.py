@@ -13,12 +13,14 @@ covers.
 This module hardcodes **no key**. Callers inject a :class:`Signer` / :class:`Verifier` provider:
 
 * :class:`Ed25519Signer` / :class:`Ed25519Verifier` — an ephemeral in-process Ed25519 provider
-  (via the ``cryptography`` library) so tests need **no secret and no network**.
-* :class:`KeyVaultSigner` / :class:`KeyVaultVerifier` — a **fail-closed** Azure Key Vault stub
-  (keyless via ``DefaultAzureCredential``). The azure SDK is imported **lazily inside the method**
-  (mirroring ``modules.aiops.connectors.azure_monitor``) so importing this module — and
-  ``mypy src`` — stays azure-free. Until the KV key is provisioned it raises ``NotImplementedError``
-  with a ``TODO(human):`` note.
+  (via the ``cryptography`` library) so tests and the **offline** authoring/release tooling need
+  **no secret and no network**. The customer platform NEVER signs — signing is done OFFLINE in
+  Microsoft's own infrastructure — so no Key Vault signing provider exists here (issue #89).
+* :class:`TrustBundleVerifier` — the **customer-side, verification-only, keyless** trust root
+  (issue #89). It holds a set of pinned Ed25519 **PUBLIC** keys (a :class:`~shared.contracts.
+  TrustBundle`), selects the key whose ``key_id`` matches a pack signature's ``key_id``, and
+  verifies the detached signature — **no private key, no Key Vault key op, no secret material**.
+  Fail-closed: an unknown/unpinned key id or an empty bundle rejects the pack.
 
 ## Fail closed
 
@@ -34,12 +36,13 @@ import base64
 import binascii
 import hashlib
 import hmac
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from shared.contracts import PackSignature
+from shared.contracts import PackSignature, TrustBundle
 
 # Algorithm identifiers understood by this module. The detached ephemeral/test provider is
 # Ed25519; a real Key Vault provider will extend this set once wired.
@@ -77,6 +80,18 @@ class Verifier(Protocol):
     """A detached-signature checker. Returns ``True`` iff ``signature`` is valid for ``data``."""
 
     def verify(self, data: bytes, signature: bytes) -> bool: ...
+
+
+@runtime_checkable
+class PackVerifier(Protocol):
+    """A **key-id-aware**, keyless pack-signature verifier backed by a pinned trust root.
+
+    Unlike the low-level :class:`Verifier` (which is handed a specific key's raw bytes), a
+    :class:`PackVerifier` selects the right public key from a trust bundle using the signature's
+    ``key_id`` before verifying. Fail-closed: an unknown/unpinned key id yields ``False``.
+    """
+
+    def verify_pack(self, pack: dict[str, object], signature: PackSignature) -> bool: ...
 
 
 # --------------------------------------------------------------------------------------
@@ -216,64 +231,88 @@ class Ed25519Verifier:
 
 
 # --------------------------------------------------------------------------------------
-# Azure Key Vault provider — fail-closed stub, keyless, guarded/lazy azure import.
+# Trust bundle verifier — the customer-side, verification-only, KEYLESS trust root (issue #89).
 # --------------------------------------------------------------------------------------
-def _import_keyvault_crypto() -> None:
-    """Guarded, lazy import of the Azure Key Vault crypto SDK (mirrors aiops azure_monitor edge).
+class TrustBundleVerifier:
+    """Verify a pack's detached signature against a set of PINNED Ed25519 **PUBLIC** keys.
 
-    Azure imports live inside the method so importing this module — and ``mypy src`` — stays
-    azure-free WITHOUT the Azure SDK installed. A missing SDK is tolerated because the KV providers
-    are fail-closed stubs that raise ``NotImplementedError`` regardless of SDK presence.
-    """
-    try:
-        from azure.identity import DefaultAzureCredential  # noqa: F401
-        from azure.keyvault.keys.crypto import (  # noqa: F401
-            CryptographyClient,
-            SignatureAlgorithm,
-        )
-    except ImportError:
-        return
+    This is the customer-side trust root: Microsoft signs packs **offline**; this platform only
+    **verifies**. It is **keyless** — it holds only public keys (provenance, never secrets) — and
+    **fail-closed**: an unknown/unpinned ``key_id``, an EMPTY bundle, or a wrong/tampered/malformed
+    signature all yield ``False`` (:meth:`verify_pack`). It selects the public key whose ``key_id``
+    matches the :class:`~shared.contracts.PackSignature` and delegates to :func:`verify_pack`.
 
-
-class KeyVaultSigner:
-    """Fail-closed Azure Key Vault :class:`Signer` stub (keyless via ``DefaultAzureCredential``).
-
-    A real, typed provider — not a dead import. It satisfies the :class:`Signer` protocol but
-    refuses to sign until the KV key is provisioned.
+    Rotation/pinning: publish a new ``key_id`` + public key into the :class:`~shared.contracts.
+    TrustBundle` and retire an old one by removing it. Remote/refreshable bundle distribution (e.g.
+    via signed pack-registry metadata) is a deliberate, documented **future** extension — this class
+    verifies against whatever pinned set it is constructed with and does no fetching.
     """
 
-    def __init__(self, key_id: str, *, algorithm: str = ED25519_ALG) -> None:
-        self.key_id = key_id
-        self.algorithm = algorithm
+    def __init__(self, verifiers: Mapping[str, Ed25519Verifier]) -> None:
+        # A copy so the pinned set cannot be mutated after construction.
+        self._by_key_id: dict[str, Ed25519Verifier] = dict(verifiers)
 
-    def sign(self, data: bytes) -> bytes:
-        _import_keyvault_crypto()
-        raise NotImplementedError(
-            "TODO(human): Azure Key Vault signing is not provisioned. Once the KV key exists, "
-            "build a keyless CryptographyClient(self.key_id, DefaultAzureCredential()) and return "
-            "client.sign(SignatureAlgorithm.eddsa, data).signature. Fail closed until then."
-        )
+    @classmethod
+    def from_bundle(cls, bundle: TrustBundle) -> TrustBundleVerifier:
+        """Build a verifier from a :class:`~shared.contracts.TrustBundle`. Fail-closed per entry.
 
+        An entry with an unsupported algorithm, a malformed base64 key, or a non-32-byte key is
+        skipped (that key simply cannot verify anything). A **duplicate ``key_id``** is ambiguous —
+        two different public keys claiming one id — so it is rejected with
+        :class:`PackSignatureError` rather than silently resolving to one of them. An EMPTY result
+        set is valid and rejects every pack (the fail-closed default until real Microsoft keys are
+        pinned).
+        """
+        by_key_id: dict[str, Ed25519Verifier] = {}
+        for entry in bundle.keys:
+            if entry.algorithm != ED25519_ALG:
+                continue  # only Ed25519 is supported; skip -> this key verifies nothing
+            if entry.key_id in by_key_id:
+                raise PackSignatureError(
+                    f"Trust bundle has a duplicate key id {entry.key_id!r} (fail closed)"
+                )
+            try:
+                raw = base64.b64decode(entry.public_key, validate=True)
+            except (binascii.Error, ValueError):
+                continue  # malformed key material -> skip (fail closed for this key)
+            if len(raw) != 32:
+                continue  # not a raw Ed25519 public key -> skip
+            try:
+                by_key_id[entry.key_id] = Ed25519Verifier.from_public_bytes(raw, entry.key_id)
+            except (ValueError, TypeError):
+                continue  # cryptography rejects the bytes -> skip
+        return cls(by_key_id)
 
-class KeyVaultVerifier:
-    """Fail-closed Azure Key Vault :class:`Verifier` stub (keyless via ``DefaultAzureCredential``).
+    @classmethod
+    def reject_all(cls) -> TrustBundleVerifier:
+        """An empty, pin-nothing verifier that rejects every pack — the fail-closed default."""
+        return cls({})
 
-    A real, typed provider — not a dead import. It satisfies the :class:`Verifier` protocol but
-    refuses to verify until the KV key / public trust root is provisioned.
-    """
+    def key_ids(self) -> frozenset[str]:
+        """The set of pinned key ids (for diagnostics/tests). Never exposes key material."""
+        return frozenset(self._by_key_id)
 
-    def __init__(self, key_id: str, *, algorithm: str = ED25519_ALG) -> None:
-        self.key_id = key_id
-        self.algorithm = algorithm
+    def public_bytes_for(self, key_id: str) -> bytes | None:
+        """Return the pinned 32-byte raw Ed25519 PUBLIC key for ``key_id``, or ``None`` if absent.
 
-    def verify(self, data: bytes, signature: bytes) -> bool:
-        _import_keyvault_crypto()
-        raise NotImplementedError(
-            "TODO(human): Azure Key Vault verification is not provisioned. Once the KV key / "
-            "public trust root exists, build a keyless CryptographyClient(self.key_id, "
-            "DefaultAzureCredential()) and return client.verify(SignatureAlgorithm.eddsa, data, "
-            "signature).is_valid. Fail closed until then."
-        )
+        Exposes only PUBLIC key material (never a secret), so a caller that has already verified a
+        pack against this trust root can record the exact pinned key as provenance. Returns ``None``
+        when the ``key_id`` is not pinned (the caller must have fail-closed before reaching here).
+        """
+        verifier = self._by_key_id.get(key_id)
+        return verifier.public_bytes() if verifier is not None else None
+
+    def verify_pack(self, pack: dict[str, object], signature: PackSignature) -> bool:
+        """Select the public key by ``signature.key_id`` and verify. Fail-closed ``bool``.
+
+        Returns ``False`` when the ``key_id`` is not pinned in the bundle (unknown/unavailable trust
+        root), and otherwise defers to :func:`verify_pack` (which fails closed on a wrong algorithm,
+        malformed base64, a tampered digest, or a bad cryptographic signature).
+        """
+        verifier = self._by_key_id.get(signature.key_id)
+        if verifier is None:
+            return False  # unknown / unpinned key id -> fail closed
+        return verify_pack(pack, signature, verifier)
 
 
 __all__ = [
@@ -281,10 +320,10 @@ __all__ = [
     "SUPPORTED_ALGORITHMS",
     "Ed25519Signer",
     "Ed25519Verifier",
-    "KeyVaultSigner",
-    "KeyVaultVerifier",
     "PackSignatureError",
+    "PackVerifier",
     "Signer",
+    "TrustBundleVerifier",
     "Verifier",
     "sign_pack",
     "verify_pack",
