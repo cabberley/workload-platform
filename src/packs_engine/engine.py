@@ -48,7 +48,7 @@ from shared.signing import PackVerifier, Verifier, verify_pack
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import; avoids runtime coupling to the emitter
     from packs_engine.content_store import PackContentStore
-    from packs_engine.registry import PackRegistry
+    from packs_engine.registry import PackRegistry, RegistryEntry
     from shared.audit import AuditEmitter
 
 
@@ -185,6 +185,20 @@ class PacksEngine:
     def attach_audit_emitter(self, emitter: AuditEmitter) -> None:
         """Attach a store-backed audit emitter after construction (used by the API composition)."""
         self._audit_emitter = emitter
+
+    def registry_entries(self, pack_type: PackType | None = None) -> list[RegistryEntry]:
+        """Read-only listing of published pack versions in the wired registry (issue #57).
+
+        A thin, keyless, PII-free projection of the registry index (:meth:`PackRegistry.list`) so
+        the control-plane API can surface the pack-version catalogue to the console WITHOUT exposing
+        the engine internals or the content store. Returns ``[]`` when no registry is wired (no
+        content root / import subsystem) — fail-closed: absence of a catalogue is an empty list,
+        never an error or a fabricated entry. This does NOT verify or activate anything; it only
+        reads what the registry already recorded at admission.
+        """
+        if self._registry is None:
+            return []
+        return self._registry.list(pack_type)
 
     def _iter_pack_files(self) -> list[Path]:
         return sorted(
