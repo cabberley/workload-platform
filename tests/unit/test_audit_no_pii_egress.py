@@ -93,12 +93,16 @@ def test_all_default_waivers_track_issue_91() -> None:
 
 
 def test_default_waivers_include_issue_96_http_detail_sites() -> None:
-    # R6 HIGH 2: the real src/** non-literal HTTPException detail sites are waived under #96.
+    # R6 HIGH 2: the real src/** non-literal HTTPException detail sites are waived under #96. The
+    # results/findings sites became visible once those routes gained a bounded response_model
+    # (issue #91) — the detail check only runs for routes that declare one.
     issue_96 = {k for k, v in AUDIT._DEFAULT_WAIVERS.items() if v == "#96"}
     assert issue_96 == {
         "POST /api/modules/{name}/run <raise HTTPException detail>",
         "GET /api/workloads/{workload}/graph <raise HTTPException detail>",
         "GET /api/workloads/{workload}/impact <raise HTTPException detail>",
+        "POST /api/workloads/{workload}/results <raise HTTPException detail>",
+        "POST /api/workloads/{workload}/findings <raise HTTPException detail>",
     }
 
 
@@ -2244,11 +2248,11 @@ def test_r15_pairable_scalar_tuple_no_false_positive() -> None:
     assert not any(v.target.startswith("GET /m1d") for v in auditor.violations)
 
 
-# --- M1-inv: the real tree stays EXIT-0-equivalent with EXACTLY 18 tracked waivers -------
-def test_r15_real_tree_invariant_18_waivers_intact() -> None:
+# --- M1-inv: the real tree stays EXIT-0-equivalent with EXACTLY 11 tracked waivers -------
+def test_r15_real_tree_invariant_waivers_intact() -> None:
     auditor = AUDIT.run_audit(_REPO_ROOT)
     assert auditor.violations == []
-    assert len(auditor.waived) == 18
+    assert len(auditor.waived) == 11
 
 
 # ======================================================================================
@@ -2331,11 +2335,311 @@ def test_r16_helper_scalar_pair_no_false_positive() -> None:
     assert not any(v.target.startswith("GET /n1d") for v in auditor.violations)
 
 
-# --- N1e: the real tree stays EXIT-0-equivalent with EXACTLY 18 tracked waivers ----------
-def test_r16_real_tree_invariant_18_waivers_intact() -> None:
+# --- N1e: the real tree stays EXIT-0-equivalent with EXACTLY 11 tracked waivers ----------
+def test_r16_real_tree_invariant_waivers_intact() -> None:
     auditor = AUDIT.run_audit(_REPO_ROOT)
     assert auditor.violations == []
-    assert len(auditor.waived) == 18
+    assert len(auditor.waived) == 11
 
 
+# ======================================================================================
+# R17 (#91 R2): the handler-bypass detector no longer trusts an ARBITRARY attribute call for a
+# route whose response_model transitively contains a redaction-required model (ResourceNode /
+# ModuleRunResult). Such a route MUST route through a reviewed egress projection
+# (``_estate_egress.redact`` / ``redact_node_tags`` / ``redact_tree`` /
+# ``_redact_run_result_for_egress``); a raw ``return store.get_estate(...)`` is failed closed so it
+# cannot ride the model-wide ``ResourceNode.tags`` / ``ModuleRunResult.extra`` waiver. Synthetic.
+# ======================================================================================
+from shared.contracts import ResourceNode as _RN  # noqa: E402
+from shared.contracts import redact_node_tags as _redact_node_tags  # noqa: E402
 
+
+class _FakeEstateStore:
+    def get_estate(self, workload: str) -> list[_RN]:
+        return [_RN(id="n", name="n", type="t", tags={"patientName": "AliceSmith"})]
+
+
+class _FakeEstateEgress:
+    """Mirrors ``_EstateEgress`` — a reviewed ``.redact`` projection the boundary trusts."""
+
+    @staticmethod
+    def redact(nodes: list[_RN]) -> list[_RN]:
+        return [_redact_node_tags(n) for n in nodes]
+
+
+_fake_estate_store = _FakeEstateStore()
+_fake_estate_egress = _FakeEstateEgress()
+
+
+def test_r17_raw_return_of_redaction_required_model_fails_closed() -> None:
+    app = FastAPI()
+
+    @app.get("/raw", response_model=list[_RN])
+    def raw() -> Any:
+        # Rides the model-wide ResourceNode.tags waiver but applies NO redaction — must FAIL.
+        return _fake_estate_store.get_estate("w")
+
+    # Waive the open-key-type ResourceNode.tags exactly like the real tree does.
+    auditor = AUDIT.Auditor({"ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    targets = [v.target for v in auditor.violations]
+    assert "GET /raw <unredacted egress>" in targets, targets
+
+
+def test_r17_sanitized_projection_passes() -> None:
+    app = FastAPI()
+
+    @app.get("/sanitized", response_model=list[_RN])
+    def sanitized() -> Any:
+        # Routes through the reviewed ``.redact`` projection (like ``_estate_egress.redact``) —
+        # must PASS.
+        return _fake_estate_egress.redact(_fake_estate_store.get_estate("w"))
+
+    auditor = AUDIT.Auditor({"ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert not any(v.target.startswith("GET /sanitized") for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r17_unredacted_egress_is_unwaivable() -> None:
+    # Even a route-scoped waiver cannot silence the raw-egress finding (a model-wide waiver must
+    # never hide a NEW unsanitized endpoint).
+    app = FastAPI()
+
+    @app.get("/raw2", response_model=list[_RN])
+    def raw2() -> Any:
+        return _fake_estate_store.get_estate("w")
+
+    auditor = AUDIT.Auditor(
+        {"ResourceNode.tags": "#91", "GET /raw2 <unredacted egress>": "#91"}
+    )
+    auditor.audit_app(app)
+    assert any(v.target == "GET /raw2 <unredacted egress>" for v in auditor.violations)
+
+
+def test_r17_real_tree_invariant_waivers_intact() -> None:
+    auditor = AUDIT.run_audit(_REPO_ROOT)
+    assert auditor.violations == []
+    assert len(auditor.waived) == 11
+
+
+# ======================================================================================
+# R18 (#91 R3, finding 3): the trusted-projection detector resolves calls to their EXACT reviewed
+# definitions (by identity / structural proof), so a DECOY ``.redact`` and a PARTIALLY-sanitized
+# collection FAIL, a genuinely-sanitized route PASSES, and the fail-closed redaction check runs even
+# when the route is covered by a route-level unbounded-mapping waiver. Synthetic.
+# ======================================================================================
+class _DecoyLog:
+    """A decoy whose ``redact`` is an IDENTITY wrapper — it sanitizes nothing."""
+
+    @staticmethod
+    def redact(value: Any) -> Any:
+        return value
+
+
+_decoy_log = _DecoyLog()
+
+
+class _FakeGraphResponse(BaseModel):
+    """Mirrors the real ``GraphResponse`` wrapper — a bounded model whose ``nodes`` field carries
+    the redaction-required ``ResourceNode`` surface."""
+
+    nodes: list[_RN]
+    graphRevision: int = 0
+
+
+def test_r18_decoy_redact_wrapper_fails() -> None:
+    app = FastAPI()
+
+    @app.get("/decoy", response_model=list[_RN])
+    def decoy() -> Any:
+        # A call named ``.redact`` that is NOT a reviewed projection (an identity decoy) must not be
+        # trusted merely because its simple name matches — must FAIL.
+        return _decoy_log.redact(_fake_estate_store.get_estate("w"))
+
+    auditor = AUDIT.Auditor({"ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert any(v.target == "GET /decoy <unredacted egress>" for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r18_partially_sanitized_collection_fails() -> None:
+    app = FastAPI()
+
+    @app.get("/partial", response_model=list[_RN])
+    def partial() -> Any:
+        # The first list is genuinely sanitized, but concatenating the RAW estate leaves unsanitized
+        # nodes in the returned collection — must FAIL (EVERY returned element must be sanitized).
+        return _fake_estate_egress.redact(
+            _fake_estate_store.get_estate("w")
+        ) + _fake_estate_store.get_estate("w")
+
+    auditor = AUDIT.Auditor({"ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert any(v.target == "GET /partial <unredacted egress>" for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r18_genuinely_sanitized_route_passes() -> None:
+    app = FastAPI()
+
+    @app.get("/clean", response_model=_FakeGraphResponse)
+    def clean() -> Any:
+        # Every ``ResourceNode`` in the wrapper's redaction-required ``nodes`` field flows through
+        # the reviewed ``redact_node_tags`` projection (mirrors the real ``get_graph``) — PASS.
+        return _FakeGraphResponse(
+            nodes=[_redact_node_tags(n) for n in _fake_estate_store.get_estate("w")],
+            graphRevision=1,
+        )
+
+    auditor = AUDIT.Auditor({"ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert not any(v.target.startswith("GET /clean") for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r18_redaction_check_runs_under_route_unbounded_waiver() -> None:
+    app = FastAPI()
+
+    @app.get("/mapping", response_model=dict[str, _RN])
+    def mapping() -> Any:
+        # The response_model is itself an unbounded mapping (a route-level unbounded waiver), yet a
+        # raw ``ResourceNode`` value must STILL be caught by the fail-closed redaction check.
+        return {"a": _fake_estate_store.get_estate("w")[0]}
+
+    auditor = AUDIT.Auditor({
+        "GET /mapping": "#91",  # route-level unbounded-mapping waiver
+        "ResourceNode.tags": "#91",
+    })
+    auditor.audit_app(app)
+    # The unbounded surface itself is waived...
+    assert any(k == "GET /mapping" for k, _i, _n in auditor.waived)
+    # ...but the redaction check STILL fires (unwaivable) even under the route-level waiver.
+    assert any(v.target == "GET /mapping <unredacted egress>" for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+# ======================================================================================
+# R18 (#91 R4, FIX 3): the constructor-sanitization check maps a redaction-required field to EVERY
+# accepted input name (its ``validation_alias`` / ``alias`` / ``AliasChoices`` members), so a
+# wrapper populated through a validation alias (``Model(items=raw_nodes)`` for field ``nodes``)
+# cannot smuggle RAW nodes past the field-name match. Synthetic.
+# ======================================================================================
+class _AliasedGraphResponse(BaseModel):
+    """A wrapper whose redaction-required ``nodes`` field is POPULATED via the ``items`` alias."""
+
+    nodes: list[_RN] = Field(validation_alias=AliasChoices("items", "nodes"))
+    graphRevision: int = 0
+
+
+def test_r18_aliased_field_raw_nodes_fails() -> None:
+    app = FastAPI()
+
+    @app.get("/aliased-raw", response_model=_AliasedGraphResponse)
+    def aliased_raw() -> Any:
+        # Field ``nodes`` populated through its ``items`` validation alias with RAW nodes — the
+        # audit must map ``items`` back to the redaction-required field and FAIL closed.
+        return _AliasedGraphResponse(items=_fake_estate_store.get_estate("w"), graphRevision=1)
+
+    auditor = AUDIT.Auditor({"ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert any(v.target == "GET /aliased-raw <unredacted egress>" for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r18_aliased_field_sanitized_passes() -> None:
+    app = FastAPI()
+
+    @app.get("/aliased-clean", response_model=_AliasedGraphResponse)
+    def aliased_clean() -> Any:
+        # Same alias, but every node flows through the reviewed ``redact_node_tags`` projection.
+        return _AliasedGraphResponse(
+            items=[_redact_node_tags(n) for n in _fake_estate_store.get_estate("w")],
+            graphRevision=1,
+        )
+
+    auditor = AUDIT.Auditor({"ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert not any(v.target.startswith("GET /aliased-clean") for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+# ======================================================================================
+# R18 (#91 R4, FIX 4): a ``response_model=None`` route still egresses whatever the handler returns.
+# The route-level "no response_model" flag is waivable, but a raw ResourceNode/ModuleRunResult
+# egress must NEVER ride a waiver — the fail-closed ``<unredacted egress>`` check runs even here.
+# Synthetic.
+# ======================================================================================
+def test_r18_response_model_none_raw_nodes_flagged_even_with_route_waiver() -> None:
+    app = FastAPI()
+
+    @app.get("/rawnone")
+    def rawnone() -> list[_RN]:
+        # No response_model; annotated return is redaction-required and NOT projected — must FAIL
+        # even though the route's no-response_model flag is waived.
+        return _fake_estate_store.get_estate("w")
+
+    auditor = AUDIT.Auditor({
+        "GET /rawnone": "#91",  # route-level "no response_model" waiver
+        "ResourceNode.tags": "#91",
+    })
+    auditor.audit_app(app)
+    assert any(v.target == "GET /rawnone <unredacted egress>" for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r18_response_model_none_sanitized_passes() -> None:
+    app = FastAPI()
+
+    @app.get("/cleannone")
+    def cleannone() -> list[_RN]:
+        # No response_model, but every node flows through the reviewed projection — PASS (only the
+        # waivable no-response_model flag remains).
+        return _fake_estate_egress.redact(_fake_estate_store.get_estate("w"))
+
+    auditor = AUDIT.Auditor({"GET /cleannone": "#91", "ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert not any(v.target.endswith("<unredacted egress>") for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r18_response_model_none_response_annotation_raw_nodes_flagged() -> None:
+    # R5 (issue #91): an opaque Response/JSONResponse return annotation on a response_model=None
+    # route must NOT let a raw redaction-required egress ride a route waiver — the unwaivable
+    # redaction check must still fire because a Response body is opaque to static type analysis.
+    app = FastAPI()
+
+    @app.get("/rawresp")
+    def rawresp() -> JSONResponse:  # Response subclass — was previously treated as "bounded"
+        return _fake_estate_store.get_estate("w")  # type: ignore[return-value]
+
+    auditor = AUDIT.Auditor({"GET /rawresp": "#91", "ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert any(v.target == "GET /rawresp <unredacted egress>" for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+def test_r18_response_model_none_response_annotation_sanitized_passes() -> None:
+    # Guards against the R5 fix over-flagging: a Response-annotated route whose body flows through
+    # the reviewed projection must still PASS (only the waivable no-response_model flag remains).
+    app = FastAPI()
+
+    @app.get("/cleanresp")
+    def cleanresp() -> JSONResponse:  # Response subclass, but data is projected
+        return _fake_estate_egress.redact(_fake_estate_store.get_estate("w"))  # type: ignore[return-value]
+
+    auditor = AUDIT.Auditor({"GET /cleanresp": "#91", "ResourceNode.tags": "#91"})
+    auditor.audit_app(app)
+    assert not any(v.target.endswith("<unredacted egress>") for v in auditor.violations), (
+        auditor.violations
+    )

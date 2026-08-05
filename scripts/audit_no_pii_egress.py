@@ -104,12 +104,14 @@ aliased-Response-subclass raw returns incl. attribute-bound aliases, dependency-
 raw/structured RETURN values (one level), and direct class-dependency ``__new__``/``__init__``
 constructors are COVERED, not residual.)
 
-Because genuine unbounded mappings (`ResourceNode.tags`, `ModuleRunResult.extra`, the count/label
-maps) and the raw-dict endpoints still exist in ``src/**`` and are tracked by **#91**, the
-corresponding HITRUST control is documented as **Partial** in
-``docs/compliance/hitrust-control-map.md`` — this audit prevents *new* PII-named or unbounded egress
-while those residual gaps are closed. (Opaque finding-ID value hardening is separately tracked by
-**#78**.)
+Because value-constrained unbounded mappings (`ResourceNode.tags`, `ModuleRunResult.extra`,
+`ImpactResult.states`, `ScaleTrigger.metadata`) still exist in ``src/**`` and are tracked by
+**#91**, the corresponding HITRUST control remains documented as **Partial** in
+``docs/compliance/hitrust-control-map.md`` — though issue #91 has since bounded every raw-dict
+endpoint (each now returns a typed ``response_model``) and the metrics label maps (projected onto
+the bounded ``MetricsSnapshotView`` at ``/api/metrics``), cutting the #91 waivers from 13 to 4.
+This audit prevents *new* PII-named or unbounded egress while those residual gaps are closed.
+(Opaque finding-ID value hardening is separately tracked by **#78**.)
 
 The audit imports the platform packages — run it with the repo installed (``pip install -e .`` — the
 CI ``compliance`` job does this) or ``PYTHONPATH=src``.
@@ -127,6 +129,7 @@ import argparse
 import ast
 import dataclasses
 import enum
+import functools
 import inspect
 import sys
 import textwrap
@@ -325,6 +328,241 @@ def iter_referenced_types(annotation: Any) -> list[Any]:
         for arg in get_args(member):
             found.extend(iter_referenced_types(arg))
     return found
+
+
+# Egress models whose static type is only PII-safe BECAUSE a reviewed egress projection redacts
+# their customer-controlled/-derived free-form surface (``ResourceNode.tags`` / ``ModuleRunResult
+# .extra``) before the boundary — the ``ResourceNode.tags`` / ``ModuleRunResult.extra`` waivers ride
+# on that projection actually running. A route whose response_model transitively contains one of
+# these MUST hand FastAPI a value produced by a trusted projection; a raw ``return store.get_estate
+# (...)`` bypasses redaction while riding the model-wide waiver, so it is failed closed.
+_REDACTION_REQUIRED_MODELS: frozenset[str] = frozenset({"ResourceNode", "ModuleRunResult"})
+
+# The human-readable names of the EXACT reviewed sanitizer projections (for the violation message
+# only). The ACTUAL trust decision is made by RESOLVING a call to its bound method/function and
+# matching that against the reviewed definitions (see ``_reviewed_projection_callables`` /
+# ``_call_is_trusted_projection``) — NOT by matching a simple attribute name, so a decoy
+# ``log.redact(...)`` cannot masquerade as ``_estate_egress.redact``. Keep in lockstep with
+# ``src/shared/contracts.py`` and ``src/api/app/main.py``.
+_TRUSTED_EGRESS_PROJECTIONS: frozenset[str] = frozenset(
+    {
+        "contracts.redact_tree", "contracts.redact_node_tags", "contracts.redact_value",
+        "_estate_egress.redact", "_redact_run_result_for_egress",
+    }
+)
+
+# Depth bound when resolving a projection WRAPPER (a ``.redact`` staticmethod / helper that itself
+# maps a canonical projection over its input) to prove it is trusted. Bounds mutual recursion.
+_MAX_PROJECTION_WRAPPER_DEPTH = 4
+
+
+@functools.lru_cache(maxsize=1)
+def _reviewed_projection_callables() -> frozenset:
+    """The EXACT reviewed egress-projection CALLABLES, resolved by identity (not by name).
+
+    The canonical leaf projections live in ``shared.contracts`` (``redact_tree`` /
+    ``redact_node_tags`` / ``redact_value``); the reviewed wrappers live in ``api.app.main``
+    (``_redact_run_result_for_egress`` and ``_EstateEgress.redact``). Resolved once and matched by
+    object identity so an import ALIAS (``from shared.contracts import redact_node_tags as _r``)
+    still resolves, while a same-named decoy defined elsewhere does NOT. Guarded: if a module cannot
+    be imported the set simply omits it (a wrapper is then re-proved structurally instead).
+    """
+    reviewed: set = set()
+    try:
+        from shared import contracts as _contracts
+
+        reviewed.update({_contracts.redact_tree, _contracts.redact_node_tags,
+                         _contracts.redact_value})
+    except Exception:  # noqa: BLE001,S110 — degrade gracefully; wrappers re-proved structurally.
+        pass
+    try:
+        from api.app import main as _main
+
+        reviewed.add(_main._redact_run_result_for_egress)
+        egress_redact = inspect.getattr_static(type(_main._estate_egress), "redact", None)
+        if isinstance(egress_redact, (staticmethod, classmethod)):
+            egress_redact = egress_redact.__func__
+        if egress_redact is not None:
+            reviewed.add(egress_redact)
+    except Exception:  # noqa: BLE001,S110 — degrade gracefully; wrappers re-proved structurally.
+        pass
+    return frozenset(reviewed)
+
+
+def _resolve_call_target(call: ast.Call, module_globals: Mapping[str, Any]) -> Any:
+    """Resolve a ``Call`` node's callee to its actual Python callable, or ``None`` if unresolvable.
+
+    A bare name resolves via ``module_globals``; an attribute call ``obj.attr(...)`` resolves
+    ``obj`` (a module → its member; an instance/class → the STATIC attribute on the class, so no
+    descriptor/property is triggered) and unwraps a ``staticmethod``/``classmethod``. Fail-closed:
+    anything that cannot be resolved (e.g. ``log.redact`` where ``log`` has no ``redact``) is
+    ``None`` and therefore NOT trusted.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        return module_globals.get(func.id)
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        base = module_globals.get(func.value.id)
+        if base is None:
+            return None
+        if isinstance(base, types.ModuleType):
+            return getattr(base, func.attr, None)
+        owner = base if isinstance(base, type) else type(base)
+        # FIX 5 (issue #91 R4): resolution is against the STATIC class attribute, so an instance
+        # monkeypatch (``_estate_egress.redact = lambda n: n``) is out of the static threat model —
+        # a source-edit attacker able to add that line is already inside the trust boundary and
+        # could edit the redaction body directly, so the static audit gains nothing by chasing it.
+        attr = inspect.getattr_static(owner, func.attr, None)
+        if isinstance(attr, (staticmethod, classmethod)):
+            attr = attr.__func__
+        return attr
+    return None
+
+
+def _call_is_trusted_projection(
+    call: ast.Call, module_globals: Mapping[str, Any], _depth: int = 0
+) -> bool:
+    """Whether ``call`` resolves to a reviewed egress projection (by identity) or a proven wrapper.
+
+    A call is trusted when it resolves to one of the EXACT reviewed callables
+    (:func:`_reviewed_projection_callables`), or — for a thin wrapper the reviewed set does not
+    contain (e.g. a ``.redact`` staticmethod that maps ``redact_node_tags`` over its input) — when
+    EVERY data-bearing ``return`` of the resolved function is itself fully sanitized. Bounded by
+    :data:`_MAX_PROJECTION_WRAPPER_DEPTH`. A decoy (``log.redact`` / an identity wrapper) resolves
+    to a non-reviewed callable whose returns are NOT fully sanitized → ``False``.
+    """
+    target = _resolve_call_target(call, module_globals)
+    if target is None:
+        return False
+    if target in _reviewed_projection_callables():
+        return True
+    if _depth >= _MAX_PROJECTION_WRAPPER_DEPTH:
+        return False
+    hfunc = _resolve_helper_func(target)
+    if hfunc is None:
+        return False
+    hglobals = getattr(target, "__globals__", {}) or {}
+    returns = _iter_returns(hfunc)
+    if not returns:
+        return False
+    return all(_return_fully_sanitized(r.value, hglobals, _depth + 1) for r in returns)
+
+
+def _model_constructor_fully_sanitized(
+    call: ast.Call, module_globals: Mapping[str, Any], _depth: int
+) -> bool:
+    """Whether a ``Model(...)`` constructor supplies fully-sanitized values for its
+    redaction-required fields (and is thus safe to egress).
+
+    Resolves the constructed class; a NON-model callable, positional args, or a ``**spread`` cannot
+    be mapped to fields and fail closed. Constructing a REDACTION-REQUIRED model directly (e.g.
+    ``ResourceNode(tags=...)`` / ``ModuleRunResult(extra=...)``) is NEVER sanitized — the raw
+    ``tags``/``extra`` it carries is exactly what must be redacted, so only a reviewed projection
+    (never a bare constructor) may produce one. For a wrapper model, each keyword whose FIELD type
+    transitively contains a redaction-required model must be fully sanitized; other fields are
+    irrelevant. This lets ``GraphResponse(nodes=[redact_node_tags(n) for n in ...], edges=...)``
+    pass while ``GraphResponse(nodes=raw_nodes, ...)`` and ``ResourceNode(tags=raw)`` fail.
+    """
+    if not isinstance(call.func, ast.Name):
+        return False
+    target = module_globals.get(call.func.id)
+    if not (isinstance(target, type) and issubclass(target, BaseModel)):
+        return False
+    if target.__name__ in _REDACTION_REQUIRED_MODELS:
+        return False
+    if call.args or any(kw.arg is None for kw in call.keywords):
+        return False
+    # A redaction-required field must be sanitized regardless of WHICH accepted input name the
+    # constructor uses — a validation alias (``validation_alias``/``alias``, incl. every
+    # ``AliasChoices`` member) lets ``Model(items=raw_nodes)`` populate field ``nodes``. Map every
+    # accepted input name back to the field's redaction requirement (fail-closed).
+    required: set[str] = set()
+    for name, info in target.model_fields.items():
+        if _REDACTION_REQUIRED_MODELS & _referenced_model_names(info.annotation):
+            required |= emitted_field_keys(name, info)
+    for kw in call.keywords:
+        if kw.arg in required and not _return_fully_sanitized(kw.value, module_globals, _depth):
+            return False
+    return True
+
+
+def _return_fully_sanitized(
+    value: ast.expr | None, module_globals: Mapping[str, Any], _depth: int = 0
+) -> bool:
+    """Whether the WHOLE returned value is provably free of unsanitized redaction-required data.
+
+    Default-deny/fail-closed: a value passes ONLY when every redaction-required part is proven to
+    flow through a reviewed projection. A trusted-projection call passes; a trivial/constant passes;
+    a literal collection / comprehension / dict / ternary / boolean / concatenation passes iff ALL
+    its data-bearing parts pass; a model constructor passes iff its redaction-required fields are
+    sanitized. Anything else — a bare ``return store.get_estate(...)``, a partially-sanitized
+    collection (one raw element / concatenated raw list), a decoy wrapper, an identity wrapper —
+    FAILS.
+    """
+    value = _unwrap_await(value)
+    if _is_trivial_return(value):
+        return True
+    if value is None:
+        return True
+    if isinstance(value, ast.Call):
+        if _call_is_trusted_projection(value, module_globals, _depth):
+            return True
+        return _model_constructor_fully_sanitized(value, module_globals, _depth)
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        return all(_return_fully_sanitized(e, module_globals, _depth) for e in value.elts)
+    if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return _return_fully_sanitized(value.elt, module_globals, _depth)
+    if isinstance(value, ast.DictComp):
+        return _return_fully_sanitized(value.value, module_globals, _depth)
+    if isinstance(value, ast.Dict):
+        # A ``**spread`` (key is None) injects unknown entries → fail closed.
+        return all(
+            k is not None and _return_fully_sanitized(v, module_globals, _depth)
+            for k, v in zip(value.keys, value.values, strict=False)
+        )
+    if isinstance(value, ast.IfExp):
+        return _return_fully_sanitized(
+            value.body, module_globals, _depth
+        ) and _return_fully_sanitized(value.orelse, module_globals, _depth)
+    if isinstance(value, ast.BoolOp):
+        return all(_return_fully_sanitized(v, module_globals, _depth) for v in value.values)
+    if isinstance(value, ast.BinOp):
+        return _return_fully_sanitized(
+            value.left, module_globals, _depth
+        ) and _return_fully_sanitized(value.right, module_globals, _depth)
+    return False
+
+
+def _referenced_model_names(annotation: Any, _seen: set[int] | None = None) -> set[str]:
+    """Every BaseModel name transitively reachable from ``annotation`` (through nested fields).
+
+    ``iter_referenced_types`` stops at the first model it meets (it does not descend into a model's
+    OWN fields); this walk continues into each model's ``model_fields`` so a ``ResourceNode`` buried
+    inside ``GraphResponse.nodes`` (or ``ModuleRunResult.estate``) is still discovered. Cycle-safe
+    via an id guard.
+    """
+    seen = _seen if _seen is not None else set()
+    names: set[str] = set()
+    for ref in iter_referenced_types(annotation):
+        if not (isinstance(ref, type) and issubclass(ref, BaseModel)) or id(ref) in seen:
+            continue
+        seen.add(id(ref))
+        names.add(ref.__name__)
+        for info in ref.model_fields.values():
+            names |= _referenced_model_names(info.annotation, seen)
+    return names
+
+
+def _is_trivial_return(value: ast.expr | None) -> bool:
+    """A return that carries no model data (so it needs no projection): ``None`` / empty literal."""
+    value = _unwrap_await(value)
+    if value is None or isinstance(value, ast.Constant):
+        return True
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        return not value.elts
+    if isinstance(value, ast.Dict):
+        return not value.keys
+    return False
 
 
 def _call_name(func: ast.expr) -> str | None:
@@ -1103,29 +1341,55 @@ class Violation:
 # free-form mappings & raw-dict endpoints); non-literal HTTPException error details are tracked by
 # **#96**; opaque finding-ID hardening is the separate **#78**.
 _DEFAULT_WAIVERS: dict[str, str] = {
-    # Free-form ``dict[str, ...]`` mapping fields on egress read models (unbounded emitted keys).
+    # Free-form ``dict[str, ...]`` mapping fields on egress read models whose KEY TYPE stays open
+    # (so the static type audit still flags them) but whose CONTENTS are DEFAULT-REDACTED at the API
+    # response boundary. ``ModuleRunResult.extra`` is heterogeneous internal module analysis output
+    # (nested dicts + lists + scalars across every module) and may carry customer-derived PII in any
+    # leaf OR mapping key, so the run endpoint recursively sanitizes the WHOLE ``extra`` tree via
+    # ``shared.contracts.redact_tree`` before egress (default-DENY): EVERY str/bytes/object leaf
+    # becomes ``[redacted]`` and every mapping KEY is redacted to a positional placeholder UNLESS it
+    # is an exact member of the platform/module schema allow-list ``PLATFORM_SAFE_STRUCTURAL_KEYS``
+    # (so a customer-/workload-derived key like ``extra.drift.<scope>`` is redacted) — only
+    # numbers/bools/None/enums pass through.
+    # ``ImpactResult.states`` maps graph node ids (not enumerable) to a bounded ``HealthState`` enum
+    # value — the same ids already egress via ``down``/``degraded``.
+    # ``ResourceNode.tags`` is customer-controlled Azure tag data: the API-egress projection (GET
+    # estate/graph and the run-result carrier) runs each node through ``redact_node_tags``, which
+    # DEFAULT-REDACTS (default-DENY) — every tag VALUE becomes ``[redacted]`` and every tag KEY
+    # becomes a positional placeholder unless its key is in the (currently empty)
+    # ``PLATFORM_SAFE_TAG_KEYS`` platform-owned allow-list, so a PII key (e.g. ``a@contoso.com``,
+    # or a "structurally valid" ``123-45-6789``) can never egress verbatim. The stored estate and
+    # the in-boundary copy used for internal module classification / impact analysis keep the raw
+    # keys and values. Each remains #91 because the RESPONSE MODEL TYPE (open key type) still reads
+    # as unbounded to the static audit; the handler-bypass detector additionally requires these
+    # routes to route EVERY returned redaction-required value through a reviewed egress projection
+    # (see ``_REDACTION_REQUIRED_MODELS`` / ``_return_fully_sanitized``), so a NEW raw endpoint,
+    # partially-sanitized collection, or decoy wrapper returning an unsanitized
+    # ``ResourceNode``/``ModuleRunResult`` FAILS (unwaivably, even under a route-level unbounded
+    # waiver) rather than riding this model-wide waiver. The metrics label maps are separately
+    # bounded on egress by the ``MetricsSnapshotView`` projection served at ``/api/metrics``
+    # (allow-listed keys + redacted values) so ``MetricSample.labels``/``DurationSample.labels`` no
+    # longer need a waiver.
     "ModuleRunResult.extra": "#91",
     "ImpactResult.states": "#91",
     "ResourceNode.tags": "#91",
-    "MetricSample.labels": "#91",
-    "DurationSample.labels": "#91",
-    # Endpoints that currently return an unbounded dict (aggregate acks / health / counts). Bounding
-    # these to typed schemas is tracked by #91.
-    "GET /api/health": "#91",
-    "GET /": "#91",
-    "GET /api/modules": "#91",
-    "POST /api/workloads/{workload}/results": "#91",
-    "POST /api/workloads/{workload}/estate": "#91",
-    "POST /api/workloads/{workload}/graph": "#91",
-    "POST /api/workloads/{workload}/findings": "#91",
-    "POST /api/workloads/{workload}/snapshot": "#91",
+    # ``ScaleTrigger.metadata`` is KEDA scaler config (scaler-specific keys, str values) surfaced
+    # transitively by typing ``GET /api/modules`` as ``list[ModuleManifest]``. It is infra config
+    # consumed by iac-deploy, not customer data; the value type is already bounded to ``str`` and
+    # the keys are scaler-defined (not enumerable). Tracked by #91 as a tightly-scoped field waiver
+    # (replaces the former endpoint-level ``GET /api/modules`` waiver — a precision improvement).
+    "ScaleTrigger.metadata": "#91",
     # Non-literal HTTPException ``detail`` on bounded routes: today the app raises a coerced
     # exception message (``str(exc)``) or an f-string naming the workload. These are bounded error
     # strings, but the detector fails closed on any non-literal detail; constant-ifying them
-    # src-side is tracked in **#96** (this compliance tooling must not edit src/**).
+    # src-side is tracked in **#96** (this compliance tooling must not edit src/**). The results/
+    # findings sites become visible now that those routes carry a bounded ``response_model`` (the
+    # detail check only runs for routes that declare one).
     "POST /api/modules/{name}/run <raise HTTPException detail>": "#96",
     "GET /api/workloads/{workload}/graph <raise HTTPException detail>": "#96",
     "GET /api/workloads/{workload}/impact <raise HTTPException detail>": "#96",
+    "POST /api/workloads/{workload}/results <raise HTTPException detail>": "#96",
+    "POST /api/workloads/{workload}/findings <raise HTTPException detail>": "#96",
 }
 
 _DICT_CONTRACTS: tuple[DictReturnContract, ...] = (
@@ -1419,6 +1683,41 @@ class Auditor:
         top = (getattr(module, "__name__", "") or "").split(".", 1)[0]
         return top in {"fastapi", "starlette"}
 
+    @staticmethod
+    def _endpoint_return_requires_redaction(endpoint: Any) -> bool:
+        """Whether a ``response_model=None`` route must run the fail-closed redaction check.
+
+        Resolve the handler's return annotation and decide (FIX 4, issue #91 R4):
+        * references a redaction-required model (``ResourceNode``/``ModuleRunResult``) → True;
+        * a ``Response``/``JSONResponse``/... subclass (an opaque already-serialized body that
+          bypasses ``response_model``) → True (fail closed — its payload is not statically knowable);
+        * unresolvable / absent / raw-or-unbounded (bare ``dict``/``list``, ``Any``, ...) → True
+          (fail closed — we cannot prove the payload is free of a redaction-required value);
+        * a resolvable, bounded, non-redaction annotation → False (no redaction check needed).
+        """
+        try:
+            hints = typing.get_type_hints(endpoint)
+        except Exception:  # noqa: BLE001 — unresolved return hint must fail closed, not skip.
+            return True
+        if "return" not in hints:
+            return True
+        ann = hints["return"]
+        if _REDACTION_REQUIRED_MODELS & _referenced_model_names(ann):
+            return True
+        # A Response/JSONResponse/StreamingResponse return hands FastAPI an ALREADY-SERIALIZED body
+        # that bypasses response_model; its payload is opaque to static type analysis, so it cannot
+        # be proven free of a redaction-required value → fail closed (issue #91 R5). ``Any``/
+        # ``object`` are already caught below by ``unbounded_egress_reason``.
+        for member in _iter_union_members(ann):
+            if isinstance(member, type) and any(
+                base.__name__ == "Response"
+                and (getattr(base, "__module__", "") or "").split(".", 1)[0]
+                in {"starlette", "fastapi"}
+                for base in getattr(member, "__mro__", ())
+            ):
+                return True
+        return unbounded_egress_reason(ann) is not None
+
     def _audit_api_route(self, route: Any, prefix: str = "") -> None:
         """Audit one FastAPI ``APIRoute``: response_model boundedness + handler-bypass check."""
         methods = ",".join(sorted(route.methods or []))
@@ -1436,6 +1735,17 @@ class Auditor:
             self._flag_unbounded(
                 label, "route declares no response_model (raw dict/Response egress)"
             )
+            # FIX 4 (issue #91 R4): a ``response_model=None`` route still egresses whatever the
+            # handler returns. The unbounded flag above is route-waivable, but a raw
+            # ResourceNode/ModuleRunResult egress must NEVER ride a waiver. Derive the redaction
+            # requirement from the handler's actual return annotation; an unknown/raw/Any return is
+            # not provably free of a redaction-required payload → fail closed (require redaction).
+            if self._endpoint_return_requires_redaction(route.endpoint):
+                for suffix, note, _unwaivable in self._handler_bypasses_model(
+                    route.endpoint, require_redaction=True, redaction_only=True
+                ):
+                    key = f"{label} {suffix}" if suffix else label
+                    self.violations.append(Violation(key, "dynamic", note))
             return
 
         route_unbounded = False
@@ -1448,13 +1758,29 @@ class Auditor:
 
         # A route that declares a bounded model but hands FastAPI a raw dict / Response bypasses
         # that model at runtime — the declared schema is NOT enforced. Fail closed.
+        require_redaction = any(
+            _REDACTION_REQUIRED_MODELS & _referenced_model_names(a) for a in annotations
+        )
         if not route_unbounded:
-            for suffix, note, unwaivable in self._handler_bypasses_model(route.endpoint):
+            for suffix, note, unwaivable in self._handler_bypasses_model(
+                route.endpoint, require_redaction=require_redaction
+            ):
                 key = f"{label} {suffix}" if suffix else label
                 if unwaivable:
                     self.violations.append(Violation(key, "dynamic", note))
                 else:
                     self._flag_unbounded(key, note)
+        elif require_redaction:
+            # The fail-closed redaction check must run EVEN when the response_model is structurally
+            # unbounded (and thus covered by a model-wide / route-level unbounded waiver) — an
+            # unsanitized ResourceNode/ModuleRunResult egress can never ride a waiver (issue #91 R3,
+            # finding 3). Only the unwaivable ``<unredacted egress>`` finding is produced here; the
+            # unbounded surface itself is already accounted for above via ``_flag_unbounded``.
+            for suffix, note, _unwaivable in self._handler_bypasses_model(
+                route.endpoint, require_redaction=True, redaction_only=True
+            ):
+                key = f"{label} {suffix}" if suffix else label
+                self.violations.append(Violation(key, "dynamic", note))
 
         # FastAPI resolves ``Depends(...)`` dependencies before the handler; a dependency that
         # raises HTTPException egresses its detail to the client exactly like the handler. Audit
@@ -1516,7 +1842,9 @@ class Auditor:
                     self.violations.append(Violation(key, "dynamic", note))
 
     @staticmethod
-    def _handler_bypasses_model(endpoint: Any) -> list[tuple[str, str, bool]]:
+    def _handler_bypasses_model(
+        endpoint: Any, *, require_redaction: bool = False, redaction_only: bool = False
+    ) -> list[tuple[str, str, bool]]:
         """Return ``(key-suffix, reason, unwaivable)`` findings iff a handler can emit a bad body.
 
         FastAPI serialises a handler's return value THROUGH the declared model *unless* the value is
@@ -1526,6 +1854,17 @@ class Auditor:
         level of module-level/global helper calls. Anything that cannot be proven to be a value
         FastAPI coerces through the bounded model is flagged (over-approximating: false-positives
         are waivable, false-negatives are not). Unreadable source ⇒ flagged.
+
+        When ``require_redaction`` is set (the route's response_model transitively contains a
+        :data:`_REDACTION_REQUIRED_MODELS` model whose free-form surface only survives the type
+        audit because a reviewed projection redacts it), EVERY returned redaction-required value
+        MUST flow through a reviewed egress projection (:func:`_return_fully_sanitized`); a raw
+        ``return store.get_estate(...)``, a partially-sanitized collection, or an identity/decoy
+        wrapper is failed closed (UNWAIVABLE) so it cannot ride the model-wide ``tags``/``extra``
+        ``ModuleRunResult.extra`` waiver. With ``redaction_only`` set, ONLY that fail-closed
+        redaction check runs (used when the route is otherwise already flagged unbounded, so the raw
+        dict/Response and raised-detail scans are skipped) — the redaction check itself is never
+        skipped.
         """
         try:
             source = textwrap.dedent(inspect.getsource(endpoint))
@@ -1686,10 +2025,38 @@ class Auditor:
             return out
 
         findings: list[tuple[str, str, bool]] = []
-        for stmt in _iter_returns(func):
-            if (reason := value_is_raw(stmt.value, resolve_helpers=True)) is not None:
-                findings.append(("", reason, False))
+        if not redaction_only:
+            for stmt in _iter_returns(func):
+                if (reason := value_is_raw(stmt.value, resolve_helpers=True)) is not None:
+                    findings.append(("", reason, False))
+                    break
+
+        # When the response_model carries a redaction-required model, a data-bearing return that
+        # does NOT fully flow through a reviewed egress projection would emit an unsanitized
+        # ``ResourceNode``/``ModuleRunResult`` while riding the model-wide ``ResourceNode.tags`` /
+        # ``ModuleRunResult.extra`` waiver. Fail CLOSED (unwaivable) so a NEW raw endpoint (e.g.
+        # ``return store.get_estate(...)``), a partially-sanitized collection, or a decoy/identity
+        # wrapper trips the audit rather than passing green. This check runs even under a
+        # route-level unbounded waiver (see ``_audit_api_route``); it is never skipped.
+        if require_redaction:
+            for stmt in _iter_returns(func):
+                if _is_trivial_return(stmt.value) or _return_fully_sanitized(
+                    stmt.value, module_globals
+                ):
+                    continue
+                findings.append((
+                    "<unredacted egress>",
+                    "handler returns a redaction-required model "
+                    f"({', '.join(sorted(_REDACTION_REQUIRED_MODELS))}) without routing every "
+                    "returned redaction-required value through a reviewed egress projection "
+                    f"({', '.join(sorted(_TRUSTED_EGRESS_PROJECTIONS))}) — customer-controlled "
+                    "tags/extra could egress unredacted (see issue #91)",
+                    True,
+                ))
                 break
+
+        if redaction_only:
+            return findings
 
         # A ``raise HTTPException(detail=...)`` in the handler body serialises ``detail`` into the
         # response body, bypassing the declared response_model. A scalar string-coercion detail is

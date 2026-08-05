@@ -10,10 +10,10 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from shared.audit import AuditEmitter, resolve_actor
 from shared.blast_radius import compute_impact, graph_revision
@@ -23,12 +23,15 @@ from shared.contracts import (
     DriftReport,
     Finding,
     HealthState,
-    MetricsSnapshot,
+    MetricsSnapshotView,
+    ModuleManifest,
     ModuleRunResult,
     ReadinessReport,
     ResourceNode,
     WorkloadGraph,
     is_audit_safe,
+    redact_node_tags,
+    redact_tree,
 )
 from shared.module_base import build_default_registry, run_module
 from shared.observability import (
@@ -245,8 +248,30 @@ PacksDep = Annotated[object | None, Depends(get_packs)]
 ClientsDep = Annotated[Mapping[str, object], Depends(get_clients)]
 
 
+class ModuleHealth(BaseModel):
+    """Bounded per-module liveness entry in the health payload (module id + fixed status)."""
+
+    module: str
+    status: str
+
+
+class HealthResponse(BaseModel):
+    """Bounded liveness response (issue #91): explicit fields, no free-form egress.
+
+    Preserves the exact shape the compose-smoke gate parses (``status``/``service``/``modules``)
+    plus the additive ``live``/``kind`` fields — now as a typed contract so the egress surface is
+    statically bounded instead of a raw ``dict``.
+    """
+
+    status: str
+    service: str
+    modules: list[ModuleHealth] = Field(default_factory=list)
+    live: bool
+    kind: str
+
+
 @app.get("/api/health")
-def health() -> dict[str, object]:
+def health() -> HealthResponse:
     """**Liveness** probe: true while the process is up; NEVER depends on external dependencies.
 
     Used by CI smoke and platform liveness probes. Its existing shape (``status``/``service``/
@@ -255,14 +280,17 @@ def health() -> dict[str, object]:
     process is serving) and ``kind`` (to distinguish it from the readiness endpoint). Readiness of
     dependencies lives at ``/api/health/ready`` so liveness can never be dragged down by a slow or
     unreachable dependency (which would cause an unnecessary restart loop).
+
+    The response is a bounded :class:`HealthResponse` contract (issue #91) rather than a raw dict,
+    so the egress surface is statically PII-free-and-bounded.
     """
-    return {
-        "status": "ok",
-        "service": "workloads-platform-api",
-        "modules": [m.health() for m in registry.enabled_modules()],
-        "live": True,
-        "kind": "liveness",
-    }
+    return HealthResponse(
+        status="ok",
+        service="workloads-platform-api",
+        modules=[ModuleHealth.model_validate(m.health()) for m in registry.enabled_modules()],
+        live=True,
+        kind="liveness",
+    )
 
 
 @dataclass
@@ -374,24 +402,71 @@ def _clients_probe(build_clients: Callable[[], Mapping[str, object]]) -> ProbeRe
 
 
 @app.get("/api/metrics")
-def get_metrics_snapshot(metrics: MetricsDep) -> MetricsSnapshot:
+def get_metrics_snapshot(metrics: MetricsDep) -> MetricsSnapshotView:
     """Read-only, vendor-neutral JSON snapshot of the in-process metrics registry.
 
-    Keyless and PII-free: labels are bounded, low-cardinality names (module name + outcome) with
-    numeric measures only — no resource ids, connection strings, or free text. This is deliberately
-    JSON (not Prometheus text) to stay vendor-neutral.
+    Keyless and PII-free: the raw registry accepts arbitrary label maps, so on egress the snapshot
+    is projected onto the bounded :class:`MetricsSnapshotView` (issue #91) — label KEYS are the
+    closed :class:`MetricLabelKey` allow-list (``module``/``outcome``) and every VALUE is coerced
+    through the platform sanitizer, dropping any unexpected label. In production only the sanctioned
+    low-cardinality labels are emitted, so this projection is loss-free for real traffic while
+    guaranteeing no free-form label can egress. Deliberately JSON (not Prometheus text) to stay
+    vendor-neutral.
     """
-    return metrics.snapshot()
+    return MetricsSnapshotView.from_snapshot(metrics.snapshot())
 
 
 @app.get("/api/modules")
-def list_modules() -> list[dict[str, object]]:
+def list_modules() -> list[ModuleManifest]:
     """Enumerate modules and their scale profiles (drives infra + the web console)."""
-    return [m.model_dump() for m in registry.manifests()]
+    return registry.manifests()
 
 
 class RunRequest(BaseModel):
     scope: dict[str, str] = {}
+
+
+class _EstateEgress:
+    """Egress projection for estate reads — redacts customer-controlled ``ResourceNode.tags``.
+
+    Exposed as a method (a reviewed sanitizer projection the response boundary trusts) so redaction
+    runs on the outbound copy while FastAPI still enforces the declared ``list[ResourceNode]``
+    response model. Each node is passed through :func:`~shared.contracts.redact_node_tags`, which
+    DEFAULT-REDACTS customer tags (default-deny): every tag VALUE becomes the redaction placeholder
+    and every tag KEY becomes a positional placeholder unless its key is platform-owned, so a PII
+    key can never egress. The stored estate and the in-process copy used for internal impact/graph
+    analysis keep their raw keys and values (issue #91).
+    """
+
+    @staticmethod
+    def redact(nodes: list[ResourceNode]) -> list[ResourceNode]:
+        return [redact_node_tags(node) for node in nodes]
+
+
+_estate_egress = _EstateEgress()
+
+
+def _redact_run_result_for_egress(result: ModuleRunResult) -> ModuleRunResult:
+    """Project a ``ModuleRunResult`` onto its egress shape (issue #91).
+
+    DEFAULT-REDACTS the two customer-controlled/customer-derived free-form surfaces before the
+    result crosses the HTTP response boundary: every ``ResourceNode.tags`` (in ``estate`` and in
+    ``graph.nodes``) is sanitized via :func:`~shared.contracts.redact_node_tags` (tag values
+    redacted, and tag keys redacted to positional placeholders unless the key is platform-owned),
+    and the nested ``extra`` structure is recursively sanitized via
+    :func:`~shared.contracts.redact_tree` (every string/bytes/object leaf redacted; only
+    numbers/bools/None/enums survive, and only exact platform/module schema keys survive while
+    customer-/workload-derived keys become placeholders). Applied to a COPY only — the result the
+    API persisted (``commit_run``) and any internal analysis keep raw values.
+    """
+    update: dict[str, Any] = {"extra": redact_tree(result.extra)}
+    if result.estate is not None:
+        update["estate"] = [redact_node_tags(n) for n in result.estate]
+    if result.graph is not None:
+        update["graph"] = result.graph.model_copy(
+            update={"nodes": [redact_node_tags(n) for n in result.graph.nodes]}
+        )
+    return result.model_copy(update=update)
 
 
 @app.post("/api/modules/{name}/run")
@@ -451,7 +526,7 @@ def run_module_endpoint(
                         audit, actor=actor, workload=workload, count=len(result.findings)
                     )
             ok = result.ok
-            return result
+            return _redact_run_result_for_egress(result)
         except ProvenanceError as exc:
             # Fail closed: an un-provenanced finding is rejected at the persistence gate; surface a
             # clean 422 (never a 500) and persist nothing. The run is still audited in ``finally``.
@@ -475,6 +550,21 @@ def run_module_endpoint(
 # commit itself is atomic (single transaction / manifest commit point), so even a mid-write error
 # leaves state unchanged.
 # --------------------------------------------------------------------------------------
+class PersistCounts(BaseModel):
+    """Bounded per-kind write counts returned by an atomic ``commit_run`` (issue #91)."""
+
+    estate: int = Field(ge=0)
+    graph: int = Field(ge=0)
+    findings: int = Field(ge=0)
+
+
+class ResultsResponse(BaseModel):
+    """Bounded response for the results-submit endpoint (workload id + per-kind counts)."""
+
+    workload: str
+    persisted: PersistCounts
+
+
 @app.post("/api/workloads/{workload}/results")
 def submit_results(
     workload: str,
@@ -482,7 +572,7 @@ def submit_results(
     request: Request,
     store: StoreDep,
     audit: AuditDep,
-) -> dict[str, object]:
+) -> ResultsResponse:
     """Accept a validated ``ModuleRunResult`` and persist estate/graph/findings atomically.
 
     This is how the compute-only ACA worker hands a completed run to the API (the single writer),
@@ -491,6 +581,8 @@ def submit_results(
     central provenance gate (an un-provenanced finding fails closed with a 422 and NOTHING is
     written); on success a PII-free ``finding.emitted`` event is also recorded. Auditing never
     blocks the write.
+
+    Returns a bounded :class:`ResultsResponse` (issue #91) rather than a raw dict.
     """
     actor = resolve_actor(request.headers)
     # Validate BOTH derived audit subjects (run.executed + finding.emitted) before any write, so a
@@ -509,21 +601,42 @@ def submit_results(
     )
     if result.findings:
         _emit_findings_persisted(audit, actor=actor, workload=workload, count=len(result.findings))
-    return {"workload": workload, "persisted": persisted}
+    return ResultsResponse(workload=workload, persisted=PersistCounts.model_validate(persisted))
+
+
+class EstateWriteResult(BaseModel):
+    """Bounded response for the estate-replace endpoint (count of persisted nodes)."""
+
+    count: int = Field(ge=0)
+
+
+class GraphWriteResult(BaseModel):
+    """Bounded response for the graph-replace endpoint (node + edge counts)."""
+
+    nodes: int = Field(ge=0)
+    edges: int = Field(ge=0)
+
+
+class FindingsWriteResult(BaseModel):
+    """Bounded response for the findings-upsert endpoint (count of upserted findings)."""
+
+    count: int = Field(ge=0)
 
 
 @app.post("/api/workloads/{workload}/estate")
-def put_estate(workload: str, nodes: list[ResourceNode], store: StoreDep) -> dict[str, int]:
+def put_estate(
+    workload: str, nodes: list[ResourceNode], store: StoreDep
+) -> EstateWriteResult:
     """Replace the persisted estate for ``workload``."""
     store.put_estate(workload, nodes)
-    return {"count": len(nodes)}
+    return EstateWriteResult(count=len(nodes))
 
 
 @app.post("/api/workloads/{workload}/graph")
-def put_graph(workload: str, graph: WorkloadGraph, store: StoreDep) -> dict[str, int]:
+def put_graph(workload: str, graph: WorkloadGraph, store: StoreDep) -> GraphWriteResult:
     """Replace the persisted dependency graph for ``workload``."""
     store.put_graph(workload, graph)
-    return {"nodes": len(graph.nodes), "edges": len(graph.edges)}
+    return GraphWriteResult(nodes=len(graph.nodes), edges=len(graph.edges))
 
 
 @app.post("/api/workloads/{workload}/findings")
@@ -533,13 +646,15 @@ def add_findings(
     request: Request,
     store: StoreDep,
     audit: AuditDep,
-) -> dict[str, int]:
+) -> FindingsWriteResult:
     """Upsert findings into the current set for ``workload``.
 
     Findings persist through the central provenance gate (issue #59): a finding without evidence /
     sourceReferences fails closed with a 422 and NOTHING is written on either backend. On a
     successful write a PII-free ``finding.emitted`` event (subject = ``<workload>#count=N``) is
     recorded to the append-only audit log; auditing never blocks the write.
+
+    Returns a bounded :class:`FindingsWriteResult` (issue #91) rather than a raw dict.
     """
     # Validate the exact derived finding.emitted subject before any write (fail closed).
     _require_auditable_findings_subject(workload, len(findings))
@@ -551,13 +666,19 @@ def add_findings(
         _emit_findings_persisted(
             audit, actor=resolve_actor(request.headers), workload=workload, count=len(findings)
         )
-    return {"count": len(findings)}
+    return FindingsWriteResult(count=len(findings))
+
+
+class SnapshotResult(BaseModel):
+    """Bounded response for the snapshot endpoint (the new snapshot's id)."""
+
+    snapshotId: str
 
 
 @app.post("/api/workloads/{workload}/snapshot")
-def snapshot(workload: str, store: StoreDep) -> dict[str, str]:
+def snapshot(workload: str, store: StoreDep) -> SnapshotResult:
     """Freeze the current findings into a point-in-time snapshot; return its id."""
-    return {"snapshotId": store.snapshot(workload)}
+    return SnapshotResult(snapshotId=store.snapshot(workload))
 
 
 # --------------------------------------------------------------------------------------
@@ -571,8 +692,15 @@ def list_workloads(store: StoreDep) -> list[str]:
 
 @app.get("/api/workloads/{workload}/estate")
 def get_estate(workload: str, store: StoreDep) -> list[ResourceNode]:
-    """Return the latest estate for ``workload`` (empty list if none)."""
-    return store.get_estate(workload)
+    """Return the latest estate for ``workload`` (empty list if none).
+
+    Customer-controlled ``ResourceNode.tags`` are DEFAULT-REDACTED at this egress projection via
+    :func:`~shared.contracts.redact_node_tags` (issue #91): every tag VALUE becomes the redaction
+    placeholder and every tag KEY becomes a positional placeholder unless its key is platform-owned,
+    so a PII key cannot egress. The stored estate and the in-process copy used for internal
+    impact/graph analysis keep the raw keys and values.
+    """
+    return _estate_egress.redact(store.get_estate(workload))
 
 
 class GraphResponse(WorkloadGraph):
@@ -592,12 +720,20 @@ class GraphResponse(WorkloadGraph):
 
 @app.get("/api/workloads/{workload}/graph")
 def get_graph(workload: str, store: StoreDep) -> GraphResponse:
-    """Return the latest dependency graph for ``workload`` + its revision (404 if none)."""
+    """Return the latest dependency graph for ``workload`` + its revision (404 if none).
+
+    Customer-controlled ``ResourceNode.tags`` on the graph nodes are DEFAULT-REDACTED at this egress
+    projection via :func:`~shared.contracts.redact_node_tags` (issue #91): tag values are redacted
+    and tag keys are redacted to positional placeholders unless the key is platform-owned. The
+    persisted graph and the revision (computed over the FULL raw topology) are unaffected.
+    """
     graph = store.get_graph(workload)
     if graph is None:
         raise HTTPException(status_code=404, detail=f"no graph for workload {workload!r}")
     return GraphResponse(
-        nodes=graph.nodes, edges=graph.edges, graphRevision=graph_revision(graph)
+        nodes=[redact_node_tags(n) for n in graph.nodes],
+        edges=graph.edges,
+        graphRevision=graph_revision(graph),
     )
 
 
@@ -694,6 +830,14 @@ def get_drift(workload: str, store: StoreDep) -> DriftReport:
     )
 
 
+class RootResponse(BaseModel):
+    """Bounded service-index response for ``GET /`` (fixed name + doc/health hrefs, issue #91)."""
+
+    name: str
+    docs: str
+    health: str
+
+
 @app.get("/")
-def root() -> dict[str, str]:
-    return {"name": "workloads-platform", "docs": "/docs", "health": "/api/health"}
+def root() -> RootResponse:
+    return RootResponse(name="workloads-platform", docs="/docs", health="/api/health")
