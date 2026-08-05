@@ -70,7 +70,16 @@ describe("FindingRow provenance", () => {
   });
 
   it("renders unknown pack provenance when packId/packVersion are null", () => {
-    render(<FindingRow finding={makeFinding({ packId: null, packVersion: null })} />);
+    render(
+      <FindingRow
+        finding={makeFinding({
+          provenance: "structural",
+          structuralKind: "spof",
+          packId: null,
+          packVersion: null,
+        })}
+      />,
+    );
     expect(screen.getByText("unknown@unknown")).toBeInTheDocument();
   });
 });

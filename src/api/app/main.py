@@ -656,6 +656,12 @@ def submit_results(
     # non-audit-safe module id or workload id can never persist state whose audit event is dropped.
     _require_auditable_run_subject(result.module)
     _require_auditable_findings_subject(workload, len(result.findings))
+    # TODO(human): This is the SECOND findings-ingestion path (see add_findings). Structural-
+    # provenance trust (issue #83) is enforced only by the contract-level module-emitter allowlist +
+    # persistence revalidation, which apply here too (commit_run funnels through the same Finding
+    # validator). But `result.module` / `Finding.module` are self-declared, so full enforcement
+    # needs PER-MODULE identities or a signed, module-bound submission capability — #64 + #79 as
+    # designed (a single shared worker identity) cannot distinguish modules. No auth logic here yet.
     try:
         persisted = store.commit_run(workload, result)
     except ProvenanceError as exc:
@@ -725,6 +731,19 @@ def add_findings(
     """
     # Validate the exact derived finding.emitted subject before any write (fail closed).
     _require_auditable_findings_subject(workload, len(findings))
+    # TODO(human): Structural-provenance trust (issue #83) is CURRENTLY enforced only by the
+    # module-emitter allowlist in shared.contracts (STRUCTURAL_FINDING_EMITTERS) — a defense-in-
+    # depth check that a structural/pack-less finding's self-declared `module` matches the single
+    # module authorized to emit that StructuralFindingKind (e.g. spof -> dependency_graph). This
+    # guards against an HONEST module mismatch but NOT a dishonest caller: `Finding.module` is
+    # self-declared. NOTE: findings are ingested via BOTH this path (POST /findings -> add_findings)
+    # AND POST /results (submit_results -> commit_run), so the self-declared-`module` gap applies to
+    # both; the contract-level module-binding + persistence revalidation cover both, but neither
+    # verifies the DECLARER. FULL enforcement requires PER-MODULE identities (NOT the single shared
+    # worker identity #79 currently provisions) OR a signed, module-bound submission capability —
+    # #64 (Entra auth) + #79 as currently designed are INSUFFICIENT, because they cannot distinguish
+    # `dependency_graph` from another module sharing the one worker identity. Do NOT add auth logic
+    # here until per-module identities or a module-bound capability exist.
     try:
         store.add_findings(workload, findings)
     except ProvenanceError as exc:

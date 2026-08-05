@@ -110,7 +110,8 @@ def test_estate_and_node_ids_5xx_raise_state_unavailable():
 # --------------------------------------------------------------------------------------
 def _failing_finding() -> Finding:
     return Finding(id="f1", module="quality_checks", title="zone", passed=False,
-                   severity=Severity.high, nodeId="vm1")
+                   severity=Severity.high, nodeId="vm1",
+                   packId="waf-reliability-baseline", packVersion="1.2.0")
 
 
 class _PrevFailingState:

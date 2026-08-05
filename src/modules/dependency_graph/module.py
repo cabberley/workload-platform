@@ -26,11 +26,13 @@ from shared.contracts import (
     ModuleManifest,
     ModuleRunResult,
     PackType,
+    ProvenanceKind,
     ResourceNode,
     ScaleProfile,
     ScaleTrigger,
     Severity,
     SourceReference,
+    StructuralFindingKind,
     WorkloadGraph,
 )
 from shared.module_base import Module, ModuleContext
@@ -108,7 +110,13 @@ def edges_from_backend_pool(lb_id: str, member_ids: list[str]) -> list[Dependenc
 
 
 def spof_findings(graph: WorkloadGraph, threshold: int = 1) -> list[Finding]:
-    """Emit a Finding for each node whose failure downs more than `threshold` nodes."""
+    """Emit a Finding for each node whose failure downs more than `threshold` nodes.
+
+    These are **structural** findings — computed by the platform from the dependency graph, not
+    derived from any signed pack — so they carry no ``packId``/``packVersion`` and are explicitly
+    marked ``provenance=structural`` with ``structuralKind=spof`` (issue #83). Evidence still cites
+    the resource id + blast radius (guardrail #8 / issue #59).
+    """
     findings: list[Finding] = []
     for node_id, radius in rank_spofs(graph):
         if radius < threshold:
@@ -127,6 +135,8 @@ def spof_findings(graph: WorkloadGraph, threshold: int = 1) -> list[Finding]:
                 severity=sev,
                 nodeId=node_id,
                 blastRadius=radius,
+                provenance=ProvenanceKind.structural,
+                structuralKind=StructuralFindingKind.spof,
                 evidence=[SourceReference(kind="resource", id=node_id,
                                           detail=f"blast radius = {radius}")],
                 detail=f"Failure of {node_id} takes down {radius} dependent node(s).",

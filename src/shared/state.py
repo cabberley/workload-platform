@@ -40,7 +40,7 @@ from shared.contracts import (
     ResourceNode,
     WorkloadGraph,
 )
-from shared.provenance import enforce_finding_provenance
+from shared.provenance import enforce_finding_provenance, revalidate_finding_provenance
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports, never needed at runtime
     from azure.data.tables import TableClient, TableServiceClient
@@ -523,6 +523,10 @@ class LocalStateStore:
         # provenance fails closed BEFORE any row is written, inside the caller's transaction, so the
         # whole write rolls back and NOTHING is persisted.
         enforce_finding_provenance(findings)
+        # Defense in depth (issue #83): also re-assert the pack-vs-structural provenance invariant
+        # at this durable boundary, so a finding that somehow reached persistence in an invalid
+        # provenance state (bypassing construction/assignment validation) is rejected fail-closed.
+        revalidate_finding_provenance(findings)
         now = _now_iso()
         rows = [
             (workload, finding.id, finding.module, finding.model_dump_json(), now)
@@ -845,6 +849,9 @@ class AzureStateStore:
         # blob is written, so neither the Azure nor the local backend can ever persist a finding
         # without evidence. Raising here (before the first ``_write_blob``) leaves storage intact.
         enforce_finding_provenance(findings)
+        # Defense in depth (issue #83): re-assert the pack-vs-structural provenance invariant at the
+        # durable boundary too, so an invalid-provenance finding is rejected before any blob write.
+        revalidate_finding_provenance(findings)
         scope = encode_storage_key(workload)
         last_error: Exception | None = None
         for _attempt in range(_MAX_COMMIT_RETRIES):

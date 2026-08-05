@@ -126,7 +126,8 @@ class FakeOpsPacks:
 
 def _failing(fid: str, severity: Severity, blast: int) -> Finding:
     return Finding(id=fid, module="quality_checks", title=f"check {fid}", passed=False,
-                   nodeId=f"/synthetic/{fid}", severity=severity, blastRadius=blast)
+                   nodeId=f"/synthetic/{fid}", severity=severity, blastRadius=blast,
+                   packId="waf-reliability-baseline", packVersion="1.2.0")
 
 
 def _ops_pack() -> FakePack:
@@ -186,7 +187,8 @@ def test_load_ops_routing_fails_closed_without_packs() -> None:
 def test_run_delivers_failing_finding_and_records_audit() -> None:
     failing = _failing("q1", Severity.medium, 6)  # -> escalates to critical -> "page"
     passing = Finding(id="q2", module="quality_checks", title="ok", passed=True,
-                      severity=Severity.info)
+                      severity=Severity.info,
+                      packId="waf-reliability-baseline", packVersion="1.2.0")
     state = FakeState({"epic": [failing, passing]})
     channel = FakeChannel()
     ctx = ModuleContext(state=state, clients={"notifier": channel},
@@ -263,7 +265,8 @@ def test_run_suppresses_none_route_without_sending() -> None:
 
 def test_run_fails_closed_without_notifier() -> None:
     failing = _failing("q1", Severity.high, 2)
-    passing = Finding(id="q2", module="quality_checks", title="ok", passed=True)
+    passing = Finding(id="q2", module="quality_checks", title="ok", passed=True,
+                      packId="waf-reliability-baseline", packVersion="1.2.0")
     state = FakeState({"epic": [failing, passing]})
     ctx = ModuleContext(state=state, clients={}, packs=FakeOpsPacks([_ops_pack()]))
 
@@ -292,7 +295,8 @@ def _egress_finding() -> Finding:
     # Mirrors the real quality_checks id format "{rule}::{node.id}" so the raw id embeds node.id.
     node = "/synthetic/rg/db-node-01"
     return Finding(id=f"require-tag::{node}", module="quality_checks", title="tag check",
-                   passed=False, nodeId=node, severity=Severity.medium, blastRadius=6)
+                   passed=False, nodeId=node, severity=Severity.medium, blastRadius=6,
+                   packId="waf-reliability-baseline", packVersion="1.2.0")
 
 
 def test_opaque_finding_id_is_deterministic_bounded_hex() -> None:

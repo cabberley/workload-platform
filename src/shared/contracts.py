@@ -13,7 +13,7 @@ from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _utcnow() -> datetime:
@@ -232,8 +232,69 @@ class Severity(StrEnum):
     critical = "critical"
 
 
+class ProvenanceKind(StrEnum):
+    """How a :class:`Finding` is attributed — the explicit provenance marker (guardrail #8, #83).
+
+    Distinguishes the two legitimate kinds of finding so provenance is a declared, enforced fact
+    rather than an implicit ``packId is None`` guess:
+
+    * ``pack`` — derived from a signed, versioned pack (Rule / Telemetry / …). MUST carry a
+      non-blank ``packId`` **and** ``packVersion`` (cite the pack + version).
+    * ``structural`` — computed by the platform itself from the estate / dependency graph (e.g. a
+      single-point-of-failure), so it legitimately has **no** pack. MUST name one of the
+      enumerated :class:`StructuralFindingKind` values, so pack-less findings are an explicit,
+      allowlisted set — never an accidental omission.
+    """
+
+    pack = "pack"
+    structural = "structural"
+
+
+class StructuralFindingKind(StrEnum):
+    """Allowlist of platform-computed (pack-less) finding kinds (guardrail #8, issue #83).
+
+    A structural finding is derived by the platform itself, not from any signed pack, so it carries
+    no ``packId`` / ``packVersion`` by design. Only these enumerated kinds may be marked
+    ``ProvenanceKind.structural``; every other finding must be pack-derived. Add a member here (and
+    to the ADR) when a genuinely new platform-internal finding kind is introduced — never widen the
+    set implicitly.
+    """
+
+    spof = "spof"  # dependency & blast-radius single point of failure (dependency_graph module)
+
+
+# Single source of truth (issue #83, guardrail #8): each structural finding kind is emitted by
+# exactly one platform module, so a structural/pack-less finding can only be attributed to the
+# module actually authorized to compute it. The ``_enforce_provenance`` validator rejects a
+# structural finding whose ``module`` does not match its kind's authorized emitter, AND rejects any
+# ``StructuralFindingKind`` missing from this map (fail closed — a new kind added without an emitter
+# mapping is invalid until wired in). NOTE (residual): ``Finding.module`` is *self-declared* on this
+# branch; binding it to an AUTHENTICATED per-component caller identity is the #64 (Entra auth) +
+# #79 (per-component identities) follow-up — see ADR 0013.
+STRUCTURAL_FINDING_EMITTERS: dict[StructuralFindingKind, str] = {
+    StructuralFindingKind.spof: "dependency_graph",
+}
+
+
 class Finding(BaseModel):
-    """A single PASS/FAIL/observation with provenance and blast-radius context."""
+    """A single PASS/FAIL/observation with provenance and blast-radius context.
+
+    Provenance is a **fail-closed, enforced invariant** (issue #83): a finding is valid ONLY if it
+    is either (a) ``provenance=pack`` with BOTH ``packId`` and ``packVersion`` present/non-blank, or
+    (b) ``provenance=structural`` naming an allowlisted :class:`StructuralFindingKind`. Neither
+    (missing pack id/version and not explicitly structural) raises at construction — no silent
+    default hides missing provenance. This complements issue #59's *evidence* guard
+    (``shared.provenance``): #59 requires each finding cite ≥1 attributable ``SourceReference``,
+    while #83 requires it declare and prove its pack-vs-structural attribution kind — the two are
+    orthogonal (a pack-derived finding can still fail the evidence guard, and vice-versa).
+
+    ``validate_assignment=True`` (issue #83): the provenance invariant is re-run on *every*
+    attribute assignment, not only at construction, so mutating a provenance field into an invalid
+    combination (e.g. ``finding.packId = None`` on a pack finding) raises immediately rather than
+    silently producing an invalid, persisted finding.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
 
     id: str
     module: str
@@ -243,10 +304,70 @@ class Finding(BaseModel):
     nodeId: str | None = None
     blastRadius: int = Field(default=0, description="Count of nodes that go down if nodeId fails")
     evidence: list[SourceReference] = Field(default_factory=list)
+    provenance: ProvenanceKind = Field(
+        default=ProvenanceKind.pack,
+        description="Explicit attribution marker: pack-derived (default) or structural/derived.",
+    )
     packId: str | None = None
     packVersion: str | None = None
+    structuralKind: StructuralFindingKind | None = Field(
+        default=None,
+        description="Set (from the allowlist) iff provenance=structural; None for pack findings.",
+    )
     detail: str | None = None
     createdAt: datetime = Field(default_factory=_utcnow)
+
+    @model_validator(mode="after")
+    def _enforce_provenance(self) -> Finding:
+        """Fail closed unless provenance is complete (pack id+version) or explicitly structural."""
+        if self.provenance is ProvenanceKind.pack:
+            if not (self.packId and self.packId.strip()):
+                raise ValueError(
+                    f"pack-derived Finding {self.id!r} must carry a non-blank packId "
+                    "(guardrail #8: cite the pack + version); mark it structural if it is "
+                    "platform-computed"
+                )
+            if not (self.packVersion and self.packVersion.strip()):
+                raise ValueError(
+                    f"pack-derived Finding {self.id!r} must carry a non-blank packVersion "
+                    "(guardrail #8: cite the pack + version)"
+                )
+            if self.structuralKind is not None:
+                raise ValueError(
+                    f"pack-derived Finding {self.id!r} must not declare a structuralKind"
+                )
+        else:  # ProvenanceKind.structural
+            if self.structuralKind is None:
+                raise ValueError(
+                    f"structural Finding {self.id!r} must name an allowlisted structuralKind "
+                    f"(one of {[k.value for k in StructuralFindingKind]}); a pack-less finding "
+                    "must be an explicit, enumerated platform-internal kind"
+                )
+            if self.packId is not None or self.packVersion is not None:
+                raise ValueError(
+                    f"structural Finding {self.id!r} must not carry packId/packVersion "
+                    "(it is platform-computed, not pack-derived); both must be exactly None, "
+                    "not merely blank"
+                )
+            authorized_emitter = STRUCTURAL_FINDING_EMITTERS.get(self.structuralKind)
+            if authorized_emitter is None:
+                # Fail closed: a StructuralFindingKind with no authorized-emitter mapping is not
+                # yet a legitimate structural kind (adding a kind without wiring its emitter must
+                # never silently pass). Keep STRUCTURAL_FINDING_EMITTERS exhaustive.
+                raise ValueError(
+                    f"structural Finding {self.id!r} declares structuralKind "
+                    f"{self.structuralKind.value!r}, which has no authorized emitter module "
+                    "(guardrail #8: pack-less structural findings must map to an authorized "
+                    "platform emitter); refusing to accept (fail closed)"
+                )
+            if self.module != authorized_emitter:
+                raise ValueError(
+                    f"structural Finding {self.id!r} of kind {self.structuralKind.value!r} may "
+                    f"only be emitted by module {authorized_emitter!r}, not {self.module!r} "
+                    "(guardrail #8: structural provenance is bound to its authorized emitter); "
+                    "refusing to accept (fail closed)"
+                )
+        return self
 
 
 class WorkloadGraph(BaseModel):

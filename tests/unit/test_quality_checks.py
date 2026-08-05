@@ -94,7 +94,8 @@ def _vm(node_id: str, *, tags: dict[str, str] | None = None) -> ResourceNode:
 def test_evaluate_rule_passes_when_required_tag_present():
     node = _vm("vm-pass", tags={"availability-zone": "1"})
     rule = {"id": "r1", "title": "zone", "resourceType": VM_TYPE,
-            "requiredTag": "availability-zone", "severity": "high"}
+            "requiredTag": "availability-zone", "severity": "high",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is True
@@ -104,7 +105,8 @@ def test_evaluate_rule_passes_when_required_tag_present():
 def test_evaluate_rule_fails_closed_on_missing_tag():
     node = _vm("vm-fail")
     rule = {"id": "r1", "title": "zone", "resourceType": VM_TYPE,
-            "requiredTag": "availability-zone", "severity": "high"}
+            "requiredTag": "availability-zone", "severity": "high",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is False
@@ -121,7 +123,8 @@ def test_evaluate_rule_not_applicable_by_type_returns_none():
 def test_evaluate_rule_fails_closed_when_no_recognized_predicate():
     # Rule matches the node type but declares no supported predicate → must NOT silent-PASS.
     node = _vm("vm-x", tags={"availability-zone": "1"})
-    rule = {"id": "r-nopred", "title": "no predicate", "resourceType": VM_TYPE, "severity": "low"}
+    rule = {"id": "r-nopred", "title": "no predicate", "resourceType": VM_TYPE, "severity": "low",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is False
@@ -132,7 +135,8 @@ def test_evaluate_rule_fails_closed_when_no_recognized_predicate():
 def test_evaluate_rule_invalid_severity_does_not_crash():
     node = _vm("vm-bad")
     rule = {"id": "r1", "resourceType": VM_TYPE, "requiredTag": "availability-zone",
-            "severity": "not-a-severity"}
+            "severity": "not-a-severity",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is False
@@ -144,7 +148,8 @@ def test_evaluate_rule_non_scalar_severity_does_not_crash():
     node = _vm("vm-bad")
     for bad in (["high"], {"x": 1}, 3, True):
         rule = {"id": "r1", "resourceType": VM_TYPE, "requiredTag": "availability-zone",
-                "severity": bad}
+                "severity": bad,
+                "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
         finding = evaluate_rule(node, rule)
         assert finding is not None
         assert finding.severity == Severity.medium  # safe default, no crash

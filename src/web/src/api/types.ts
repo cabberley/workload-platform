@@ -105,8 +105,13 @@ export type SourceReference = {
 /**
  * Mirrors `contracts.Finding`. `passed` is tri-state (`null` = unknown, treated as NOT a failure —
  * fail-closed). `nodeId`, `packId`, `packVersion`, `detail` are nullable-but-present; `createdAt`
- * is an ISO-8601 datetime string.
+ * is an ISO-8601 datetime string. `provenance` is the explicit pack-vs-structural attribution
+ * marker (issue #83): a `pack` finding carries `packId`+`packVersion`; a `structural` finding names
+ * a `structuralKind` and has null pack id/version.
  */
+export type ProvenanceKind = "pack" | "structural";
+export type StructuralFindingKind = "spof";
+
 export type Finding = {
   id: string;
   module: string;
@@ -116,8 +121,10 @@ export type Finding = {
   nodeId: string | null;
   blastRadius: number;
   evidence: SourceReference[];
+  provenance: ProvenanceKind;
   packId: string | null;
   packVersion: string | null;
+  structuralKind: StructuralFindingKind | null;
   detail: string | null;
   createdAt: string;
 };
