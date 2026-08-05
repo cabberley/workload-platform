@@ -76,6 +76,7 @@ def _finding_with_evidence(fid: str = "q1") -> Finding:
     return Finding(
         id=fid, module="quality_checks", title=fid, passed=False, severity=Severity.high,
         evidence=[SourceReference(kind="resource", id=f"node-{fid}")],
+        packId="waf-reliability-baseline", packVersion="1.2.0",
     )
 
 
@@ -439,12 +440,16 @@ def test_azure_store_satisfies_audit_sink() -> None:
 # --------------------------------------------------------------------------------------
 def test_finding_has_provenance() -> None:
     assert finding_has_provenance(_finding_with_evidence())
-    naked = Finding(id="x", module="quality_checks", title="x", passed=False)
+    # #83-valid (pack-derived) yet evidence-empty: exercises the orthogonal #59 evidence guard.
+    naked = Finding(id="x", module="quality_checks", title="x", passed=False,
+                    packId="waf-reliability-baseline", packVersion="1.2.0")
     assert not finding_has_provenance(naked)
 
 
 def test_enforce_provenance_raises_on_missing_evidence() -> None:
-    naked = Finding(id="x", module="quality_checks", title="x", passed=False)
+    # #83-valid (pack-derived) yet evidence-empty: exercises the orthogonal #59 evidence guard.
+    naked = Finding(id="x", module="quality_checks", title="x", passed=False,
+                    packId="waf-reliability-baseline", packVersion="1.2.0")
     with pytest.raises(ProvenanceError):
         enforce_finding_provenance([naked])
     # A finding WITH evidence passes cleanly.
@@ -464,7 +469,8 @@ class _EvidencelessModule(Module):
 
     def run(self, ctx: ModuleContext, *, scope: dict[str, str] | None = None) -> ModuleRunResult:
         finding = _finding_with_evidence() if self._evidence else Finding(
-            id="x", module="quality_checks", title="x", passed=False)
+            id="x", module="quality_checks", title="x", passed=False,
+            packId="waf-reliability-baseline", packVersion="1.2.0")
         return ModuleRunResult(module="quality_checks", ok=True, findings=[finding])
 
 
@@ -925,7 +931,9 @@ def test_verify_detects_truncated_tail(store: LocalStateStore) -> None:
 # HIGH-1 — central provenance gate: no un-provenanced finding persists on EITHER backend.
 # --------------------------------------------------------------------------------------
 def _naked_finding(fid: str = "np1") -> Finding:
-    return Finding(id=fid, module="quality_checks", title=fid, passed=False)
+    # #83-valid (pack-derived) yet evidence-empty: exercises the orthogonal #59 evidence guard.
+    return Finding(id=fid, module="quality_checks", title=fid, passed=False,
+                   packId="waf-reliability-baseline", packVersion="1.2.0")
 
 
 def test_local_add_findings_rejects_missing_provenance(store: LocalStateStore) -> None:
@@ -1130,6 +1138,7 @@ def _finding_with_ref(kind: str, ref_id: str, fid: str = "e1") -> Finding:
     return Finding(
         id=fid, module="quality_checks", title=fid, passed=False,
         evidence=[SourceReference(kind=kind, id=ref_id)],
+        packId="waf-reliability-baseline", packVersion="1.2.0",
     )
 
 

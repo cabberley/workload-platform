@@ -41,6 +41,7 @@ def _finding(node_id: str, *, metric: str = "latency_ms") -> Finding:
         severity=Severity.high,
         nodeId=node_id,
         evidence=[SourceReference(kind="metric", id=metric, detail=f"breach at {node_id}")],
+        packId="telemetry-baseline", packVersion="1.0.0",
     )
 
 
@@ -54,6 +55,7 @@ def _unlocalized_finding() -> Finding:
         severity=Severity.high,
         nodeId=None,
         evidence=[SourceReference(kind="metric", id="orphan_metric", detail="no node")],
+        packId="telemetry-baseline", packVersion="1.0.0",
     )
 
 

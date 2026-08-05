@@ -332,7 +332,8 @@ def test_finding_id_namespaces_provably_disjoint() -> None:
 
     legacy = detect_metric_breach(
         {"name": "win::cpu", "value": 10, "op": "gt", "threshold": 1,
-         "nodeId": _NODE, "severity": "high"}
+         "nodeId": _NODE, "severity": "high",
+         "packId": "demo-pack", "packVersion": "1.0.0"}
     )
     assert legacy is not None
     det = _one_detector(_signal(name="cpu", op="gt", threshold=1, window={"samples": 1}))

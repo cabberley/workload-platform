@@ -173,6 +173,7 @@ def test_api_state_reader_roundtrips_full_readable_state(wired):
     findings = [
         {"id": "f1", "module": "quality_checks", "title": "t", "passed": False,
          "severity": "high", "nodeId": "vm1",
+         "packId": "waf-reliability-baseline", "packVersion": "1.2.0",
          "evidence": [{"kind": "resource", "id": "vm1"}]}
     ]
     assert client.post("/api/workloads/epic/findings", json=findings).status_code == 200
@@ -187,6 +188,49 @@ def test_api_state_reader_roundtrips_full_readable_state(wired):
     assert [f.id for f in reader.get_findings("epic", module="quality_checks")] == ["f1"]
     assert [f.id for f in reader.get_previous_findings("epic")] == ["f1"]
     assert reader.get_previous_node_ids("epic") == ["vm1"]
+
+
+def test_api_rejects_structural_finding_carrying_blank_pack_id(wired):
+    # FIX A (issue #83): a structural finding must have NO pack identity at all. A blank
+    # (whitespace) packId is still pack identity — the API must fail closed with 422, never persist.
+    client, _packs, _clients, _store = wired
+    findings = [
+        {"id": "s1", "module": "dependency_graph", "title": "spof", "passed": False,
+         "severity": "high", "nodeId": "vm1", "provenance": "structural",
+         "structuralKind": "spof", "packId": "   ",
+         "evidence": [{"kind": "resource", "id": "vm1"}]}
+    ]
+    assert client.post("/api/workloads/epic/findings", json=findings).status_code == 422
+    # Nothing persisted — fail closed leaves storage untouched.
+    assert client.get("/api/workloads/epic/findings").json() == []
+
+
+def test_api_rejects_structural_finding_from_unauthorized_module(wired):
+    # FIX C (issue #83, guardrail #8): a structural/spof finding may only be emitted by its
+    # authorized module (dependency_graph). A caller declaring a different module must fail closed
+    # with 422 — it cannot mint a packless "critical" finding to bypass pack citation.
+    client, _packs, _clients, _store = wired
+    findings = [
+        {"id": "spof::vm1", "module": "quality_checks", "title": "spof", "passed": False,
+         "severity": "critical", "nodeId": "vm1", "provenance": "structural",
+         "structuralKind": "spof",
+         "evidence": [{"kind": "resource", "id": "vm1"}]}
+    ]
+    assert client.post("/api/workloads/epic/findings", json=findings).status_code == 422
+    assert client.get("/api/workloads/epic/findings").json() == []
+
+
+def test_api_accepts_structural_finding_from_authorized_module(wired):
+    # The same structural/spof finding from the authorized emitter module persists (200).
+    client, _packs, _clients, _store = wired
+    findings = [
+        {"id": "spof::vm1", "module": "dependency_graph", "title": "spof", "passed": False,
+         "severity": "critical", "nodeId": "vm1", "provenance": "structural",
+         "structuralKind": "spof",
+         "evidence": [{"kind": "resource", "id": "vm1"}]}
+    ]
+    assert client.post("/api/workloads/epic/findings", json=findings).status_code == 200
+    assert [f["id"] for f in client.get("/api/workloads/epic/findings").json()] == ["spof::vm1"]
 
 
 def test_api_state_reader_fails_closed_on_unknown_workload(wired):
@@ -236,6 +280,7 @@ def test_write_endpoints_return_bounded_count_schemas(wired):
     findings = [
         {"id": "f1", "module": "quality_checks", "title": "t", "passed": False,
          "severity": "high", "nodeId": "vm1",
+         "packId": "waf-reliability-baseline", "packVersion": "1.2.0",
          "evidence": [{"kind": "resource", "id": "vm1"}]}
     ]
     findings_resp = client.post("/api/workloads/epic/findings", json=findings)

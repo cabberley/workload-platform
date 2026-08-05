@@ -28,7 +28,14 @@ from modules.telemetry_export.shaping import (
     shape_spofs,
 )
 from shared.connectors import FetchResult
-from shared.contracts import Finding, HealthState, ResourceNode, Severity
+from shared.contracts import (
+    Finding,
+    HealthState,
+    ProvenanceKind,
+    ResourceNode,
+    Severity,
+    StructuralFindingKind,
+)
 from shared.module_base import ModuleContext
 
 _AT = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -56,6 +63,8 @@ def _finding(
         severity=severity,
         nodeId=node_id,
         blastRadius=blast_radius,
+        provenance=ProvenanceKind.structural,
+        structuralKind=StructuralFindingKind.spof,
         createdAt=_AT,
     )
 

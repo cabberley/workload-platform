@@ -84,8 +84,13 @@ def _encode_id_component(text: object) -> str:
 def detect_metric_breach(signal: dict) -> Finding | None:
     """Pure threshold detection for one telemetry signal.
 
-    signal = {name, value, op ('gt'|'lt'), threshold, nodeId, severity}
+    signal = {name, value, op ('gt'|'lt'), threshold, nodeId, severity, packId, packVersion}
     Fail-closed: a malformed signal returns None (surfaced upstream), never a silent pass.
+
+    A telemetry detection is **pack-derived**, so the finding carries its source pack's
+    ``packId``/``packVersion`` (guardrail #8 / issue #83). These are threaded in from the rule that
+    produced the detection (see ``_breach_input``); the pack-provenance invariant on ``Finding``
+    fails closed at construction if they are absent.
     """
     required = {"name", "value", "op", "threshold"}
     if not required.issubset(signal):
@@ -96,6 +101,8 @@ def detect_metric_breach(signal: dict) -> Finding | None:
     breached = value > threshold if op == "gt" else value < threshold
     if not breached:
         return None
+    pack_id = str(signal.get("packId") or "")
+    pack_version = str(signal.get("packVersion") or "")
     return Finding(
         id=f"detect::{_encode_id_component(signal['name'])}::"
         f"{_encode_id_component(signal.get('nodeId', 'na'))}",
@@ -106,6 +113,8 @@ def detect_metric_breach(signal: dict) -> Finding | None:
         nodeId=signal.get("nodeId"),
         evidence=[SourceReference(kind="metric", id=signal["name"],
                                   detail=f"{signal['value']} {op} {signal['threshold']}")],
+        packId=pack_id or None,
+        packVersion=pack_version or None,
         detail="Proactive detection from telemetry pack threshold.",
     )
 
@@ -489,7 +498,11 @@ def fuse_detections(
 
 
 def _breach_input(rule: dict[str, Any], signal: Signal, node_id: str) -> dict[str, Any]:
-    """Build the ``detect_metric_breach`` input for one rule × observation on a canonical node."""
+    """Build the ``detect_metric_breach`` input for one rule × observation on a canonical node.
+
+    Threads the rule's pack provenance (``packId``/``packVersion``) so the constructed detection is
+    a valid pack-derived ``Finding`` (issue #83) rather than failing the pack-provenance invariant.
+    """
     return {
         "name": rule["name"],
         "value": signal.value,
@@ -497,6 +510,8 @@ def _breach_input(rule: dict[str, Any], signal: Signal, node_id: str) -> dict[st
         "threshold": rule["threshold"],
         "nodeId": node_id,  # canonical estate id, not the raw signal casing
         "severity": rule["severity"],
+        "packId": rule.get("packId"),
+        "packVersion": rule.get("packVersion"),
     }
 
 
@@ -618,8 +633,8 @@ def _merge_candidates(
         for source_id in ordered_sources
     ]
     finding.evidence = list(finding.evidence) + pack_refs + connector_refs
-    finding.packId = winner_rule["packId"]
-    finding.packVersion = winner_rule["packVersion"]
+    # packId/packVersion are already set at construction from ``winner_rule`` via ``_breach_input``
+    # (issue #83), so no post-hoc reassignment is needed here.
     if len(contributing) > 1:
         finding.detail = (
             f"{finding.detail} Merged from {len(contributing)} telemetry packs; "

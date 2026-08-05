@@ -78,6 +78,7 @@ def _finding(fid: str, module: str, *, passed: bool | None) -> Finding:
     return Finding(
         id=fid, module=module, title=fid, passed=passed, severity=Severity.high,
         evidence=[SourceReference(kind="resource", id=f"node-{fid}")],
+        packId="waf-reliability-baseline", packVersion="1.2.0",
     )
 
 

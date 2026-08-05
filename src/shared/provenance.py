@@ -58,3 +58,21 @@ def enforce_finding_provenance(findings: Iterable[Finding]) -> None:
                 f"Finding {finding.id!r} from module {finding.module!r} has no attributable "
                 "sourceReferences (provenance); refusing to emit (fail closed)"
             )
+
+
+def revalidate_finding_provenance(findings: Iterable[Finding]) -> None:
+    """Re-run the :class:`Finding` pack-vs-structural invariant at a persistence boundary (#83).
+
+    Defense in depth: ``Finding`` enforces its provenance invariant in a construction-time
+    ``model_validator``, and ``validate_assignment=True`` re-runs it on attribute mutation. This is
+    a belt-and-braces re-check at the durable-write boundary — even if a finding somehow reached
+    persistence in an invalid provenance state (e.g. built via ``model_construct`` which bypasses
+    validation, or an attribute forced through ``__dict__``), we reject it here fail-closed,
+    consistent with the evidence gate in :func:`enforce_finding_provenance`. Re-validating the
+    round-tripped ``model_dump()`` re-executes ``_enforce_provenance``; on a violation Pydantic
+    raises (a :class:`pydantic.ValidationError`) so the whole write rolls back and NOTHING is
+    persisted.
+    """
+    for finding in findings:
+        Finding.model_validate(finding.model_dump())
+

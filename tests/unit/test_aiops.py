@@ -292,7 +292,8 @@ def test_fuse_unknown_role_selects_nothing() -> None:
 def _detection(node_id: str) -> Finding:
     return detect_metric_breach(
         {"name": "odb_latency_ms", "value": 512.0, "op": "gt",
-         "threshold": 500.0, "nodeId": node_id, "severity": "high"}
+         "threshold": 500.0, "nodeId": node_id, "severity": "high",
+         "packId": "telemetry-baseline", "packVersion": "1.0.0"}
     )  # type: ignore[return-value]
 
 
