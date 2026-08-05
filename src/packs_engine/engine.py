@@ -4,7 +4,7 @@ Packs are the only inbound artifact (content, not code). This engine is the trus
 it computes SHA-256 over pack content and verifies the HMAC signature **before** a pack is
 allowed to execute. Unknown/invalid signature => fail closed (refuse).
 
-## Two independent, separately-documented trust gates
+## Trust gates
 
 1. **Legacy HMAC (symmetric)** — :func:`verify` checks the body-only ``sha256`` and an HMAC over it
    using an injected ``signing_secret`` (Key Vault at the boundary). Active when a secret is set and
@@ -13,10 +13,22 @@ allowed to execute. Unknown/invalid signature => fail closed (refuse).
    injected, each pack's :attr:`~shared.contracts.PackManifest.pack_signature` is verified against
    the pack's *canonical bytes* via :func:`shared.signing.verify_pack`. A missing or invalid
    detached signature fails closed (:class:`PackVerificationError`).
+3. **Trust-root import admission + runtime re-verification (issue #89)** —
+   :meth:`PacksEngine.verify_pack_for_import` is the customer-side, verification-only, **keyless**
+   trust root for IMPORTED packs. Microsoft signs packs OFFLINE; this platform only verifies,
+   selecting a pinned Ed25519 **PUBLIC** key from a trust bundle
+   (:class:`~shared.signing.PackVerifier`) by the signature's ``key_id``. The import/assign
+   subsystem (#37) calls it BEFORE a pack enters the registry/content store (#44). **R2
+   (defence-in-depth):** :meth:`PacksEngine._resolve_imported_packs` no longer trusts the recorded
+   digest transitively — it INDEPENDENTLY re-verifies each imported pack's persisted detached
+   signature against the SAME pinned bundle at load time (digest match is integrity, not trust), so
+   a legacy/pre-fix or attacker-crafted ``dist`` that recorded a digest without a pinned-verified
+   signature is rejected fail-closed. Fail-closed everywhere: unknown key id / empty bundle / bad
+   signature / signature-less legacy entry / no trust root wired => reject.
 
-The two gates are deliberately kept separate: HMAC is a body-integrity MAC; the detached signature
-is an asymmetric provenance signature over canonical (version-identity) bytes. When **no** verifier
-is injected, gate (2) is inert and today's behavior is preserved exactly.
+Gates (1)/(2) apply to packs loaded from the content-root filesystem; gate (3) guards the import
+path. When **no** verifier is injected for a gate, that gate is inert and today's behavior is
+preserved exactly.
 """
 from __future__ import annotations
 
@@ -32,7 +44,7 @@ from pydantic import ValidationError
 
 from packs_engine.canonical import canonical_digest
 from shared.contracts import AuditAction, AuditResult, PackManifest, PackType, is_audit_safe
-from shared.signing import Verifier, verify_pack
+from shared.signing import PackVerifier, Verifier, verify_pack
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import; avoids runtime coupling to the emitter
     from packs_engine.content_store import PackContentStore
@@ -142,6 +154,7 @@ class PacksEngine:
         *,
         signing_secret: bytes | None = None,
         signature_verifier: Verifier | None = None,
+        import_verifier: PackVerifier | None = None,
         audit_emitter: AuditEmitter | None = None,
         registry: PackRegistry | None = None,
         content_store: PackContentStore | None = None,
@@ -151,6 +164,13 @@ class PacksEngine:
         # Optional, independent detached-signature gate (issue #35). Inert when None: today's
         # HMAC-only behavior is preserved exactly.
         self._verifier = signature_verifier
+        # Customer-side, verification-only, keyless TRUST ROOT for IMPORTED packs (issue #89). This
+        # is a key-id-aware pack verifier (typically a ``TrustBundleVerifier`` over pinned Ed25519
+        # PUBLIC keys) used by :meth:`verify_pack_for_import` — the fail-closed admission gate the
+        # import/assign subsystem (#37) MUST call before a pack is registered/stored (#44) and
+        # activated. Inert when None ONLY for callers that never import (e.g. shipped-pack tests);
+        # :meth:`verify_pack_for_import` itself fails closed when no trust root is wired.
+        self._import_verifier = import_verifier
         # Optional audit emitter (issue #59). Inert when None. When set (the API injects a
         # store-backed emitter — the single writer), a pack whose signature/hash verification FAILS
         # is recorded as a fail-closed ``pack.verify`` audit event before the failure propagates.
@@ -315,12 +335,21 @@ class PacksEngine:
         * ``canonical_digest(loaded) != registry.digest`` (tampered/mismatched bytes);
         * the loaded manifest's ``id``/``version`` does not match the registry entry's ref (the
           bytes claim a different identity than the entry that authorized them);
-        * the loaded manifest is malformed or its type does not match the entry.
+        * the loaded manifest is malformed or its type does not match the entry;
+        * **no trust root is wired** (``self._import_verifier is None``), the entry carries **no
+          persisted detached signature/key_id** (a legacy/pre-#89 or hand-crafted entry), the
+          signature's ``key_id`` is **not pinned** in the trust bundle, or the **signature does not
+          verify** against the pinned public key (issue #89, R2).
 
-        The digest re-verification is the trust gate here: because the registry digest was recorded
-        only AFTER a successful signature verification on import, bytes whose recomputed canonical
-        digest matches that digest are exactly the verified content — no separate signature check is
-        needed (and the stored canonical bytes deliberately exclude the volatile signature fields).
+        The digest re-verification proves **integrity** (the stored bytes ARE the recorded content),
+        but integrity is not trust. The runtime therefore INDEPENDENTLY re-verifies the persisted
+        detached signature against the **pinned trust bundle** (``self._import_verifier``) — the
+        SAME trust root the exporter/import-admission gate uses — instead of transitively trusting
+        the registry digest. This closes the reviewer-found bypass where a legacy/pre-fix or
+        attacker-crafted ``dist`` (a ``registry/index.json`` + ``store/`` written WITHOUT the
+        pinned admission gate) would be activated on a digest match alone, even though the pinned
+        trust root rejects the signer. A signature-less (legacy) entry stays fail-closed until it
+        is re-exported through the pinned admission gate.
 
         Two store entries can never share one ``id@version`` with differing content: the registry
         rejects a re-publish of an existing ``id@version`` under a different digest
@@ -376,6 +405,19 @@ class PacksEngine:
                 continue
             if manifest.type != entry.type:
                 continue  # registry type must match the loaded manifest -> fail closed
+            # Runtime trust-root re-verification (issue #89, R2). The digest match above is
+            # INTEGRITY, not trust: a legacy/pre-fix or attacker-crafted dist could carry a digest
+            # that was never backed by a signature verified against the pinned bundle. Re-verify the
+            # persisted detached signature against the pinned trust root INDEPENDENTLY, and fail
+            # closed (skip, never execute) on any of: no trust root wired, a legacy/signature-less
+            # entry, an unpinned key_id, or a signature that does not verify.
+            if self._import_verifier is None:
+                continue  # no trust root -> cannot verify imports -> fail closed
+            signature = entry.detached_signature()
+            if signature is None:
+                continue  # legacy/untrusted entry (no verifiable detached signature) -> fail closed
+            if not self._import_verifier.verify_pack(raw, signature):
+                continue  # signature does not verify against the pinned bundle -> fail closed
             resolved.append(Pack(manifest=manifest, body=raw.get("body", {}), imported=True))
         return resolved
 
@@ -422,6 +464,55 @@ class PacksEngine:
         if not verify_pack(raw, signature, verifier):
             raise PackVerificationError(
                 f"Pack {manifest.id}: detached signature failed verification (fail closed)"
+            )
+
+    def verify_pack_for_import(self, pack: dict[str, Any]) -> None:
+        """Fail-closed **trust-root admission gate** for an IMPORTED pack (issue #89).
+
+        This is the customer-side, verification-only, keyless trust root. Microsoft signs packs
+        **offline** in its own infrastructure; this platform only **verifies**, using the pinned
+        Ed25519 **PUBLIC** keys of the injected :class:`~shared.signing.PackVerifier` (a
+        ``TrustBundleVerifier``). The verifier selects the public key whose id matches the pack
+        signature's ``key_id`` and checks the detached signature over the pack's canonical bytes.
+
+        Call this **BEFORE** a pack is admitted to the registry/content store (#44) and activated —
+        it is the clean extension hook the import/assign subsystem (#37) will call at admission, and
+        it does NOT depend on #37's parked WIP. The #44 store deliberately holds *signature-free*
+        canonical bytes; the detached signature verified here is persisted on the registry entry so
+        the runtime resolver can INDEPENDENTLY re-verify it against the same pinned bundle at load
+        time (issue #89, R2 — :meth:`_resolve_imported_packs`). Admission verifies the signature at
+        the write boundary; the runtime re-verifies it at read time — digest match is integrity, not
+        trust.
+
+        Fail closed (raises :class:`PackVerificationError`) when: no trust root is wired, the
+        manifest is malformed, the detached signature is missing, the ``key_id`` is not pinned in
+        the trust bundle (unknown key / empty-or-unavailable bundle), or the signature does not
+        verify against the selected public key.
+        """
+        if self._import_verifier is None:
+            raise PackVerificationError(
+                "pack import rejected: no trust root configured to verify signatures (fail closed)"
+            )
+        manifest_raw = pack.get("manifest") if isinstance(pack, dict) else None
+        if not isinstance(manifest_raw, dict):
+            raise PackVerificationError(
+                "pack import rejected: missing or malformed manifest (fail closed)"
+            )
+        try:
+            manifest = PackManifest(**manifest_raw)
+        except ValidationError as exc:
+            raise PackVerificationError(
+                "pack import rejected: malformed manifest (fail closed)"
+            ) from exc
+        signature = manifest.pack_signature
+        if signature is None:
+            raise PackVerificationError(
+                f"pack import rejected: {manifest.id} carries no detached signature (fail closed)"
+            )
+        if not self._import_verifier.verify_pack(pack, signature):
+            raise PackVerificationError(
+                f"pack import rejected: {manifest.id} signature did not verify against the trust "
+                f"bundle key {signature.key_id!r} (fail closed)"
             )
 
     def load_for_workload(self, workload: str, pack_type: PackType) -> list[Pack]:
