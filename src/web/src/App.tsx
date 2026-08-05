@@ -5,20 +5,25 @@ import { useAsync, type AsyncState } from "./hooks/useAsync";
 import { WorkloadSelector } from "./panels/WorkloadSelector";
 import { WorkloadView } from "./panels/WorkloadView";
 import { ModulesTable } from "./panels/ModulesTable";
+import { ModuleControls } from "./panels/ModuleControls";
+import { PacksConsole } from "./panels/PacksConsole";
 import { GrafanaPanel } from "./panels/GrafanaPanel";
 import { EstateView } from "./panels/EstateView";
 import { FindingsView } from "./panels/FindingsView";
 import { DriftView } from "./panels/DriftView";
 import { card } from "./styles";
 
-/** In-page sections. `estate` is estate-wide; the rest are scoped to the selected workload. */
-type Tab = "estate" | "workload" | "findings" | "drift";
+/** In-page sections. `estate`, `modules` and `packs` are estate-wide; the rest are scoped to the
+ *  selected workload (`packs` additionally uses the selection for per-workload assignment). */
+type Tab = "estate" | "workload" | "findings" | "drift" | "modules" | "packs";
 
 const TABS: { id: Tab; label: string; scoped: boolean }[] = [
   { id: "estate", label: "Estate", scoped: false },
   { id: "workload", label: "Workload", scoped: true },
   { id: "findings", label: "Findings", scoped: true },
   { id: "drift", label: "Drift", scoped: true },
+  { id: "modules", label: "Modules", scoped: false },
+  { id: "packs", label: "Packs", scoped: false },
 ];
 
 /**
@@ -115,6 +120,12 @@ export function App() {
 function renderTab(tab: Tab, selected: string | null, workloadsState: AsyncState<string[]>) {
   if (tab === "estate") {
     return <EstateView state={workloadsState} />;
+  }
+  if (tab === "modules") {
+    return <ModuleControls />;
+  }
+  if (tab === "packs") {
+    return <PacksConsole workload={selected} />;
   }
   if (!selected) {
     return (

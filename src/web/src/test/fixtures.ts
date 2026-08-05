@@ -1,6 +1,38 @@
 // Clearly-fake synthetic fixtures for web component tests. NO real customer data / PHI / PII —
 // every id, name and value here is invented for testing only.
-import type { DriftReport, Finding, WorkloadGraph } from "../api/types";
+import type { DriftReport, Finding, ModuleManifest, PackRegistryEntry, WorkloadGraph } from "../api/types";
+
+export function makeModule(overrides: Partial<ModuleManifest> = {}): ModuleManifest {
+  return {
+    name: "discovery",
+    displayName: "Discovery",
+    kind: "service",
+    enabled: true,
+    consumes: ["workload"],
+    produces: ["estate"],
+    scaleProfile: {
+      kind: "service",
+      minReplicas: 1,
+      maxReplicas: 3,
+      triggers: [],
+      cpu: 0.5,
+      memoryGi: 1,
+    },
+    ...overrides,
+  };
+}
+
+export function makePack(overrides: Partial<PackRegistryEntry> = {}): PackRegistryEntry {
+  return {
+    id: "rule.tls.fake",
+    version: "1.2.0",
+    type: "rule",
+    digest: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    createdAt: "2026-01-01T00:00:00Z",
+    signed: true,
+    ...overrides,
+  };
+}
 
 export function makeFinding(overrides: Partial<Finding> = {}): Finding {
   return {

@@ -45,6 +45,23 @@ export type ModuleManifest = {
   scaleProfile: ScaleProfile;
 };
 
+/**
+ * Read model for one published pack version — mirrors the API app's `PackRegistryEntryView`
+ * (issue #57), the keyless/PII-free projection of a `packs_engine.registry.RegistryEntry`. Every
+ * field is REQUIRED (always serialized). `digest` is the content-address / version identity (a
+ * lowercase sha256 hex — NOT a secret); `signed` reflects whether the entry carries a well-formed
+ * detached signature. The SPA only ever *reads* this shape. The raw key id / signature bytes are
+ * intentionally NOT part of this contract (never egressed by the backend).
+ */
+export type PackRegistryEntry = {
+  id: string;
+  version: string;
+  type: PackType;
+  digest: string;
+  createdAt: string;
+  signed: boolean;
+};
+
 /** Mirrors `contracts.ResourceNode`. `workload`/`tier`/`role` are nullable-but-present. */
 export type ResourceNode = {
   id: string;

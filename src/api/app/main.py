@@ -15,6 +15,7 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
+from packs_engine.engine import PacksEngine
 from shared.audit import AuditEmitter, resolve_actor
 from shared.blast_radius import compute_impact, graph_revision
 from shared.contracts import (
@@ -420,6 +421,72 @@ def get_metrics_snapshot(metrics: MetricsDep) -> MetricsSnapshotView:
 def list_modules() -> list[ModuleManifest]:
     """Enumerate modules and their scale profiles (drives infra + the web console)."""
     return registry.manifests()
+
+
+class PackRegistryEntryView(BaseModel):
+    """Read model for one published pack version in the wired pack registry (issue #57).
+
+    Presentation-only projection of a :class:`~packs_engine.registry.RegistryEntry` — it is not a
+    cross-module contract, so (like :class:`ImpactResult`) it lives here in the API app rather than
+    in ``shared.contracts``. Deliberately keyless and PII-free: it carries only the pack's own
+    identity (``id``/``version``/``type``), its content-address (``digest`` — the version identity,
+    not a secret), its publish timestamp, and a boolean ``signed`` derived from whether the entry
+    carries a well-formed detached signature. The raw ``keyId`` and signature bytes are NOT egressed
+    — the console only needs to know a version exists and whether it is signed.
+    """
+
+    id: str
+    version: str
+    type: str
+    digest: str
+    createdAt: str
+    signed: bool
+
+
+@app.get("/api/packs")
+def list_packs(packs: PacksDep) -> list[PackRegistryEntryView]:
+    """Read-only catalogue of published pack versions in the wired registry (issue #57).
+
+    Thin, keyless, PII-free and fail-closed: when no packs engine / registry is wired (no content
+    root, or the import subsystem is absent) this returns ``[]`` — an empty catalogue is never an
+    error and never a fabricated entry. Mirrors the ``GET /api/modules`` pattern (project an
+    in-process read surface for the console) and never verifies/activates anything; it only reads
+    what the registry recorded at admission. ``signed`` reflects whether the entry carries a
+    well-formed detached signature (a version identity/provenance signal for the console — the
+    runtime resolver still independently re-verifies trust before any pack executes).
+    """
+    return _pack_catalogue.project(packs)
+
+
+class _PackCatalogueEgress:
+    """Egress projection for the pack-registry catalogue read (issue #57).
+
+    Exposed as a method (a reviewed projection the response boundary trusts, mirroring
+    :class:`_EstateEgress`) so the route hands back the value FastAPI coerces through its declared
+    ``list[PackRegistryEntryView]`` response model. The view carries only the pack's own identity
+    (id/version/type), its content-address ``digest`` (the version identity — not a secret), a
+    publish timestamp, and a boolean ``signed``; the raw key id / signature bytes are never
+    egressed. Fail-closed: no wired ``PacksEngine`` (hence no registry) ⇒ an empty catalogue.
+    """
+
+    @staticmethod
+    def project(packs: object) -> list[PackRegistryEntryView]:
+        if not isinstance(packs, PacksEngine):
+            return []
+        return [
+            PackRegistryEntryView(
+                id=entry.ref.id,
+                version=entry.ref.version,
+                type=entry.type.value,
+                digest=entry.digest,
+                createdAt=entry.createdAt.isoformat(),
+                signed=entry.detached_signature() is not None,
+            )
+            for entry in packs.registry_entries()
+        ]
+
+
+_pack_catalogue = _PackCatalogueEgress()
 
 
 class RunRequest(BaseModel):

@@ -7,6 +7,7 @@ import type {
   Finding,
   ImpactResult,
   ModuleManifest,
+  PackRegistryEntry,
   WorkloadGraph,
 } from "./types";
 
@@ -35,6 +36,16 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 export function fetchModules(): Promise<ModuleManifest[]> {
   return getJson<ModuleManifest[]>("/api/modules");
+}
+
+/**
+ * The pack-version registry catalogue (issue #57). Read-only: the backend returns `[]` (never an
+ * error) when no registry is wired, so callers must treat an empty list as "no catalogue" — not as
+ * an all-clear. Assigning a version to a workload is a *write* that must go through the (not-yet-
+ * present) validated assignment backend — see `TODO(human)` in `PacksConsole`.
+ */
+export function fetchPacks(): Promise<PackRegistryEntry[]> {
+  return getJson<PackRegistryEntry[]>("/api/packs");
 }
 
 export function fetchWorkloads(): Promise<string[]> {
