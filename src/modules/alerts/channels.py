@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -186,6 +187,102 @@ def _canonical_host_ok(host: str) -> bool:
     return all(1 <= len(label) <= 63 for label in stripped.split("."))
 
 
+# Cloud metadata service address (IMDS). Range-blocked as an SSRF-sensitive destination. It is also
+# link-local (169.254.169.254 ∈ 169.254.0.0/16), so ``is_link_local`` already catches it, but it is
+# named explicitly so the SSRF intent (issue #95) is unmistakable at the classification site.
+_METADATA_IPV4 = ipaddress.IPv4Address("169.254.169.254")
+# IPv6 unique-local block (RFC 4193). ``ipaddress`` has no ``is_unique_local`` predicate, and its
+# broad ``.is_private`` for IPv6 also flags the documentation range (2001:db8::/32) — a legitimate,
+# non-SSRF target — so we test fc00::/7 membership explicitly instead of using ``.is_private``.
+_UNIQUE_LOCAL_IPV6 = ipaddress.IPv6Network("fc00::/7")
+# RFC 6598 shared address space (CGNAT / carrier-grade NAT — also the default Tailscale range).
+# ``ipaddress`` classifies it as NEITHER ``.is_private`` NOR global, so it must be blocked
+# explicitly: it is internal, not internet-routable, and commonly fronts CGNAT and Tailscale hosts.
+_SHARED_ADDRESS_SPACE_IPV4 = ipaddress.IPv4Network("100.64.0.0/10")
+# RFC 6052 well-known NAT64 prefix and RFC 8215 local-use NAT64 prefix. NAT64 addresses embed an
+# IPv4 target that a NAT64 gateway translates to (which may be an INTERNAL service). The embedded
+# IPv4's location is prefix/network-defined and not reliably extractable, so we fail closed and
+# block the whole prefixes rather than trying to parse out and re-classify the embedded IPv4.
+_NAT64_WELLKNOWN_IPV6 = ipaddress.IPv6Network("64:ff9b::/96")
+_NAT64_LOCALUSE_IPV6 = ipaddress.IPv6Network("64:ff9b:1::/48")
+
+_IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def _is_ssrf_blocked_ip(ip: _IPAddress) -> bool:
+    """Classify a parsed/resolved IP as SSRF-sensitive (issue #95) → range-block, fail closed.
+
+    Blocks: loopback; link-local (169.254.0.0/16, fe80::/10); the unspecified address (``::``,
+    ``0.0.0.0``); the cloud-metadata address (169.254.169.254); IPv4 RFC1918 and the other
+    non-global ranges ``ipaddress`` groups under ``.is_private``; RFC 6598 shared/CGNAT address
+    space (100.64.0.0/10), which ``ipaddress`` marks as NEITHER private nor global; and IPv6
+    unique-local (fc00::/7) and the NAT64 prefixes (RFC 6052 ``64:ff9b::/96``, RFC 8215
+    ``64:ff9b:1::/48``, which embed an internal-reachable IPv4). For IPv6 we deliberately do NOT
+    use ``.is_private`` — it also flags the documentation range 2001:db8::/32, a legitimate
+    non-SSRF target — so only loopback, link-local, unspecified, unique-local and NAT64 (all
+    genuinely internal) are blocked. An ipv4-mapped IPv6 address is classified by its embedded IPv4
+    (defense in depth; such literals are already rejected earlier by :func:`_canonical_host_ok`).
+    """
+    if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+        return True
+    if isinstance(ip, ipaddress.IPv4Address):
+        return ip.is_private or ip == _METADATA_IPV4 or ip in _SHARED_ADDRESS_SPACE_IPV4
+    if ip in _UNIQUE_LOCAL_IPV6 or ip in _NAT64_WELLKNOWN_IPV6 or ip in _NAT64_LOCALUSE_IPV6:
+        return True
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return _is_ssrf_blocked_ip(mapped)
+    return False
+
+
+def _resolve_host_ips(host: str) -> list[_IPAddress]:
+    """Resolve a DNS ``host`` to its IP addresses via ``socket.getaddrinfo`` (issue #95).
+
+    Isolated behind this thin wrapper so the DNS-rebinding range-check can be exercised hermetically
+    in tests (patch this symbol) WITHOUT touching httpx's own resolver on the delivery path. Raises
+    ``OSError`` (``socket.gaierror``) or ``UnicodeError`` for an unresolvable/undecodable host; the
+    caller treats any failure as a fail-closed rejection.
+    """
+    ips: list[_IPAddress] = []
+    for info in socket.getaddrinfo(host, None):
+        addr = str(info[4][0]).partition("%")[0]  # strip an IPv6 scope/zone id if present
+        ips.append(ipaddress.ip_address(addr))
+    return ips
+
+
+def _is_ssrf_blocked_host(host: str) -> bool:
+    """Return whether ``host`` is (or resolves to) an SSRF-sensitive destination (issue #95).
+
+    An IP LITERAL is classified directly. A DNS NAME is resolved and blocked if ANY resolved
+    address is SSRF-sensitive (closes a DNS-rebinding vector); an unresolvable host is blocked
+    (fail closed).
+
+    TOCTOU / DNS-rebinding residual: resolution here happens at VALIDATION time, but httpx
+    independently re-resolves the same host at ``send()`` (the hardened client in
+    :func:`build_webhook_http_client`), so a name that resolves public here could resolve to an
+    internal address there. Pinning the resolved IP through to delivery is not cleanly feasible with
+    the shared ``httpx.Client`` (it would need a per-URL custom resolver/transport and would break
+    Host/SNI/TLS verification), so we accept and DOCUMENT this narrow window rather than invent a
+    fragile pin. The blast radius is bounded: delivery is proxy-disabled, redirect-disabled,
+    TLS-verified, POSTs only a PII-free allowlist payload, and never returns the response body to
+    any caller — a range-rebind is blind SSRF at worst.
+    """
+    literal = host.partition("%")[0]  # an IPv6 literal may still carry a %zone the parser preserved
+    try:
+        ip = ipaddress.ip_address(literal)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        return _is_ssrf_blocked_ip(ip)
+    try:
+        resolved = _resolve_host_ips(host)
+    except (OSError, UnicodeError):
+        return True  # unresolvable / undecodable host → fail closed
+    if not resolved:
+        return True  # resolver returned nothing → fail closed
+    return any(_is_ssrf_blocked_ip(addr) for addr in resolved)
+
+
 def require_https_webhook(url: str, *, allow_insecure_loopback: bool = False) -> httpx.URL:
     """Validate an outbound webhook URL is HTTPS (fail closed); return the canonical URL or raise.
 
@@ -247,6 +344,16 @@ def require_https_webhook(url: str, *, allow_insecure_loopback: bool = False) ->
     if not host or not host_shape_ok or (port is not None and not 0 <= port <= 65535):
         raise InsecureWebhookError(_MALFORMED_WEBHOOK_MSG)
     if scheme == "https":
+        # SSRF range-block (issue #95, follow-up to #84): reject an https:// destination that is (or
+        # resolves to) an SSRF-sensitive address — loopback / RFC1918-private / link-local /
+        # unique-local (fc00::/7) / cloud-metadata (169.254.169.254). Uses the SAME constant
+        # sanitized message as any other invalid URL so the blocked host/IP is NEVER echoed
+        # (preserves #84's no-host-leak / no-PII guarantee). http:// needs no separate gate here:
+        # its ONLY accepted destination is the loopback opt-out below (an intentional local test
+        # sink, deliberately EXEMPT from this range-block); every other http:// is rejected on
+        # scheme.
+        if _is_ssrf_blocked_host(host):
+            raise InsecureWebhookError(_MALFORMED_WEBHOOK_MSG)
         return parsed
     if scheme == "http" and allow_insecure_loopback and _is_loopback_host(host):
         return parsed

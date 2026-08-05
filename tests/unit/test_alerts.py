@@ -4,6 +4,8 @@ All fixtures are synthetic and clearly fake. Delivery is exercised through an in
 :class:`FakeChannel`; no test touches the network. The HTTPS-enforcement tests construct a
 :class:`WebhookChannel` only to assert its constructor validates the scheme (no network I/O).
 """
+import ipaddress
+import socket
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,6 +31,23 @@ from modules.alerts.module import (
 )
 from shared.contracts import Finding, PackType, Severity
 from shared.module_base import ModuleContext
+
+
+# --------------------------------------------------------------------------------------
+# Issue #95 added DNS resolution to require_https_webhook: a webhook host that resolves into an
+# SSRF-sensitive range is range-blocked, and an UNRESOLVABLE host fails closed. The existing suite
+# uses unresolvable synthetic hosts (``*.invalid`` / ``*.example``) as stand-ins for a normal public
+# webhook, so by default we resolve every DNS NAME to a fixed PUBLIC address — keeping the suite
+# hermetic/offline (no real DNS). This patches only the validator's thin resolver wrapper, NOT
+# httpx's own resolver on the delivery path, so send()-time idna/getaddrinfo tests are unaffected.
+# Individual #95 tests below OVERRIDE this to exercise the blocked-resolution / unresolvable paths.
+# --------------------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _stub_public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake(_host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        return [ipaddress.ip_address("93.184.216.34")]  # a fixed, clearly-public address
+
+    monkeypatch.setattr("modules.alerts.channels._resolve_host_ips", _fake)
 
 
 # --------------------------------------------------------------------------------------
@@ -981,3 +1000,190 @@ def test_require_https_webhook_all_http_rejected_with_optout_off(url: str) -> No
     # Default OFF: every cleartext http:// URL (loopback or disguised) is rejected.
     with pytest.raises(InsecureWebhookError):
         require_https_webhook(url)
+
+
+# --------------------------------------------------------------------------------------
+# Issue #95 (follow-up to #84): range-block SSRF-sensitive webhook destinations over HTTPS. Before
+# #95, any well-formed ``https://`` host was accepted after the SHAPE check; internal ranges
+# (loopback / RFC1918-private / link-local / unique-local / cloud-metadata) were reachable over TLS.
+# The validator now range-blocks them for https too, resolving DNS names to close a rebinding
+# vector, and fails closed on an unresolvable host — always with the CONSTANT sanitized message so
+# the blocked host/IP never leaks (the #84 no-PII guarantee). The cleartext-loopback opt-out for a
+# local test sink is the one documented exemption and is preserved exactly.
+# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("url", "leak"),
+    [
+        ("https://127.0.0.1/hook", "127.0.0.1"),  # IPv4 loopback
+        ("https://[::1]/hook", "::1"),  # IPv6 loopback
+        ("https://10.0.0.5/hook", "10.0.0.5"),  # RFC1918 10/8
+        ("https://192.168.1.1/hook", "192.168.1.1"),  # RFC1918 192.168/16
+        ("https://172.16.0.1/hook", "172.16.0.1"),  # RFC1918 172.16/12
+        ("https://169.254.1.1/hook", "169.254.1.1"),  # IPv4 link-local
+        ("https://[fe80::1]/hook", "fe80::1"),  # IPv6 link-local
+        ("https://169.254.169.254/hook", "169.254.169.254"),  # cloud metadata (IMDS)
+        ("https://[fd00::1]/hook", "fd00::1"),  # IPv6 unique-local fc00::/7
+        ("https://100.64.0.1/hook", "100.64.0.1"),  # RFC 6598 shared/CGNAT 100.64/10
+        ("https://100.100.100.200/hook", "100.100.100.200"),  # CGNAT (Tailscale MagicDNS-style)
+        ("https://[::]/hook", "::"),  # IPv6 unspecified
+        ("https://0.0.0.0/hook", "0.0.0.0"),  # IPv4 unspecified
+        ("https://[64:ff9b:1:a00:0:500::]/hook", "64:ff9b"),  # RFC 8215 local-use NAT64
+        ("https://[64:ff9b::10.0.0.5]/hook", "64:ff9b"),  # RFC 6052 well-known NAT64 (embeds 10/8)
+    ],
+)
+def test_require_https_webhook_range_blocks_ssrf_ip_literals(url: str, leak: str) -> None:
+    from modules.alerts.channels import _MALFORMED_WEBHOOK_MSG
+
+    with pytest.raises(InsecureWebhookError) as excinfo:
+        require_https_webhook(url)
+    message = str(excinfo.value)
+    assert message == _MALFORMED_WEBHOOK_MSG  # constant sanitized error, same as any invalid URL
+    assert leak not in message  # the blocked host/IP is NEVER echoed (no destination leak)
+    assert "/hook" not in message  # path/query never echoed either
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1/hook",
+        "https://[::1]/hook",
+        "https://169.254.169.254/hook",
+        "https://[fe80::1]/hook",
+        "https://[fd00::1]/hook",
+    ],
+)
+def test_webhook_channel_range_blocked_ip_never_reaches_transport(url: str) -> None:
+    # Construction validates and rejects the SSRF-sensitive destination — the transport is a bomb
+    # that raises if dialled, proving no delivery (or DNS) is attempted for a blocked host.
+    with pytest.raises(InsecureWebhookError):
+        WebhookChannel(url, transport=_boom_transport())
+
+
+def test_require_https_webhook_accepts_public_ip_literal() -> None:
+    # A public IP literal is NOT range-blocked (no resolution needed for a literal).
+    url = "https://93.184.216.34/hook"
+    assert require_https_webhook(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://93.184.216.34/hook",  # ordinary global IPv4
+        "https://[2606:4700:4700::1111]/hook",  # ordinary global IPv6 (guards against over-block)
+        "https://[2001:db8::1]/hook",  # #84 documentation range 2001:db8::/32 STILL allowed
+    ],
+)
+def test_require_https_webhook_accepts_global_ip_literals(url: str) -> None:
+    # Over-block guard: adding the unspecified-address block (``::``/``0.0.0.0``) must NOT catch any
+    # ordinary global address, and the #84 documentation range must remain deliverable.
+    assert require_https_webhook(url) == url
+
+
+def test_require_https_webhook_accepts_public_dns_name() -> None:
+    # A DNS name that resolves (autouse stub) to a public address is accepted — hermetic/offline.
+    url = "https://public.example.com/hook"
+    assert require_https_webhook(url) == url
+
+
+@pytest.mark.parametrize(
+    "public_ip",
+    ["100.63.255.255", "100.128.0.0"],  # just BELOW and just ABOVE RFC 6598 100.64.0.0/10
+)
+def test_require_https_webhook_accepts_ips_bordering_cgnat(public_ip: str) -> None:
+    # Regression guard against an over-broad CGNAT mask: the addresses immediately outside
+    # 100.64.0.0/10 are ordinary public/global IPs and MUST still be accepted.
+    url = f"https://{public_ip}/hook"
+    assert require_https_webhook(url) == url
+
+
+@pytest.mark.parametrize(
+    "blocked_ip",
+    [
+        "10.0.0.5",
+        "127.0.0.1",
+        "169.254.169.254",
+        "fe80::1",
+        "fd00::1",
+        "100.64.0.5",
+        "::",
+        "0.0.0.0",
+        "64:ff9b:1:a00:0:500::",
+        "64:ff9b::a00:5",
+    ],
+)
+def test_require_https_webhook_range_blocks_dns_rebinding(
+    blocked_ip: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # DNS-rebinding path: a public-looking NAME whose resolution lands in a blocked range is
+    # rejected with the constant sanitized message (neither the name nor the resolved IP leaks).
+    def _resolve(_host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        return [ipaddress.ip_address(blocked_ip)]
+
+    monkeypatch.setattr("modules.alerts.channels._resolve_host_ips", _resolve)
+    from modules.alerts.channels import _MALFORMED_WEBHOOK_MSG
+
+    with pytest.raises(InsecureWebhookError) as excinfo:
+        require_https_webhook("https://rebind.example.com/hook?token=SECRET")
+    message = str(excinfo.value)
+    assert message == _MALFORMED_WEBHOOK_MSG
+    for leak in (blocked_ip, "rebind.example.com", "SECRET", "/hook"):
+        assert leak not in message
+
+
+def test_require_https_webhook_range_blocks_any_resolved_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If ANY resolved address is SSRF-sensitive, the host is blocked (a mixed public+internal set).
+    def _resolve(_host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        return [ipaddress.ip_address("93.184.216.34"), ipaddress.ip_address("169.254.169.254")]
+
+    monkeypatch.setattr("modules.alerts.channels._resolve_host_ips", _resolve)
+    with pytest.raises(InsecureWebhookError):
+        require_https_webhook("https://mixed.example.com/hook")
+
+
+def test_require_https_webhook_fails_closed_on_unresolvable_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Fail closed: an unresolvable host (resolver raises) is rejected with the constant message.
+    def _resolve(_host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr("modules.alerts.channels._resolve_host_ips", _resolve)
+    from modules.alerts.channels import _MALFORMED_WEBHOOK_MSG
+
+    with pytest.raises(InsecureWebhookError) as excinfo:
+        require_https_webhook("https://does-not-resolve.example.com/hook")
+    assert str(excinfo.value) == _MALFORMED_WEBHOOK_MSG
+
+
+def test_require_https_webhook_fails_closed_on_empty_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Fail closed: a resolver returning NO addresses is treated as unresolvable and rejected.
+    def _resolve(_host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        return []
+
+    monkeypatch.setattr("modules.alerts.channels._resolve_host_ips", _resolve)
+    with pytest.raises(InsecureWebhookError):
+        require_https_webhook("https://empty.example.com/hook")
+
+
+def test_range_block_preserves_cleartext_loopback_optout() -> None:
+    # Regression (#84 exemption): the http:// loopback opt-out is UNCHANGED by the #95 range-block —
+    # http:// to a genuine loopback host with the opt-out enabled is still accepted for a test sink.
+    assert (
+        require_https_webhook("http://127.0.0.1:9000/hook", allow_insecure_loopback=True)
+        == "http://127.0.0.1:9000/hook"
+    )
+    assert (
+        require_https_webhook("http://[::1]/hook", allow_insecure_loopback=True)
+        == "http://[::1]/hook"
+    )
+
+
+def test_range_block_does_not_extend_optout_to_https_loopback() -> None:
+    # The opt-out is cleartext-loopback ONLY: https:// to loopback is still range-blocked even when
+    # the loopback opt-out flag is set (the flag never relaxes the https SSRF gate).
+    with pytest.raises(InsecureWebhookError):
+        require_https_webhook("https://127.0.0.1/hook", allow_insecure_loopback=True)
