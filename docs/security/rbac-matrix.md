@@ -133,6 +133,69 @@ in the **`worker` identity** row.
 > alternative (which *would* have needed **Key Vault Crypto User**) was **explicitly not chosen**
 > because it would place a signing capability + KV role inside the customer runtime.
 
+## Application-layer API/console authorization — Entra app-role RBAC (issue #64)
+
+The per-component identities above are **Azure control/data-plane** least privilege (which identity
+may read ARG, write Blob/Table, …). Orthogonal to that is **who may call the API and what they may
+do** — an *application-layer* concern for console/human and service-to-service callers, owned by
+issue #64 ([ADR 0016](../adr/0016-entra-auth-console-api-rbac.md)). It is **keyless** (Entra OIDC
+bearer tokens validated against tenant **JWKS public keys** — no secret anywhere;
+[`src/shared/auth/`](../../src/shared/auth/)) and **deny-by-default**.
+
+| App role (Entra app role) | Granted actions | Enforced on |
+|---------------------------|-----------------|-------------|
+| **`Workloads.Reader`** | read the read-models | `GET` data endpoints (metrics, modules, packs, workloads, estate, graph, impact, findings, drift) when auth is enabled |
+| **`Workloads.Operator`** | run modules; submit results/estate/graph/findings/snapshot | **all six state-mutating `POST` endpoints** — `/api/modules/{name}/run`, `/api/workloads/{workload}/results\|estate\|graph\|findings\|snapshot` |
+| **`Workloads.Admin`** | Operator ⊇ Reader, plus future admin actions | (superset — no admin-only endpoint exists yet) |
+
+- **Deny-by-default & fail-closed *by default*.** Auth is governed by an explicit
+  `WP_AUTH_MODE ∈ {required, disabled}` that **defaults to `required`**. A `require_role(...)`
+  FastAPI dependency ([`src/api/app/main.py`](../../src/api/app/main.py)) validates the bearer token
+  then authorizes the required role. With auth enabled: missing/invalid token → **401**; valid token
+  but insufficient role → **403**; it **never** falls open to the `system` actor for a mutating
+  request. A **startup guard** refuses to serve when `required` and the tenant/audience are
+  missing **or partial** (an `AuthConfigError` aborts start-up) — a forgotten deployment var is a
+  loud failure, not a silent wide-open API. Running without auth requires the deliberate
+  `WP_AUTH_MODE=disabled` opt-out (local/CI/tests; logs a warning). **`/api/health*` and `/` stay
+  unauthenticated** (probes).
+
+  | `WP_AUTH_MODE` | tenant + audience | Result |
+  | --- | --- | --- |
+  | `required` (default) | both present | **Enforced** |
+  | `required` (default) | both absent | **Startup refuses to serve** |
+  | `required` (default) | partial (one present) | **Startup refuses to serve** |
+  | `disabled` | any | **No auth** (deliberate opt-out; warns) |
+- **Keyless validation edge.** RS256 verified with `cryptography` (public key from JWKS `n`/`e`);
+  `alg:none`/HMAC rejected; JWKS cached with bounded TTL, refreshed on unknown `kid`; HTTP + clock
+  injectable so tests are network-free. Errors are **PII-free reason codes only** — never token or
+  claims.
+- **Audit actor from the validated claim.** Mutating endpoints derive the audit actor from the
+  validated `oid` claim, **not** the `PRINCIPAL_ID_HEADER` — closing the spoofable-actor gap
+  ([`resolve_actor`](../../src/shared/audit.py) now prefers a validated `principal_id`; the header is
+  the no-auth local/worker fallback only).
+- **Service-to-service (worker → API) — keyless, wired in code.** The worker
+  ([`src/cli/worker.py`](../../src/cli/worker.py)) presents **its own managed identity** (#79):
+  [`build_api_token_provider`](../../src/shared/auth/token_source.py) obeys the same `WP_AUTH_MODE`
+  and, under `required`, mints an `<WP_AUTH_AUDIENCE>/.default` token via `DefaultAzureCredential`
+  (kept at an injectable edge — keyless tests) and attaches `Authorization: Bearer`; under `disabled`
+  it sends none; inability to mint **fails closed**. **No shared key.** The `Workloads.Operator` app
+  role must be **assigned to `identityWorker`** at deploy time — an Entra app-role assignment
+  (Microsoft Graph `appRoleAssignedTo`) that is **not ARM/Bicep-expressible**, so it is an `az rest`
+  / Graph deploy step (see below).
+- **Wiring status — honest.** Enforcement, the role model, the **fail-closed `WP_AUTH_MODE` default +
+  startup guard**, the audit-actor change, the console token-attachment/MSAL sign-in, and the
+  **worker's keyless bearer** are **wired in code and tested** (full fail-closed + header-spoof +
+  mode-precedence + worker-bearer matrix, injected key/claims/credential seams — no real Entra). The
+  non-secret `WP_AUTH_MODE`/`WP_AUTH_TENANT_ID`/`WP_AUTH_AUDIENCE` env is **threaded through Bicep**
+  (`module-app.bicep`, `module-job.bicep`, `main.bicep`; `authMode` defaults to `required`). **Not
+  yet done (deploy-time `TODO(human)`):** create the API + SPA **app registrations**, define the app
+  roles, **assign `Workloads.Operator` to `identityWorker`** and the human/console principals (Graph
+  `appRoleAssignedTo` via `az rest` — not ARM), set the deployment values for the API
+  `WP_AUTH_TENANT_ID`/`WP_AUTH_AUDIENCE` params and SPA `VITE_AUTH_*` env, and add the SPA redirect
+  URI. **Under the default `required` mode the API refuses to start until tenant+audience are
+  provided** — fail-closed, never silently wide-open. ⚠️ *(code+tests green + Bicep env threaded;
+  app-registration/role-assignment provisioning pending — #64)*
+
 ## Deployment / CI/CD (OIDC) identity — for completeness
 
 The **release/CD** principal is separate from the runtime managed identities and authenticates to

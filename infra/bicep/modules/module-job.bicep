@@ -43,6 +43,15 @@ param apiBaseUrl string = ''
 @description('Extra environment variables for this job\'s container (array of { name, value }). Used to thread module-specific, non-secret config (e.g. the telemetry_export DCE endpoint + DCR immutable id) without baking it into this generic template. Defaults to none.')
 param extraEnv array = []
 
+@description('Entra auth mode (issue #64): "required" => the worker mints a bearer for the API audience via its Managed Identity before submitting results; "disabled" => no token (local/dev). Empty => not injected. Non-secret.')
+param authMode string = ''
+
+@description('Entra tenant (directory) id (issue #64). Non-secret. Empty => not injected. Required (with authAudience) when authMode=required so the worker can resolve the API scope.')
+param authTenantId string = ''
+
+@description('Expected token audience — the API app registration Application ID URI / client id (issue #64); the worker requests <audience>/.default. Non-secret. Empty => not injected.')
+param authAudience string = ''
+
 // Assemble this job's KEDA scale rules from its declared triggers (FLAT shape, keyless queue auth).
 var queueRules = empty(queueName) ? [] : [
   {
@@ -69,7 +78,19 @@ var baseEnv = [
 var apiEnv = empty(apiBaseUrl) ? [] : [
   { name: 'WP_API_BASE_URL', value: apiBaseUrl }
 ]
-var containerEnv = concat(baseEnv, apiEnv, extraEnv)
+// Entra auth config (issue #64), keyless — non-secret identifiers only. When authMode=required the
+// worker acquires a bearer for the API audience via its own Managed Identity (#79) before POSTing
+// results; under disabled it sends no token. Injected per-var only when set.
+var authModeEnv = empty(authMode) ? [] : [
+  { name: 'WP_AUTH_MODE', value: authMode }
+]
+var authTenantEnv = empty(authTenantId) ? [] : [
+  { name: 'WP_AUTH_TENANT_ID', value: authTenantId }
+]
+var authAudienceEnv = empty(authAudience) ? [] : [
+  { name: 'WP_AUTH_AUDIENCE', value: authAudience }
+]
+var containerEnv = concat(baseEnv, apiEnv, authModeEnv, authTenantEnv, authAudienceEnv, extraEnv)
 
 resource job 'Microsoft.App/jobs@2025-01-01' = {
   name: 'wp-${moduleName}'

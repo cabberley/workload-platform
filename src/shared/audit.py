@@ -174,13 +174,28 @@ class AuditSink(Protocol):
         ...
 
 
-def resolve_actor(headers: Mapping[str, str] | None) -> str:
-    """Resolve a non-PII principal id from request headers, else the ``system`` actor (fail safe).
+def resolve_actor(
+    headers: Mapping[str, str] | None, *, principal_id: str | None = None
+) -> str:
+    """Resolve a non-PII principal id, preferring a VALIDATED claim over any request header.
 
-    Reads ONLY :data:`PRINCIPAL_ID_HEADER` (an object/principal id). If it is absent, blank, or —
-    defensively — not a bounded PII-free identifier, we fall back to :data:`SYSTEM_ACTOR` rather
-    than risk recording a name/email. Never raises.
+    Precedence (fail safe, spoof-resistant — issue #64):
+
+    * When ``principal_id`` is supplied, it is the ``oid`` from a **cryptographically validated**
+      Entra token (auth enabled). It takes precedence and the spoofable
+      :data:`PRINCIPAL_ID_HEADER` is **ignored entirely** — closing the gap where an attacker could
+      set that header to forge the audit actor. A defensively non-audit-safe validated id falls
+      back to :data:`SYSTEM_ACTOR` (never to the header).
+    * When ``principal_id`` is ``None`` (the documented no-auth local/dev/worker path), we fall back
+      to reading ONLY :data:`PRINCIPAL_ID_HEADER` (an object/principal id). If it is absent, blank,
+      or not a bounded PII-free identifier, we use :data:`SYSTEM_ACTOR` rather than risk recording a
+      name/email.
+
+    Never raises.
     """
+    if principal_id is not None:
+        # A validated claim is authoritative; the raw header is never consulted on this path.
+        return principal_id if is_audit_safe(principal_id) else SYSTEM_ACTOR
     if headers is None:
         return SYSTEM_ACTOR
     raw = (headers.get(PRINCIPAL_ID_HEADER) or "").strip()

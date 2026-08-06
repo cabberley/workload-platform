@@ -273,6 +273,26 @@ def test_resolve_actor_rejects_pii_header_value() -> None:
     assert resolve_actor({PRINCIPAL_ID_HEADER: "jane@contoso.com"}) == SYSTEM_ACTOR
 
 
+def test_resolve_actor_prefers_validated_principal_over_header() -> None:
+    # A validated oid takes precedence and the spoofable header is ignored entirely (issue #64).
+    assert (
+        resolve_actor({PRINCIPAL_ID_HEADER: "attacker-oid"}, principal_id="validated-oid")
+        == "validated-oid"
+    )
+
+
+def test_resolve_actor_validated_principal_used_even_with_no_headers() -> None:
+    assert resolve_actor(None, principal_id="validated-oid") == "validated-oid"
+
+
+def test_resolve_actor_non_safe_validated_principal_falls_back_to_system_not_header() -> None:
+    # A defensively-unsafe validated id must NOT silently fall through to the spoofable header.
+    assert (
+        resolve_actor({PRINCIPAL_ID_HEADER: "obj-123"}, principal_id="jane@contoso.com")
+        == SYSTEM_ACTOR
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Append-only persistence — local: chronological order + storage-enforced immutability.
 # --------------------------------------------------------------------------------------

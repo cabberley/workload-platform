@@ -21,10 +21,35 @@ export class ApiError extends Error {
   }
 }
 
+// Keyless bearer-token seam (issue #64). When Entra sign-in is wired (see `auth/AuthProvider`), the
+// provider registers a getter that returns a FRESH access token (acquired silently from the MSAL
+// cache) for the API audience; `getJson` attaches it as `Authorization: Bearer`. No token is stored
+// in this module — it is fetched per request and never logged. When auth is not configured the
+// provider stays `null` and requests go out unauthenticated (the documented local/no-auth path).
+export type TokenProvider = () => Promise<string | null>;
+
+let tokenProvider: TokenProvider | null = null;
+
+/** Register (or clear, with `null`) the bearer-token provider used for every `/api/*` request. */
+export function setAuthTokenProvider(provider: TokenProvider | null): void {
+  tokenProvider = provider;
+}
+
+async function authHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (tokenProvider !== null) {
+    const token = await tokenProvider();
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+  }
+  return headers;
+}
+
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(path, { method: "GET", headers: { Accept: "application/json" }, signal });
+    res = await fetch(path, { method: "GET", headers: await authHeaders(), signal });
   } catch (cause) {
     throw new ApiError(0, `network error: ${String(cause)}`);
   }
