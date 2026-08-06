@@ -21,6 +21,56 @@ FAKE_KUIPER_RESOURCE_ID = (
     "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/kuiper-widget-99"
 )
 
+# A clearly-fake second resource id for Citrix dependency-signal fixtures (never a real id).
+FAKE_CITRIX_TARGET_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/citrix-vda-02"
+)
+
+
+class MockCitrixTokenProvider:
+    """A synthetic, keyless :class:`~shared.connectors.TokenProvider` — no real Citrix, no secret.
+
+    Returns an obviously-fake bearer token so the whole keyless resolve→auth-header→fetch path is
+    exercised WITHOUT any Citrix-side facts or real credential. Records how many times it was
+    consulted so a test can assert an invalid endpoint never resolves a credential. Construct with
+    ``token=None`` to model a provider that cannot mint a token (⇒ the connector fails closed).
+    """
+
+    def __init__(self, token: str | None = "fake-citrix-read-token") -> None:  # noqa: S107 - fake
+        self.calls = 0
+        self._token = token
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        return self._token
+
+
+def synthetic_citrix_health(
+    *,
+    resource_id: str = FAKE_RESOURCE_ID,
+    health: str = "degraded",
+) -> dict[str, Any]:
+    """A synthetic Citrix *host-health* control-plane signal — obviously fake, PII/PHI-free.
+
+    The closed schema is ``{kind, resourceId, health}``: a resource id to annotate (matched against
+    an existing estate node id — never used to create a node) plus a closed-vocabulary ``health``
+    token. There is deliberately no free-form field to carry PII.
+    """
+    return {"kind": "host-health", "resourceId": resource_id, "health": health}
+
+
+def synthetic_citrix_dependency(
+    *,
+    resource_id: str = FAKE_RESOURCE_ID,
+    depends_on: str = FAKE_CITRIX_TARGET_ID,
+) -> dict[str, Any]:
+    """A synthetic Citrix *session-dependency* control-plane signal — obviously fake, PII/PHI-free.
+
+    The closed schema is ``{kind, resourceId, dependsOn}``: both endpoints are matched against
+    existing estate node ids. Maps to a (deferred, un-persisted) dependency edge.
+    """
+    return {"kind": "session-dependency", "resourceId": resource_id, "dependsOn": depends_on}
+
 
 def synthetic_kuiper_hint(
     *,
