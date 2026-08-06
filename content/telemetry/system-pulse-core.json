@@ -5,6 +5,7 @@
     "name": "Epic System Pulse — core signals",
     "version": "1.0.0",
     "targets": ["epic"],
+    "sha256": "39202e03cd5a3a3ea32123fd3c01536622c8ea5e91404fd25760b754f76700e9",
     "author": "microsoft"
   },
   "body": {

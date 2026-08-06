@@ -5,6 +5,7 @@
     "name": "WAF Reliability baseline",
     "version": "1.0.0",
     "targets": [],
+    "sha256": "ca986f54b2a84825ceb268cf287affadbffcd2a0d550618a64c96625b5d994c4",
     "author": "microsoft"
   },
   "body": {

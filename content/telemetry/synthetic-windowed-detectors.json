@@ -5,6 +5,7 @@
     "name": "SYNTHETIC demo — windowed + expression detectors (FAKE)",
     "version": "0.1.0",
     "targets": ["synthetic-demo"],
+    "sha256": "9954d72e2f9c7c823b3be8f72ac794b9a28dc83067604c480520b6ea4eda1392",
     "author": "microsoft"
   },
   "body": {

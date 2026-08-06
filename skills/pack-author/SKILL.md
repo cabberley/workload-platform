@@ -33,7 +33,8 @@ Every pack file has a `manifest` (see `src/shared/contracts.py::PackManifest`) a
 - **No PHI/PII, no customer data, no proprietary IP.** Synthetic, clearly-fake fixtures only.
 - Set `targets` to the workload kinds it applies to (empty = all).
 - Validate: `python scripts/validate_packs.py content`.
-- Sign before release (SHA-256 + HMAC); the Packs Engine verifies before execute.
+- Sign before release (SHA-256 content hash + detached **Ed25519** signature over canonical bytes,
+  signed offline); the Packs Engine verifies before execute.
 - Bump `version` (semver) on any change; never mutate a released version in place.
 
 ## Templates & authoring guide

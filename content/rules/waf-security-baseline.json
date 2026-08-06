@@ -5,6 +5,7 @@
     "name": "WAF Security baseline",
     "version": "1.0.0",
     "targets": [],
+    "sha256": "30ce46953d764117cb5b317c1694901e9011d5484a662d7777e4f00c3fc24614",
     "author": "microsoft"
   },
   "body": {

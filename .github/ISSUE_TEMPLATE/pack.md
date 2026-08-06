@@ -26,4 +26,4 @@ What knowledge does this pack encode? (checks / signals / edges / routes)
 ## Guardrails
 - [ ] No PHI/PII, no customer data, no proprietary IP — synthetic fixtures only
 - [ ] Validates against schema (`scripts/validate_packs.py`)
-- [ ] Will be signed (SHA-256 + HMAC) before release
+- [ ] Will be signed (SHA-256 content hash + detached Ed25519 signature over canonical bytes) before release

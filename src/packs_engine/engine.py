@@ -1,14 +1,21 @@
-"""Packs engine — load, verify signature, and hand packs to modules.
+"""Packs engine — load, verify integrity, and hand packs to modules.
 
-Packs are the only inbound artifact (content, not code). This engine is the trust gate:
-it computes SHA-256 over pack content and verifies the HMAC signature **before** a pack is
-allowed to execute. Unknown/invalid signature => fail closed (refuse).
+Packs are the only inbound artifact (content, not code). This engine is the trust gate: it verifies
+a pack's **SHA-256 content hash** and, where a verifier is wired, a detached **Ed25519** signature
+over the pack's canonical bytes (``shared.signing`` — the direction of record) **before** a pack is
+allowed to execute. A legacy symmetric HMAC remains an independent, optional gate. Missing/invalid
+integrity => fail closed (refuse). A SHIPPED first-party pack that OMITS its content-hash integrity
+field is refused at the load boundary (issue #82, :meth:`PacksEngine._require_shipped_integrity`);
+its detached signature is enforced once the offline signing key / pinned trust root land (#37/#44).
 
 ## Trust gates
 
-1. **Legacy HMAC (symmetric)** — :func:`verify` checks the body-only ``sha256`` and an HMAC over it
-   using an injected ``signing_secret`` (Key Vault at the boundary). Active when a secret is set and
-   ``verify_sig`` is on. Unchanged behavior; existing packs/tests rely on it.
+0. **Content-hash requirement (issue #82)** — a shipped first-party pack MUST carry ``sha256`` under
+   a verified load; :func:`verify` then proves it is correct. Fail-closed on a missing hash.
+1. **Legacy HMAC (symmetric)** — :func:`verify` checks the ``sha256`` computed over the pack's
+   CANONICAL bytes (whole manifest + body — issue #82 MEDIUM-2; previously body-only) and an HMAC
+   over it using an injected ``signing_secret`` (Key Vault at the boundary). Active when a secret is
+   set and ``verify_sig`` is on. Existing packs/tests rely on it.
 2. **Detached asymmetric signature (issue #35)** — when a :class:`~shared.signing.Verifier` is
    injected, each pack's :attr:`~shared.contracts.PackManifest.pack_signature` is verified against
    the pack's *canonical bytes* via :func:`shared.signing.verify_pack`. A missing or invalid
@@ -42,7 +49,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 from pydantic import ValidationError
 
-from packs_engine.canonical import canonical_digest
+from packs_engine.canonical import canonical_bytes, canonical_digest
 from shared.contracts import AuditAction, AuditResult, PackManifest, PackType, is_audit_safe
 from shared.signing import PackVerifier, Verifier, verify_pack
 
@@ -158,9 +165,18 @@ class PacksEngine:
         audit_emitter: AuditEmitter | None = None,
         registry: PackRegistry | None = None,
         content_store: PackContentStore | None = None,
+        require_integrity: bool = True,
     ) -> None:
         self.root = Path(content_root)
         self._secret = signing_secret
+        # Fail-closed integrity requirement for SHIPPED (first-party) packs (issue #82). When True
+        # (the default and the production posture), a pack loaded from the content-root filesystem
+        # under a verified load MUST carry its ``sha256`` content-hash integrity field, so a
+        # bundled pack that omits integrity is REFUSED rather than silently loaded. Correctness of
+        # the hash is still checked by :func:`verify`. Set False only for in-memory/synthetic
+        # fixtures that deliberately ship a hash-less pack; the detached SIGNATURE remains deferred
+        # for first-party packs (see the TODO(human) hook in :meth:`load_all`).
+        self._require_integrity = require_integrity
         # Optional, independent detached-signature gate (issue #35). Inert when None: today's
         # HMAC-only behavior is preserved exactly.
         self._verifier = signature_verifier
@@ -272,17 +288,49 @@ class PacksEngine:
             try:
                 if verify_sig:
                     try:
-                        body_bytes = json.dumps(raw.get("body", {}), sort_keys=True).encode()
+                        pack_bytes = canonical_bytes(raw)
                     except (TypeError, ValueError) as exc:
                         # A YAML-authored pack can carry a non-JSON-native body (e.g. ``!!set`` →
-                        # a Python ``set``). Serializing it here raised before any audit was
+                        # a Python ``set``). Canonicalizing it here raised before any audit was
                         # written — masking the rejection with a TypeError AND emitting zero
                         # pack.verify events. Convert to the fail-closed PackVerificationError so
                         # the except-clause below audits exactly one pack.verify/failure event.
                         raise PackVerificationError(
-                            f"Pack {manifest.id}: body is not JSON-serializable"
+                            f"Pack {manifest.id}: not canonicalizable (non-JSON-native content)"
                         ) from exc
-                    verify(manifest, body_bytes, self._secret)
+                    # Fail-closed integrity requirement (issue #82): a SHIPPED first-party pack must
+                    # carry its ``sha256`` content-hash integrity field, so a bundled pack that
+                    # OMITS integrity is REFUSED here rather than silently loaded.
+                    if self._require_integrity:
+                        self._require_shipped_integrity(manifest)
+                    # ``verify`` proves the content hash is CORRECT over the pack's CANONICAL bytes
+                    # (issue #82, MEDIUM-2) — the SAME canonicalization ``shared.signing`` signs
+                    # over. Hashing canonical bytes (whole manifest + body, volatile integrity
+                    # fields excluded) means tampering with ANY security-sensitive manifest field
+                    # (``targets``/``type``/``id``/``version``) OR the body invalidates the hash and
+                    # fails closed — a body-only hash left the manifest tamperable.
+                    verify(manifest, pack_bytes, self._secret)
+                    # A PRESENT detached signature is an AUTHENTICITY claim that MUST be
+                    # cryptographically verified — never silently ignored (issue #82, MEDIUM-1;
+                    # aligns with the invariant in ``scripts/validate_packs.py``). If a signature
+                    # is present but no trust root/verifier is wired we CANNOT verify it, so we
+                    # fail closed. Only an ABSENT signature receives the documented first-party
+                    # HASH-ONLY exemption (authenticity DEFERRED to #37/#44 — see the TODO below).
+                    if manifest.pack_signature is not None and self._verifier is None:
+                        raise PackVerificationError(
+                            f"Pack {manifest.id}: carries a detached signature but no trust root "
+                            f"is configured to verify it — a present signature must be verified, "
+                            f"not ignored (fail closed, issue #82)"
+                        )
+                    # TODO(human): turn ON first-party AUTHENTICITY by default here once the
+                    # OFFLINE signing key + pinned trust root land (#37/#44): construct the engine
+                    # with a ``signature_verifier`` and REQUIRE shipped packs to carry a
+                    # ``pack_signature`` that cryptographically verifies against the pinned root
+                    # (the same bar IMPORTED packs already meet in
+                    # ``_resolve_imported_packs``/``verify_pack_for_import``, issue #89). Until
+                    # then shipped first-party packs get HASH-ONLY integrity (tamper-evidence in
+                    # transit, NOT authenticity); a PRESENT signature is already verified/failed-
+                    # closed by the gate just above plus ``_verify_detached`` below.
                 # Independent detached-signature gate (issue #35): only active when a verifier is
                 # injected, so no-verifier callers keep today's behavior unchanged. Fail closed.
                 if self._verifier is not None:
@@ -461,6 +509,32 @@ class PacksEngine:
             pack_id=pack_id,
             pack_version=pack_version,
         )
+
+    def _require_shipped_integrity(self, manifest: PackManifest) -> None:
+        """Fail closed if a SHIPPED (first-party) pack omits its content-hash integrity field (#82).
+
+        A bundled/first-party pack loaded from the content-root filesystem MUST carry a ``sha256``
+        content hash so it can never silently load WITHOUT an integrity field; :func:`verify` then
+        proves that hash is CORRECT over the pack's CANONICAL bytes (whole manifest + body, issue
+        #82 MEDIUM-2). A missing hash is refuse-to-load (fail closed).
+
+        First-party vs imported (the deliberate, documented distinction):
+
+        * **First-party / shipped** (``Pack.imported is False``, content-root filesystem): the
+          content hash is REQUIRED now; the detached Ed25519 SIGNATURE is DEFERRED because offline
+          signing keys / the pinned trust root are a parked decision (issues #37/#44). See the
+          ``TODO(human)`` hook in :meth:`load_all` for where signature enforcement will be turned
+          on for first-party packs.
+        * **Imported / third-party** (``Pack.imported is True``, content store): held to the
+          STRICTER bar — a detached signature that VERIFIES against the pinned trust root is
+          required, enforced in :meth:`_resolve_imported_packs` and :meth:`verify_pack_for_import`
+          (issue #89). An imported pack that omits a verifiable signature is already rejected.
+        """
+        if not manifest.sha256:
+            raise PackVerificationError(
+                f"Pack {manifest.id}: missing required content-hash integrity field 'sha256' "
+                f"(fail closed, issue #82)"
+            )
 
     @staticmethod
     def _verify_detached(manifest: PackManifest, raw: dict[str, Any], verifier: Verifier) -> None:
