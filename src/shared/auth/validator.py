@@ -175,7 +175,7 @@ class TokenValidator:
 
     @staticmethod
     def _principal_from_claims(claims: Mapping[str, Any]) -> Principal:
-        """Extract the non-PII oid + recognized roles. Fail closed if no usable object id."""
+        """Extract the non-PII oid + recognized roles + tenant id. Fail closed if no usable oid."""
         oid = claims.get("oid")
         if not isinstance(oid, str) or not oid:
             # No object id ⇒ we cannot record a non-PII actor; refuse rather than fall back to PII.
@@ -184,4 +184,9 @@ class TokenValidator:
         app_roles = (
             [r for r in raw_roles if isinstance(r, str)] if isinstance(raw_roles, list) else []
         )
-        return Principal(oid=oid, roles=roles_from_app_roles(app_roles))
+        # The Entra ``tid`` claim — the caller's tenant/directory guid (non-PII) — threaded for
+        # tenant isolation (issue #65). Absent/blank ⇒ ``None`` (the single-tenant default resolves
+        # it downstream); it is never fabricated here.
+        raw_tid = claims.get("tid")
+        tenant_id = raw_tid if isinstance(raw_tid, str) and raw_tid else None
+        return Principal(oid=oid, roles=roles_from_app_roles(app_roles), tenant_id=tenant_id)

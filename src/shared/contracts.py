@@ -55,6 +55,75 @@ class AgentResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
+# Tenancy — the isolation identity threaded through state + read models (issue #65).
+#
+# The platform ships customer-owned single-tenant by DEFAULT (exactly one configured tenant, in the
+# customer's own subscription — guardrail #1); an opt-in MSP overlay (one instance serving several
+# client tenants via Azure Lighthouse — ADR 0011) is the multi-tenant mode. BOTH modes resolve to
+# exactly one :class:`TenantContext` per request/operation, which the state layer uses to namespace
+# every write and filter every read (deny-by-default, fail-closed). See ADR 0017.
+# --------------------------------------------------------------------------------------
+_TENANT_ID_MAX_LEN = 128
+# A tenant id is a NON-PII directory identifier — an Entra tenant GUID or a verified domain
+# (e.g. ``contoso.onmicrosoft.com``). Constrain it to a storage-safe charset so it can never smuggle
+# a quote, path separator, or OData operator into a partition/row key (defense in depth beneath the
+# hex-encoding the state layer additionally applies).
+_TENANT_ID_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def is_tenant_id_safe(value: str) -> bool:
+    """Return ``True`` iff ``value`` is a bounded, storage-safe, non-PII tenant identifier.
+
+    Fail-closed: rejects a non-``str``, the empty string, anything longer than
+    :data:`_TENANT_ID_MAX_LEN`, and any character outside :data:`_TENANT_ID_ALLOWED` — so a tenant
+    id can never carry a quote / path separator / OData operator into a storage partition key.
+    """
+    if not isinstance(value, str) or not value or len(value) > _TENANT_ID_MAX_LEN:
+        return False
+    return all(ch in _TENANT_ID_ALLOWED for ch in value)
+
+
+class TenancyMode(StrEnum):
+    """How this platform instance is delivered (issue #65). String-valued ⇒ trivially non-PII.
+
+    * ``single`` — customer-owned single-tenant instance (the DEFAULT): exactly one configured
+      tenant, running in the customer's own subscription (guardrail #1).
+    * ``multi`` — opt-in MSP overlay: one instance serving several client tenants via Azure
+      Lighthouse (ADR 0011); the caller's tenant is resolved per request from its validated token.
+    """
+
+    single = "single"
+    multi = "multi"
+
+
+class TenantContext(BaseModel):
+    """The resolved, non-PII tenant a single request/operation is authorized to act within (#65).
+
+    Immutable (``frozen``) and closed (``extra="forbid"``) so it cannot be widened downstream.
+    ``tenant_id`` is a bounded, storage-safe directory identifier (an Entra tenant GUID or verified
+    domain — never PII); ``mode`` records whether it was resolved in the single-tenant DEFAULT or
+    the opt-in MSP overlay. The state layer namespaces every write and filters every read by this
+    id (deny-by-default), so a query without a resolved :class:`TenantContext` returns nothing —
+    never another tenant's data.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: str
+    mode: TenancyMode
+
+    @field_validator("tenant_id")
+    @classmethod
+    def _tenant_id_is_storage_safe(cls, value: str) -> str:
+        if not is_tenant_id_safe(value):
+            # Never echo the offending value — keep the fail-closed error PII-free by construction.
+            raise ValueError("TenantContext.tenant_id is not a bounded, storage-safe identifier")
+        return value
+
+
+# --------------------------------------------------------------------------------------
 # Packs — the five signed, versioned content types.
 # --------------------------------------------------------------------------------------
 class PackType(StrEnum):
