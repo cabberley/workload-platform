@@ -103,7 +103,11 @@ def test_impact_unknown_node_fails_closed(client):
     resp = client.get("/api/workloads/epic/impact", params={"node": "ghost"})
     # Fail closed: unknown node is a 404, never a silent all-up map.
     assert resp.status_code == 404
-    assert "ghost" in resp.json()["detail"]
+    # Bounded, PII-free body (issue #96): a constant detail that never echoes the caller-controlled
+    # ``node`` path param (the error body bypasses the response_model).
+    detail = resp.json()["detail"]
+    assert detail == "node not in dependency graph"
+    assert "ghost" not in detail
 
 
 def test_impact_missing_node_param_is_422(client):
@@ -115,7 +119,10 @@ def test_impact_missing_node_param_is_422(client):
 def test_impact_no_graph_is_404(client):
     resp = client.get("/api/workloads/nope/impact", params={"node": "odb"})
     assert resp.status_code == 404
-    assert "nope" in resp.json()["detail"]
+    # Bounded, PII-free body (issue #96): never echo the caller-controlled ``workload`` path param.
+    detail = resp.json()["detail"]
+    assert detail == "no dependency graph for workload"
+    assert "nope" not in detail
 
 
 def test_impact_endpoint_does_not_mutate_state(client):
