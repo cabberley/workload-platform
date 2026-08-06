@@ -92,17 +92,24 @@ unresolvable attribute-call return (``return service.emit()`` whose return type 
 not flagged (the explicit egress allowlist is the real boundary); a genuinely OPAQUE HTTPException
 detail (a bare name of unknown type or an unclassifiable call/attribute that is neither
 provably-string nor provably-structured) stays waivable-by-human (a human must sign off each opaque
-surface); validator / ``Annotated``-metadata callables (``BeforeValidator``/``AfterValidator``/
-``field_validator``) that raise a structured ``HTTPException`` from a dependency/route parameter are
-NOT yet audited — a documented, deliberately-deferred residual tracked in issue **#103** (an
-anti-pattern of near-zero realism; the real app uses no validators; covered by over-approximation +
-human-waiver + downstream guardrails); and genuinely esoteric annotation wrappers beyond the handled
+surface); and genuinely esoteric annotation wrappers beyond the handled
 ``TypeAliasType``/serializer markers may not be fully reducible. (Builtin collection constructors —
 bare-Name, attribute and module-level alias forms — mapping-dump methods, the ``jsonable_encoder``
 structure encoder incl. attribute and one-level alias forms, ``json.loads``,
 aliased-Response-subclass raw returns incl. attribute-bound aliases, dependency-function
-raw/structured RETURN values (one level), and direct class-dependency ``__new__``/``__init__``
-constructors are COVERED, not residual.)
+raw/structured RETURN values (one level), direct class-dependency ``__new__``/``__init__``
+constructors, and validator / ``Annotated``-metadata callables (issue **#103**:
+``BeforeValidator``/``AfterValidator``/``PlainValidator``/``WrapValidator`` found at ANY
+container/union/alias depth in a parameter's ``Annotated`` metadata, plus
+``@field_validator``/``@model_validator`` methods of a Pydantic-model parameter — including a model
+reached through a nested field, an ``Optional``/``Union`` member, a container element, or a
+``TypeAliasType`` / PEP 695 ``type X =`` alias, with a bounded visited-set so recursive/
+self-referential annotations terminate) on BOTH route-handler and class-dependency
+(``__new__``/``__init__``/``__call__``) parameters — each user-defined validator's body is resolved
+and audited with the SAME structured/scalar ``HTTPException(detail=...)`` machinery (a structured
+detail is unwaivable; a scalar coercion is waivable), an opaque/unresolvable validator fails closed
+like any other
+unprovable surface, and framework/builtin validators are skipped — are COVERED, not residual.)
 
 Because value-constrained unbounded mappings (`ResourceNode.tags`, `ModuleRunResult.extra`,
 `ImpactResult.states`, `ScaleTrigger.metadata`) still exist in ``src/**`` and are tracked by
@@ -178,6 +185,30 @@ except Exception:  # noqa: BLE001
 
 _HTTP_EXCEPTION_CLASSES: tuple[type, ...] = tuple(
     c for c in (_STARLETTE_HTTP_EXC, _FASTAPI_HTTP_EXC) if isinstance(c, type)
+)
+
+
+# Pydantic functional-validator markers (issue #103). FastAPI/Pydantic run the callable wrapped by
+# each of these when it appears in a parameter's ``Annotated[...]`` metadata, so a user callable
+# raising a structured ``HTTPException`` from one egresses PII like a handler/dependency. Resolved
+# once (by identity) so the metadata walk recognises them regardless of import alias; the
+# dependency's shape is guarded so the tool degrades gracefully if pydantic changes.
+_BeforeValidator: type | None
+_AfterValidator: type | None
+_PlainValidator: type | None
+_WrapValidator: type | None
+try:  # pragma: no cover - guarded like the HTTPException imports above.
+    from pydantic.functional_validators import AfterValidator as _AfterValidator
+    from pydantic.functional_validators import BeforeValidator as _BeforeValidator
+    from pydantic.functional_validators import PlainValidator as _PlainValidator
+    from pydantic.functional_validators import WrapValidator as _WrapValidator
+except Exception:  # noqa: BLE001 - optional dependency shape; no functional validators recognised.
+    _BeforeValidator = _AfterValidator = _PlainValidator = _WrapValidator = None
+
+_FUNCTIONAL_VALIDATOR_MARKERS: tuple[type, ...] = tuple(
+    c
+    for c in (_BeforeValidator, _AfterValidator, _PlainValidator, _WrapValidator)
+    if isinstance(c, type)
 )
 
 
@@ -966,6 +997,41 @@ def _resolve_helper_func(
     return None
 
 
+def _iter_executed_callables(obj: Any) -> list[Any]:
+    """Runtime callable(s) FastAPI actually executes for ``obj`` (its parameters are user-bound).
+
+    - a plain function/coroutine/method → ``obj`` itself;
+    - a CLASS used directly as a dependency (``Depends(Guard)``) → FastAPI INSTANTIATES it, running
+      (in order) a user ``__new__``, then ``__init__``; a user ``__call__`` and a user metaclass
+      ``__call__`` may also run. Only USER-defined members (present in the class's own MRO
+      ``__dict__``, not inherited ``object``/``type`` slot-wrappers) are returned so a plain class
+      does not false-positive;
+    - an INSTANCE callable (``Depends(Guard())``) → ``type(obj).__call__``.
+
+    Shared by :func:`_resolve_callable_func` (which audits each returned callable's BODY) and the
+    validator walk (issue #103, which reads each returned callable's PARAMETER annotations for
+    ``Annotated``-embedded validators) so both use one definition of "what FastAPI runs".
+    """
+    candidates: list[Any] = []
+    if inspect.isfunction(obj) or inspect.iscoroutinefunction(obj) or inspect.ismethod(obj):
+        candidates.append(obj)
+    elif isinstance(obj, type):
+        for dunder in ("__new__", "__init__", "__call__"):
+            member = _user_defined_member(obj, dunder)
+            if member is not None:
+                candidates.append(member)
+        meta = type(obj)
+        if meta is not type:
+            meta_call = _user_defined_member(meta, "__call__")
+            if meta_call is not None:
+                candidates.append(meta_call)
+    else:
+        member = _user_defined_member(type(obj), "__call__")
+        if member is not None:
+            candidates.append(member)
+    return candidates
+
+
 def _resolve_callable_func(
     obj: Any,
 ) -> list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]]:
@@ -982,30 +1048,8 @@ def _resolve_callable_func(
     ``__globals__``. This lets idiomatic FastAPI class-based dependencies be audited, not silently
     skipped (their ``ClassDef`` has no top-level FunctionDef).
     """
-    candidates: list[Any] = []
-    if inspect.isfunction(obj) or inspect.iscoroutinefunction(obj) or inspect.ismethod(obj):
-        candidates.append(obj)
-    elif isinstance(obj, type):
-        # FastAPI instantiates a class dependency: ``__new__``/``__init__`` run on construction, and
-        # a user ``__call__`` may run too. Only USER-defined members (present in the class's own MRO
-        # ``__dict__``, not inherited ``object`` slot-wrappers) are real functions we can audit.
-        for dunder in ("__new__", "__init__", "__call__"):
-            member = _user_defined_member(obj, dunder)
-            if member is not None:
-                candidates.append(member)
-        # A user metaclass ``__call__`` (not the ``type.__call__`` slot) also runs on instantiation.
-        meta = type(obj)
-        if meta is not type:
-            meta_call = _user_defined_member(meta, "__call__")
-            if meta_call is not None:
-                candidates.append(meta_call)
-    else:
-        member = _user_defined_member(type(obj), "__call__")
-        if member is not None:
-            candidates.append(member)
-
     resolved: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, dict[str, Any]]] = []
-    for candidate in candidates:
+    for candidate in _iter_executed_callables(obj):
         if not (
             inspect.isfunction(candidate)
             or inspect.iscoroutinefunction(candidate)
@@ -1294,6 +1338,185 @@ def _iter_annotation_metadata(annotation: Any) -> list[Any]:
             continue
         stack.extend(get_args(node))
     return found
+
+
+# --------------------------------------------------------------------------------------
+# Validator / Annotated-metadata callable extraction (issue #103).
+#
+# FastAPI/Pydantic run user-defined callables embedded in a parameter's ``Annotated[...]`` metadata
+# (``BeforeValidator``/``AfterValidator``/``PlainValidator``/``WrapValidator``) and the
+# ``@field_validator``/``@model_validator`` methods of a Pydantic-model parameter, BEFORE/around a
+# handler or class-dependency call. A validator that raises a structured ``HTTPException`` egresses
+# its detail to the client exactly like a handler/dependency, so its body must be audited with the
+# SAME structured/scalar detail machinery. Extraction is pure/static (no importing/executing the
+# target app beyond reading already-imported objects) and bounded by a visited-set so a recursive
+# or self-referential model annotation cannot loop.
+# --------------------------------------------------------------------------------------
+def _functional_validator_funcs(annotation: Any) -> list[Any]:
+    """User callables wrapped by a functional-validator marker anywhere in ``annotation``.
+
+    Reuses :func:`_iter_annotation_metadata` so a marker buried inside a container/union/type-alias
+    is still reached, then keeps only ``BeforeValidator``/``AfterValidator``/``PlainValidator``/
+    ``WrapValidator`` instances and returns each one's wrapped ``.func``.
+    """
+    if not _FUNCTIONAL_VALIDATOR_MARKERS:
+        return []
+    out: list[Any] = []
+    for meta in _iter_annotation_metadata(annotation):
+        if isinstance(meta, _FUNCTIONAL_VALIDATOR_MARKERS):
+            func = getattr(meta, "func", None)
+            if func is not None:
+                out.append(func)
+    return out
+
+
+def _model_decorator_validator_funcs(model: type) -> list[Any]:
+    """The raw functions behind a model's ``@field_validator``/``@model_validator`` decorators.
+
+    Pydantic records these in ``model.__pydantic_decorators__`` (``field_validators`` +
+    ``model_validators`` maps of ``Decorator`` objects, each exposing the underlying ``.func``).
+    Builtin/pydantic-internal validators are not decorators on the user model, so only app-defined
+    validator methods appear here.
+    """
+    decorators = getattr(model, "__pydantic_decorators__", None)
+    if decorators is None:
+        return []
+    out: list[Any] = []
+    for group_name in ("field_validators", "model_validators"):
+        group = getattr(decorators, group_name, {}) or {}
+        for dec in group.values():
+            func = getattr(dec, "func", None)
+            if func is not None:
+                out.append(func)
+    return out
+
+
+def _unwrap_type_alias(annotation: Any, visited: set[int]) -> Any:
+    """Unwrap a (possibly chained) ``TypeAliasType`` to its value, bounded by ``visited``.
+
+    Handles both PEP 695 ``type X = ...`` aliases and explicit ``TypeAliasType("X", ...)``. Mirrors
+    the unwrap in :func:`_iter_annotation_metadata` (matched by class name + ``__value__``) so the
+    model-discovery path and the metadata path agree. The visited-set (alias ids) terminates
+    self-referential aliases (``type X = list[X]``).
+    """
+    node = annotation
+    while type(node).__name__ == "TypeAliasType":
+        if id(node) in visited:
+            return None
+        visited.add(id(node))
+        value = getattr(node, "__value__", None)
+        if value is None:
+            return None
+        node = value
+    return node
+
+
+def _referenced_models(annotation: Any, visited: set[int]) -> list[type]:
+    """Every ``BaseModel`` reachable in ``annotation``, unwrapping ``TypeAliasType`` at any depth.
+
+    Like :func:`iter_referenced_types` (unwraps ``Annotated``/``Optional``/``Union`` and recurses
+    container ``get_args``) but ALSO unwraps PEP 695 / ``TypeAliasType`` aliases (issue #103 HIGH-2)
+    so a model hidden behind ``type X = Annotated[_Model, ...]`` — and therefore its
+    ``@field_validator``/``@model_validator`` methods — is still discovered. Bounded by ``visited``
+    (alias + already-yielded ids) so recursive aliases/models terminate.
+    """
+    node = _unwrap_type_alias(annotation, visited)
+    if node is None:
+        return []
+    found: list[type] = []
+    for member in _iter_union_members(node):
+        if type(member).__name__ == "TypeAliasType":
+            found.extend(_referenced_models(member, visited))
+            continue
+        if isinstance(member, type) and issubclass(member, BaseModel):
+            found.append(member)
+        for arg in get_args(member):
+            found.extend(_referenced_models(arg, visited))
+    return found
+
+
+def _collect_model_validator_callables(
+    model: type, visited: set[int], out: list[Any]
+) -> None:
+    """Add every validator callable reachable from ``model`` (bounded by ``visited``).
+
+    Collects the model's own ``@field_validator``/``@model_validator`` methods and the functional
+    validators embedded in each field's annotation — at ANY container/union/alias depth (issue #103
+    HIGH-1), via the deep :func:`_functional_validator_funcs` walk plus the top-level
+    ``FieldInfo.metadata`` markers pydantic strips off the outermost ``Annotated`` — then recurses
+    into nested Pydantic-model field types (unwrapping ``TypeAliasType`` via
+    :func:`_referenced_models`). The visited-set (by object id) bounds recursion on recursive /
+    self-referential model graphs.
+    """
+    if id(model) in visited:
+        return
+    visited.add(id(model))
+    out.extend(_model_decorator_validator_funcs(model))
+    for finfo in getattr(model, "model_fields", {}).values():
+        annotation = getattr(finfo, "annotation", None)
+        # HIGH-1: functional validators nested at any depth in the field annotation.
+        out.extend(_functional_validator_funcs(annotation))
+        # ...plus markers pydantic strips off the field's OUTERMOST Annotated into the metadata
+        # (where ``annotation`` is the bare inner type, so the deep walk above cannot see them).
+        for meta in getattr(finfo, "metadata", None) or []:
+            if _FUNCTIONAL_VALIDATOR_MARKERS and isinstance(meta, _FUNCTIONAL_VALIDATOR_MARKERS):
+                func = getattr(meta, "func", None)
+                if func is not None:
+                    out.append(func)
+        for nested in _referenced_models(annotation, visited):
+            _collect_model_validator_callables(nested, visited, out)
+
+
+def _collect_param_validator_callables(annotation: Any) -> list[Any]:
+    """Every user-defined validator callable reachable from a single parameter ``annotation``.
+
+    Combines the functional validators in the annotation's own ``Annotated`` metadata (deep walk,
+    alias-unwrapping) with the ``@field_validator``/``@model_validator`` methods (and nested-field
+    functional validators) of any Pydantic model the annotation references — including one hidden
+    behind a ``TypeAliasType`` (issue #103 HIGH-2). Bounded, static, and side-effect-free.
+    """
+    out: list[Any] = _functional_validator_funcs(annotation)
+    visited: set[int] = set()
+    for model in _referenced_models(annotation, visited):
+        _collect_model_validator_callables(model, visited, out)
+    return out
+
+
+def _iter_param_annotations(fn: Any) -> list[Any]:
+    """Resolved parameter annotations of ``fn`` (``Annotated`` metadata kept), excluding return.
+
+    Uses ``typing.get_type_hints(..., include_extras=True)`` so forward refs resolve and validator
+    markers survive. Best-effort: an un-introspectable signature degrades to no annotations rather
+    than crashing the audit (validator-callable resolution — not hint resolution — is the fail-
+    closed contract for issue #103).
+    """
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except Exception:  # noqa: BLE001 - unreadable/partial hints degrade gracefully.
+        return []
+    return [value for key, value in hints.items() if key != "return"]
+
+
+_FRAMEWORK_VALIDATOR_ROOTS: frozenset[str] = frozenset(
+    {"fastapi", "starlette", "pydantic", "pydantic_core"}
+)
+
+
+def _validator_callable_is_framework(func: Any) -> bool:
+    """True iff ``func`` is a framework/builtin validator to SKIP (audit only app-defined source).
+
+    Mirrors the dependency walk's top-package framework check (``fastapi``/``starlette``, extended
+    with ``pydantic``/``pydantic_core``) and additionally treats Python builtins and C-level
+    method/slot descriptors as framework/builtin. A callable that is NOT recognised here but ALSO
+    cannot be resolved to auditable app source is handled as OPAQUE (fail-closed), not skipped.
+    """
+    module = inspect.getmodule(func)
+    top = (getattr(module, "__name__", "") or "").split(".", 1)[0]
+    if top in _FRAMEWORK_VALIDATOR_ROOTS:
+        return True
+    if inspect.isbuiltin(func) or inspect.ismethoddescriptor(func):
+        return True
+    return getattr(func, "__module__", None) == "builtins"
 
 
 def emitted_field_keys(name: str, info: FieldInfo) -> set[str]:
@@ -1713,6 +1936,10 @@ class Auditor:
         methods = ",".join(sorted(route.methods or []))
         label = f"{methods} {prefix}{route.path}"
 
+        # Validators embedded in handler/dependency PARAMETER annotations run regardless of the
+        # route's response_model, so audit them before the response_model branches below (#103).
+        self._audit_route_validators(route, label)
+
         annotations: list[Any] = []
         if route.response_model is not None:
             annotations.append(route.response_model)
@@ -1830,6 +2057,95 @@ class Auditor:
                     note = f"dependency {name}() {rreason}"
                     key = f"{label} <dependency {name} raw return>"
                     self.violations.append(Violation(key, "dynamic", note))
+
+    def _iter_param_bearing_callables(self, route: Any) -> list[Any]:
+        """Every runtime callable whose PARAMS FastAPI binds for ``route`` (handler + dependencies).
+
+        The handler plus each app-owned dependency callable's executed constructor/``__call__``
+        methods (via :func:`_iter_executed_callables`) — the surfaces whose ``Annotated`` parameter
+        metadata may carry user validators. Framework-owned dependencies are skipped exactly like
+        :meth:`_audit_route_dependencies`.
+        """
+        out: list[Any] = []
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is not None:
+            out.append(endpoint)
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            return out
+        stack = list(getattr(dependant, "dependencies", []) or [])
+        seen: set[int] = set()
+        while stack:
+            dep = stack.pop()
+            stack.extend(getattr(dep, "dependencies", []) or [])
+            call = getattr(dep, "call", None)
+            if call is None or id(call) in seen:
+                continue
+            seen.add(id(call))
+            module = inspect.getmodule(call)
+            top = (getattr(module, "__name__", "") or "").split(".", 1)[0]
+            if top in {"fastapi", "starlette"}:
+                continue  # framework-owned dependency, not app egress
+            out.extend(_iter_executed_callables(call))
+        return out
+
+    def _audit_route_validators(self, route: Any, label: str) -> None:
+        """Audit validator callables embedded in handler/dependency parameter annotations (#103).
+
+        FastAPI/Pydantic run ``BeforeValidator``/``AfterValidator``/``PlainValidator``/
+        ``WrapValidator`` callables in a parameter's ``Annotated`` metadata and the
+        ``@field_validator``/``@model_validator`` methods of a Pydantic-model parameter before the
+        handler/dependency body; a validator raising a structured ``HTTPException`` egresses its
+        detail like any other surface. Each extracted user validator is audited once.
+        """
+        seen: set[int] = set()
+        for fn in self._iter_param_bearing_callables(route):
+            for annotation in _iter_param_annotations(fn):
+                for validator in _collect_param_validator_callables(annotation):
+                    if id(validator) in seen:
+                        continue
+                    seen.add(id(validator))
+                    self._audit_validator_callable(validator, label)
+
+    def _audit_validator_callable(self, validator: Any, label: str) -> None:
+        """Audit one extracted validator callable's body with the shared detail machinery (#103).
+
+        Framework/builtin validators are skipped (only app-defined source is audited). A validator
+        that cannot be resolved to auditable source (opaque / imported-from-outside-app) is NOT
+        silently skipped: it is surfaced via :meth:`_flag_unbounded` (fail-closed, waivable) exactly
+        like any other statically-unprovable egress surface. A resolvable validator's body is
+        scanned for unbounded ``raise HTTPException(detail=...)`` using the SAME structured/scalar
+        classification (:func:`_http_detail_findings` + :func:`build_assignment_map`) as handlers
+        and dependencies — a structured detail is an unwaivable hard finding; a scalar coercion
+        keys to a per-validator waivable suffix.
+        """
+        name = getattr(validator, "__name__", None) or type(validator).__name__
+        if _validator_callable_is_framework(validator):
+            return
+        resolved = _resolve_callable_func(validator)
+        if not resolved:
+            self._flag_unbounded(
+                f"{label} <validator {name} unresolved>",
+                f"validator {name}() cannot be resolved to auditable app source "
+                "(opaque/imported-from-outside-app) — cannot prove it does not egress structured "
+                "PII in a raised HTTPException detail",
+            )
+            return
+        for vfunc, v_globals in resolved:
+            resolver = _http_exc_resolver(v_globals)
+            v_assigns = build_assignment_map(vfunc)
+            for structured, reason in _http_detail_findings(
+                vfunc, resolver, v_assigns, v_globals
+            ):
+                note = (
+                    f"validator {name}() raises HTTPException with an unbounded detail — {reason}"
+                )
+                if structured:
+                    key = f"{label} {_HTTP_STRUCTURED_SUFFIX}"
+                    self.violations.append(Violation(key, "dynamic", note))
+                else:
+                    key = f"{label} <validator {name} raise detail>"
+                    self._flag_unbounded(key, note)
 
     @staticmethod
     def _handler_bypasses_model(
