@@ -2,13 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aegis.microsoft.com/packs/ops.schema.json",
   "title": "Ops Pack body",
-  "description": "Notification routing table consumed by the Alerts & Notifications module (load_ops_routing + route).",
+  "description": "Notification routing table (Alerts module) plus an OPTIONAL advisory-only remediation table (AIOps module, issue #52).",
   "type": "object",
   "additionalProperties": false,
-  "$comment": "route() reads routes.get(sev, default) with a hard-coded 'ticket' fallback (alerts/module.py:117-123), and load_ops_routing reads routes/default/runbook independently (alerts/module.py:135-158). So default-only, routes-only, or both are all valid; at least one must be present.",
+  "$comment": "Two independent consumers read this body. (1) Alerts routing: route() reads routes.get(sev, default) with a hard-coded 'ticket' fallback (alerts/module.py:117-123) and load_ops_routing reads routes/default/runbook independently (alerts/module.py:135-158). (2) AIOps advisory remediation (issue #52): reads the additive, OPTIONAL 'remediations' table only. The three groups are independent — a pack may carry routing (default/routes) alone, remediations alone, or both — so the anyOf below admits a remediation-only Ops pack while leaving every routing consumer unaffected. 'remediations' NEVER encodes an executable action: it is advisory human-readable text only (guardrail 5, no auto-remediation).",
   "anyOf": [
     { "required": ["default"] },
-    { "required": ["routes"] }
+    { "required": ["routes"] },
+    { "required": ["remediations"] }
   ],
   "properties": {
     "default": {
@@ -31,6 +32,48 @@
     "runbook": {
       "type": ["string", "null"],
       "description": "Runbook link surfaced with routed notifications; null/absent is skipped via a truthy check (alerts/module.py:157). 'default' and 'routes' stay strict — a fallback policy must carry a real value."
+    },
+    "remediations": {
+      "type": "object",
+      "description": "OPTIONAL, ADVISORY-ONLY (issue #52). Maps a stable, low-cardinality root-cause CATEGORY (the node's classified Discovery role, e.g. 'odb', 'ecp', 'web', 'lb') to an ordered list of advisory remediation steps. The keys '*' and 'default' are documented catch-alls used when no category-specific list matches. The AIOps module attaches these steps to a confidence-gated RCA (advisory only — a human decides and applies; there is NO auto-remediation path). Bounded (max categories, steps, string lengths) to stay fail-closed.",
+      "minProperties": 1,
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^(\\*|[a-z0-9][a-z0-9._/-]*)$"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "description": "Ordered advisory steps for one root-cause category.",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["description"],
+          "$comment": "NO field may encode an executable action, script, command, or API call. 'description' is advisory human-readable text; 'runbook' is a citation URL; 'escalateSeverity' is an escalation hint — none is executed.",
+          "properties": {
+            "description": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "description": "Short human-readable advisory action. Advisory text only — never a command, script, or API call."
+            },
+            "runbook": {
+              "type": ["string", "null"],
+              "maxLength": 2048,
+              "description": "Optional runbook/citation URL for this step."
+            },
+            "escalateSeverity": {
+              "type": "string",
+              "enum": ["info", "low", "medium", "high", "critical"],
+              "description": "Optional hint: escalate / call support at or above this severity."
+            }
+          }
+        }
+      }
     }
   }
 }

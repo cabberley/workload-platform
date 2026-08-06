@@ -5,6 +5,7 @@
     "name": "Epic on Azure — core estate",
     "version": "1.0.0",
     "targets": ["epic"],
+    "sha256": "9aea51f2448258a765aa14d402d718148b79367a9ba363c55f03da5a431cfeed",
     "author": "microsoft"
   },
   "body": {

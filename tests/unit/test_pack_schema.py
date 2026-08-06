@@ -246,9 +246,97 @@ def test_telemetry_non_finite_threshold_rejected() -> None:
 
 
 def test_telemetry_unknown_field_allowed_forward_compat() -> None:
+    # TelemetryRuleSpec uses extra="ignore"; a genuinely-unknown field must not fail CI. ('window'
+    # and 'expression' are now typed optional fields — issue #51 — so they are exercised below.)
     pack = _load(_SHIPPED["telemetry"])
-    pack["body"]["signals"][0]["window"] = "5m"
+    pack["body"]["signals"][0]["futureHint"] = "5m"
     assert validate_pack(pack) == []
+
+
+# --- Telemetry issue #51: optional windowed + expression detectors --------------------------------
+
+def test_telemetry_valid_window_aggregate_validates() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "aggregate": "avg", "mode": "aggregate"}
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_valid_window_duration_validates() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"durationSeconds": 300, "mode": "all"}
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_valid_expression_validates() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "avg > threshold and max < 900"
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_window_both_selectors_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "durationSeconds": 10}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_neither_selector_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"aggregate": "avg"}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_unknown_aggregate_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "aggregate": "median"}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_unknown_mode_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "mode": "sometimes"}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_zero_samples_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 0}
+    assert validate_pack(pack)
+
+
+def test_telemetry_window_extra_property_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"samples": 5, "bogus": 1}
+    assert validate_pack(pack)
+
+
+def test_telemetry_non_finite_window_duration_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["window"] = {"durationSeconds": float("inf")}
+    errors = validate_pack(pack)
+    assert errors and any("finite" in e for e in errors)
+
+
+def test_telemetry_unsafe_expression_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "__import__('os').system('x')"
+    assert validate_pack(pack)
+
+
+def test_telemetry_expression_bad_name_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "secret > 1"
+    assert validate_pack(pack)
+
+
+def test_telemetry_expression_non_finite_literal_rejected() -> None:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["signals"][0]["expression"] = "value > 1e400"
+    assert validate_pack(pack)
+
+
+def test_synthetic_windowed_example_pack_validates_clean() -> None:
+    example = CONTENT / "telemetry" / "synthetic-windowed-detectors.json"
+    assert validate_pack(_load(example)) == []
 
 
 # --- Dependency (unchanged shape) -------------------------------------------------------------
@@ -305,6 +393,78 @@ def test_ops_null_runbook_is_valid() -> None:
     pack = _load(_SHIPPED["ops"])
     pack["body"]["runbook"] = None
     assert validate_pack(pack) == []
+
+
+# --- Ops: issue #52 additive advisory `remediations` (routing consumers unaffected) -----------
+
+def test_ops_remediation_only_pack_is_valid() -> None:
+    # A remediation-only Ops pack (no default/routes) must validate — the broadened anyOf admits it.
+    pack = _load(_SHIPPED["ops"])
+    pack["body"] = {"remediations": {
+        "odb": [{"description": "Check failover."}],
+        "web": [{"description": "Check probes.", "runbook": "https://aka.ms/x",
+                 "escalateSeverity": "high"}],
+    }}
+    assert validate_pack(pack) == []
+
+
+def test_ops_routing_only_pack_still_valid_alerts_unaffected() -> None:
+    # The existing routing-only shape (no remediations) must remain valid unchanged.
+    pack = _load(_SHIPPED["ops"])
+    pack["body"] = {"routes": {"high": "email", "critical": "page"}}
+    assert validate_pack(pack) == []
+
+
+def test_ops_routing_and_remediation_together_is_valid() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"*": [{"description": "Catch-all advisory."}]}
+    assert validate_pack(pack) == []
+
+
+def test_ops_shipped_synthetic_remediation_pack_validates() -> None:
+    pack = _load(CONTENT / "ops" / "synthetic-remediation-advisory.json")
+    assert validate_pack(pack) == []
+
+
+def test_synthetic_remediation_pack_scoped_to_fake_workload_only() -> None:
+    # MED 3: the clearly-fake pack must NOT resolve for any real workload (e.g. 'epic') — it is
+    # scoped to a synthetic, non-real target so fake advice can never surface in a real deployment.
+    from packs_engine.engine import PacksEngine
+    from shared.contracts import PackType
+
+    engine = PacksEngine(CONTENT)
+    epic_ids = {p.manifest.id for p in engine.load_for_workload("epic", PackType.ops)}
+    demo_ids = {
+        p.manifest.id
+        for p in engine.load_for_workload("acme-remediation-demo", PackType.ops)
+    }
+    assert "synthetic-remediation-advisory" not in epic_ids
+    assert "synthetic-remediation-advisory" in demo_ids
+
+
+def test_ops_remediation_executable_field_rejected() -> None:
+    # additionalProperties:false on a step means an executable-looking field fails closed.
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": [{"description": "ok", "command": "rm -rf /"}]}
+    assert validate_pack(pack)
+
+
+def test_ops_remediation_missing_description_rejected() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": [{"runbook": "https://aka.ms/x"}]}
+    assert validate_pack(pack)
+
+
+def test_ops_remediation_oversized_step_list_rejected() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": [{"description": f"s{i}"} for i in range(21)]}
+    assert validate_pack(pack)
+
+
+def test_ops_remediation_empty_category_list_rejected() -> None:
+    pack = _load(_SHIPPED["ops"])
+    pack["body"]["remediations"] = {"odb": []}
+    assert validate_pack(pack)
 
 
 # --- Structural fail-closed cases -------------------------------------------------------------

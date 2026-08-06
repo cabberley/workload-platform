@@ -6,7 +6,7 @@ from shared.contracts import Finding, ResourceNode, Severity
 from shared.module_base import Module, ModuleContext, build_default_registry, run_module
 
 
-def test_registry_has_six_modules():
+def test_registry_has_seven_modules():
     reg = build_default_registry()
     names = set(reg.names())
     assert names == {
@@ -16,6 +16,7 @@ def test_registry_has_six_modules():
         "dependency_graph",
         "aiops",
         "alerts",
+        "telemetry_export",
     }
 
 
@@ -40,7 +41,8 @@ def test_discovery_classify_assigns_role():
 def test_quality_rule_fails_closed_on_missing_tag():
     node = ResourceNode(id="vm1", name="vm1", type="Microsoft.Compute/virtualMachines")
     rule = {"id": "r1", "title": "zone tag", "resourceType": "Microsoft.Compute/virtualMachines",
-            "requiredTag": "availability-zone", "severity": "high"}
+            "requiredTag": "availability-zone", "severity": "high",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is False
@@ -49,7 +51,8 @@ def test_quality_rule_fails_closed_on_missing_tag():
 
 def test_alerts_escalate_by_blast_radius():
     f = Finding(id="f", module="quality_checks", title="t", passed=False,
-                severity=Severity.medium, blastRadius=6)
+                severity=Severity.medium, blastRadius=6,
+                packId="waf-reliability-baseline", packVersion="1.2.0")
     assert weight_by_blast_radius(f) == Severity.critical
     decision = route(f, {"routes": {"critical": "page"}, "default": "ticket"})
     assert decision["channel"] == "page"

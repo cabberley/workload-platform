@@ -5,6 +5,7 @@
     "name": "Default notification policy",
     "version": "1.0.0",
     "targets": [],
+    "sha256": "2f9240e5c8989857f36a2b22037863423f670ccbc2dd760caeb3caa0c18fd73c",
     "author": "microsoft"
   },
   "body": {

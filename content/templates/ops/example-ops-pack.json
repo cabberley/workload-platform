@@ -1,0 +1,46 @@
+{
+  "manifest": {
+    "id": "example-ops-pack",
+    "type": "ops",
+    "name": "Example Ops pack — REPLACE ME",
+    "version": "0.1.0",
+    "targets": [],
+    "author": "your-org"
+  },
+  "body": {
+    "default": "ticket",
+    "routes": {
+      "info": "none",
+      "low": "ticket",
+      "medium": "ticket",
+      "high": "email",
+      "critical": "page"
+    },
+    "runbook": "https://example.invalid/REPLACE-ME/runbook",
+    "remediations": {
+      "database": [
+        {
+          "description": "REPLACE ME — advisory step: check the database node's connection pool and failover status.",
+          "runbook": "https://example.invalid/REPLACE-ME/db-runbook",
+          "escalateSeverity": "high"
+        }
+      ],
+      "load-balancer": [
+        {
+          "description": "REPLACE ME — advisory step: verify backend pool health probes on the load balancer."
+        }
+      ],
+      "compute": [
+        {
+          "description": "REPLACE ME — advisory step: review compute node CPU/memory pressure and recent scale events."
+        }
+      ],
+      "*": [
+        {
+          "description": "REPLACE ME — advisory catch-all: capture diagnostics and contact support if the root cause is unclear.",
+          "escalateSeverity": "critical"
+        }
+      ]
+    }
+  }
+}

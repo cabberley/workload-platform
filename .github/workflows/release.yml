@@ -125,6 +125,9 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # Set the `MANAGE_STATE_IMMUTABILITY_POLICY` repository variable to `false` once the
+      # state-container WORM policy has been LOCKED out-of-band — Azure rejects any PUT on a locked
+      # immutability policy, so the pipeline must then stop managing it (see docs/adr/0009…).
       - name: What-if (preview changes)
         run: |
           az deployment group what-if \
@@ -133,7 +136,8 @@ jobs:
             --parameters \
               location="${{ vars.AZURE_LOCATION }}" \
               containerRegistry="${{ vars.ACR_NAME }}" \
-              imageTag="${{ env.IMAGE_TAG }}"
+              imageTag="${{ env.IMAGE_TAG }}" \
+              manageStateImmutabilityPolicy="${{ vars.MANAGE_STATE_IMMUTABILITY_POLICY || 'true' }}"
 
       - name: Deploy
         run: |
@@ -144,7 +148,30 @@ jobs:
             --parameters \
               location="${{ vars.AZURE_LOCATION }}" \
               containerRegistry="${{ vars.ACR_NAME }}" \
-              imageTag="${{ env.IMAGE_TAG }}"
+              imageTag="${{ env.IMAGE_TAG }}" \
+              manageStateImmutabilityPolicy="${{ vars.MANAGE_STATE_IMMUTABILITY_POLICY || 'true' }}"
+
+      # Brownfield fix (issue #79/#97): incremental ARM does NOT delete the pre-#79 single shared
+      # identity nor its Storage Blob/Table Data Contributor assignments, so an environment first
+      # deployed with the shared identity (or, pre-#97, with a worker state-write grant) would RETAIN
+      # a state-writer that is not the api. This step reuses the CD OIDC login (keyless — the
+      # destructive delete stays in CD, not a script identity) to (a) remove that legacy writer and
+      # (b) FAIL the release, fail-closed, if ANY principal other than the api identity still holds a
+      # state-write role at the storage account. It is a no-op on greenfield (nothing stray to remove).
+      - name: Enforce API-only-writer boundary (cleanup legacy identity + verify)
+        run: |
+          set -euo pipefail
+          outputs=$(az deployment group show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "wp-${{ env.IMAGE_TAG }}" \
+            --query properties.outputs -o json)
+          SA_ID=$(echo "$outputs" | jq -r '.storageAccountId.value')
+          API_PID=$(echo "$outputs" | jq -r '.apiIdentityPrincipalId.value')
+          python3 scripts/cleanup_verify_state_writers.py \
+            --scope "$SA_ID" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --allow "$API_PID" \
+            --cleanup
 
       - name: Output endpoints
         run: |

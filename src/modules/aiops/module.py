@@ -17,6 +17,18 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from modules.aiops.connectors.azure_monitor import to_signals as azure_monitor_to_signals
 from modules.aiops.connectors.system_pulse import FetchResult, Signal
 from modules.aiops.connectors.system_pulse import to_signals as system_pulse_to_signals
+from modules.aiops.rca import (
+    RCA_CONFIDENCE_FLOOR,
+    correlate_rca,
+    correlate_root_cause,
+)
+from modules.aiops.remediation import (
+    RemediationTable,
+    extract_root_cause_node_id,
+    node_category,
+    parse_remediation_table,
+    propose_remediation,
+)
 from shared.blast_radius import blast_radius
 from shared.contracts import (
     AgentResponse,
@@ -54,15 +66,31 @@ _MANIFEST = ModuleManifest(
     ),
 )
 
-# Confidence below which we do not assert an RCA — we advise contacting support instead.
-RCA_CONFIDENCE_FLOOR = 0.6
+# ``RCA_CONFIDENCE_FLOOR`` and the correlation logic live in ``modules.aiops.rca`` (issue #50) and
+# are imported above; re-exported here so the module's public RCA surface is unchanged.
+
+
+def _encode_id_component(text: object) -> str:
+    """Percent-encode ``%`` and ``:`` in one finding-id component so it can never contain the ``::``
+    delimiter. This keeps the detection-id namespaces provably disjoint regardless of metric/node
+    content: a legacy id (``detect::<metric>::<node>``) always has exactly two structural ``::``
+    (three components) while a windowed/expression id (``detect::win::…`` / ``detect::expr::…``)
+    always has three — so a metric literally named ``win::cpu`` cannot collide with a windowed
+    ``cpu``. Components without ``%``/``:`` (the common case) are returned unchanged, so existing
+    ids stay byte-for-byte identical."""
+    return str(text).replace("%", "%25").replace(":", "%3A")
 
 
 def detect_metric_breach(signal: dict) -> Finding | None:
     """Pure threshold detection for one telemetry signal.
 
-    signal = {name, value, op ('gt'|'lt'), threshold, nodeId, severity}
+    signal = {name, value, op ('gt'|'lt'), threshold, nodeId, severity, packId, packVersion}
     Fail-closed: a malformed signal returns None (surfaced upstream), never a silent pass.
+
+    A telemetry detection is **pack-derived**, so the finding carries its source pack's
+    ``packId``/``packVersion`` (guardrail #8 / issue #83). These are threaded in from the rule that
+    produced the detection (see ``_breach_input``); the pack-provenance invariant on ``Finding``
+    fails closed at construction if they are absent.
     """
     required = {"name", "value", "op", "threshold"}
     if not required.issubset(signal):
@@ -73,8 +101,11 @@ def detect_metric_breach(signal: dict) -> Finding | None:
     breached = value > threshold if op == "gt" else value < threshold
     if not breached:
         return None
+    pack_id = str(signal.get("packId") or "")
+    pack_version = str(signal.get("packVersion") or "")
     return Finding(
-        id=f"detect::{signal['name']}::{signal.get('nodeId', 'na')}",
+        id=f"detect::{_encode_id_component(signal['name'])}::"
+        f"{_encode_id_component(signal.get('nodeId', 'na'))}",
         module="aiops",
         title=f"Telemetry breach: {signal['name']}",
         passed=False,
@@ -82,31 +113,9 @@ def detect_metric_breach(signal: dict) -> Finding | None:
         nodeId=signal.get("nodeId"),
         evidence=[SourceReference(kind="metric", id=signal["name"],
                                   detail=f"{signal['value']} {op} {signal['threshold']}")],
+        packId=pack_id or None,
+        packVersion=pack_version or None,
         detail="Proactive detection from telemetry pack threshold.",
-    )
-
-
-def correlate_rca(finding: Finding, blast_radius_of: dict[str, int]) -> AgentResponse:
-    """Localize likely root cause using blast radius; gate assertions by confidence."""
-    node = finding.nodeId or "unknown"
-    radius = blast_radius_of.get(node, 0)
-    confidence = 0.8 if radius > 0 else 0.4
-    if confidence >= RCA_CONFIDENCE_FLOOR:
-        recs = [f"Investigate {node} (blast radius {radius}) as probable root cause."]
-        nxt = ["propose-remediation"]
-    else:
-        recs = ["Root cause not confidently localized."]
-        nxt = ["recommend-contact-support"]
-    return AgentResponse(
-        agentName="aiops",
-        taskType="auto-rca",
-        inputSummary=f"finding={finding.id}",
-        findings=[finding.title],
-        risks=[f"blast radius {radius}"] if radius else [],
-        recommendations=recs,
-        sourceReferences=finding.evidence,
-        confidence=confidence,
-        nextActions=nxt,
     )
 
 
@@ -249,6 +258,10 @@ def load_telemetry_rules(
     Only packs whose ``manifest.targets`` include ``workload`` are loaded (the engine filters), so
     an epic telemetry pack never detects against a sap estate. Each rule keeps its ``packId`` /
     ``packVersion`` provenance. Malformed bodies/signals are skipped and surfaced — never raised.
+
+    Signals that declare a ``window`` or ``expression`` are NOT threshold rules: they are routed to
+    the compiled-detector path (:func:`load_windowed_detectors`) and skipped here (no note — they
+    are re-homed, not malformed), so a single-sample threshold never double-fires a windowed one.
     """
     if packs is None:
         return [], []
@@ -257,18 +270,122 @@ def load_telemetry_rules(
     notes: list[str] = []
     for pack in engine.load_for_workload(workload, PackType.telemetry):
         body = pack.body
-        raw_signals = body.get("signals") if isinstance(body, dict) else None
+        if not isinstance(body, dict):
+            notes.append(f"pack {pack.manifest.id}: body is not an object — skipped")
+            continue
+        raw_signals = body.get("signals")
         if not isinstance(raw_signals, list):
-            if isinstance(body, dict) and "signals" in body:
-                notes.append(f"pack {pack.manifest.id}: 'signals' is not a list — skipped")
+            notes.append(
+                f"pack {pack.manifest.id}: 'signals' is absent or not a list — skipped"
+            )
             continue
         for raw in raw_signals:
+            if _is_windowed_signal(raw):
+                continue  # handled by the compiled-detector path, not the threshold path
             rule, note = _parse_signal_rule(raw, pack.manifest.id, pack.manifest.version)
             if note is not None:
                 notes.append(note)
             if rule is not None:
                 rules.append(rule)
     return rules, notes
+
+
+def _is_windowed_signal(raw: Any) -> bool:
+    """True if a raw signal declares a ``window`` or ``expression`` (compiled-detector path).
+
+    Mirrors ``modules.aiops.detectors.classify_signal`` without importing it at module load time
+    (that module imports this one). Kept trivial and in-sync by the shared unit tests.
+    """
+    return isinstance(raw, dict) and ("window" in raw or "expression" in raw)
+
+
+def load_windowed_detectors(
+    packs: object | None, workload: str
+) -> tuple[list[Any], list[str]]:
+    """Compile target-aware windowed/expression detectors for ``workload``. Returns ``(detectors,
+    notes)``.
+
+    Delegates to the pure :func:`modules.aiops.detectors.compile_detectors` (imported lazily to
+    avoid an import cycle) restricted to the ``window``/``expression`` kinds — the threshold kind
+    stays on the cross-pack collective fuse in :func:`load_telemetry_rules`/``fuse_detections`` so
+    multi-pack collision-merge is byte-for-byte preserved. Malformed/unsafe detectors are surfaced,
+    never silently skipped.
+    """
+    if packs is None:
+        return [], []
+    from modules.aiops.detectors import compile_detectors
+
+    engine = cast(_PacksEngineLike, packs)
+    detectors: list[Any] = []
+    notes: list[str] = []
+    for pack in engine.load_for_workload(workload, PackType.telemetry):
+        pack_detectors, pack_notes = compile_detectors(
+            pack.body,
+            pack.manifest.id,
+            pack.manifest.version,
+            kinds={"window", "expression"},
+        )
+        detectors.extend(pack_detectors)
+        notes.extend(pack_notes)
+    return detectors, notes
+
+
+def run_windowed_detectors(
+    detectors: list[Any], signals: list[Signal], estate: list[ResourceNode]
+) -> list[Finding]:
+    """Run compiled window/expression detectors over the observed signals; dedup by id. Pure.
+
+    Detectors emit kind-namespaced ids (``detect::win::`` / ``detect::expr::``) that never clash
+    with threshold ids, but two packs can define the same windowed signal on the same node. We emit
+    exactly one deterministic finding per id (highest severity, then pack provenance) while citing
+    every contributing pack — no provenance lost, output order-free.
+    """
+    by_id: dict[str, list[Finding]] = defaultdict(list)
+    for detector in detectors:
+        for finding in detector(signals, estate):
+            by_id[finding.id].append(finding)
+    merged = [_merge_windowed(group) for group in by_id.values()]
+    merged.sort(key=lambda f: f.id)
+    return merged
+
+
+def _merge_windowed(group: list[Finding]) -> Finding:
+    """Pick the deterministic winner for one id and union the contributing pack references."""
+    winner = sorted(
+        group,
+        key=lambda f: (
+            -_severity_rank(f.severity.value),
+            str(f.packId or ""),
+            str(f.packVersion or ""),
+        ),
+    )[0]
+    if len(group) == 1:
+        return winner
+    pack_refs = {
+        (str(f.packId or ""), str(f.packVersion or ""))
+        for f in group
+        if f.packId
+    }
+    existing = {(ref.kind, ref.id, ref.detail) for ref in winner.evidence}
+    for pack_id, version in sorted(pack_refs):
+        ref = SourceReference(kind="pack", id=pack_id, detail=f"version {version}")
+        if (ref.kind, ref.id, ref.detail) not in existing:
+            winner.evidence.append(ref)
+    return winner
+
+
+def _collect_detector_pack_sources(
+    detectors: list[Any],
+    into: dict[tuple[str | None, str | None], SourceReference],
+) -> None:
+    """Accumulate a distinct ``SourceReference`` per detector's Telemetry Pack (id@version)."""
+    for detector in detectors:
+        key = (detector.pack_id, detector.pack_version)
+        if not detector.pack_id or key in into:
+            continue
+        into[key] = SourceReference(
+            kind="pack", id=str(detector.pack_id), detail=f"version {detector.pack_version}"
+        )
 
 
 def _fetch_source_signals(
@@ -381,7 +498,11 @@ def fuse_detections(
 
 
 def _breach_input(rule: dict[str, Any], signal: Signal, node_id: str) -> dict[str, Any]:
-    """Build the ``detect_metric_breach`` input for one rule × observation on a canonical node."""
+    """Build the ``detect_metric_breach`` input for one rule × observation on a canonical node.
+
+    Threads the rule's pack provenance (``packId``/``packVersion``) so the constructed detection is
+    a valid pack-derived ``Finding`` (issue #83) rather than failing the pack-provenance invariant.
+    """
     return {
         "name": rule["name"],
         "value": signal.value,
@@ -389,6 +510,8 @@ def _breach_input(rule: dict[str, Any], signal: Signal, node_id: str) -> dict[st
         "threshold": rule["threshold"],
         "nodeId": node_id,  # canonical estate id, not the raw signal casing
         "severity": rule["severity"],
+        "packId": rule.get("packId"),
+        "packVersion": rule.get("packVersion"),
     }
 
 
@@ -492,9 +615,26 @@ def _merge_candidates(
         for pack_id, version in contributing
         if pack_id
     ]
-    finding.evidence = list(finding.evidence) + pack_refs
-    finding.packId = winner_rule["packId"]
-    finding.packVersion = winner_rule["packVersion"]
+    # Carry connector provenance (MED 6): now that signals can come from >1 connector, cite which
+    # connector(s) supplied the observations so an operator can trace a finding back to its source.
+    # Deterministic / order-free: distinct source ids, sorted. The cited observation's source is
+    # listed first (as the primary evidence), followed by any other contributing sources.
+    cited_source = str(cited.source)
+    contributing_sources = sorted({str(signal.source) for _rule, signal in candidates})
+    ordered_sources = [cited_source] + [s for s in contributing_sources if s != cited_source]
+    connector_refs = [
+        SourceReference(
+            kind="connector",
+            id=source_id,
+            detail=(
+                "cited observation source" if source_id == cited_source else "observation source"
+            ),
+        )
+        for source_id in ordered_sources
+    ]
+    finding.evidence = list(finding.evidence) + pack_refs + connector_refs
+    # packId/packVersion are already set at construction from ``winner_rule`` via ``_breach_input``
+    # (issue #83), so no post-hoc reassignment is needed here.
     if len(contributing) > 1:
         finding.detail = (
             f"{finding.detail} Merged from {len(contributing)} telemetry packs; "
@@ -532,6 +672,78 @@ def _resolve_workloads(state: ReadableState | None, scope: dict[str, str]) -> li
     return list(state.list_workloads())
 
 
+class _OpsPackLike(Protocol):
+    """Structural view of a verified Ops pack: manifest (provenance) + a body with remediations."""
+
+    @property
+    def manifest(self) -> _PackManifestLike: ...
+
+    @property
+    def body(self) -> dict[str, Any]: ...
+
+
+class _OpsPacksEngineLike(Protocol):
+    """The narrow packs-engine slice for loading verified Ops packs (same trust gate as telemetry).
+
+    ``load_for_workload`` verifies each pack's hash/signature **before** returning it (fail-closed)
+    and filters by ``PackManifest.targets``. We load Ops packs the same verified way the Alerts
+    module does WITHOUT importing that module (module isolation).
+    """
+
+    def load_for_workload(self, workload: str, pack_type: PackType) -> list[_OpsPackLike]: ...
+
+
+def load_ops_remediations(
+    packs: object | None, workload: str
+) -> tuple[list[RemediationTable], list[str]]:
+    """Load verified **Ops Packs** for ``workload`` and parse their advisory ``remediations``.
+
+    Fail-closed (guardrail 4): if the packs engine is absent, or an Ops pack fails verification, we
+    return no tables (⇒ the pure lookup advises support) and surface a note — we never act on an
+    unverified pack. Malformed/oversized remediation sections are rejected by the pure parser and
+    surfaced, never silently accepted. Advisory only — nothing here mutates infrastructure.
+    """
+    if packs is None:
+        return [], []
+    source = cast(_OpsPacksEngineLike, packs)
+    try:
+        loaded = source.load_for_workload(workload, PackType.ops)
+    except Exception:  # unverifiable/unavailable Ops packs -> fail closed, no remediation
+        return [], [
+            f"{workload}: Ops pack(s) failed verification — no remediation, advise support "
+            "(fail-closed)"
+        ]
+    tables: list[RemediationTable] = []
+    notes: list[str] = []
+    for pack in loaded:
+        table, pack_notes = parse_remediation_table(
+            pack.manifest.id, pack.manifest.version, pack.body
+        )
+        notes.extend(pack_notes)
+        if table is not None:
+            tables.append(table)
+    return tables, notes
+
+
+def enrich_rca_with_remediation(
+    rca: AgentResponse,
+    graph: WorkloadGraph | None,
+    tables: list[RemediationTable],
+) -> AgentResponse:
+    """Attach advisory Ops-pack remediation to an RCA, resolving root-cause category at the edge.
+
+    The category is derived from the RCA's asserted root-cause node (its classified Discovery
+    ``role``, via :func:`node_category`); the confidence/verification/no-match gates live in the
+    pure :func:`propose_remediation`. Below the floor RCA asserts no root cause ⇒ no node ⇒ support.
+    """
+    node_id = extract_root_cause_node_id(rca)
+    node = None
+    if node_id and graph is not None:
+        node = next((n for n in graph.nodes if n.id == node_id), None)
+    category = node_category(node)
+    return propose_remediation(rca, root_cause_category=category, tables=tables)
+
+
 class AiopsModule(Module):
     @property
     def manifest(self) -> ModuleManifest:
@@ -563,10 +775,20 @@ class AiopsModule(Module):
             rules, rule_notes = load_telemetry_rules(ctx.packs, workload)
             notes.extend(rule_notes)
             _collect_pack_sources(rules, pack_sources)
-            if not rules:
-                continue  # no telemetry thresholds for this workload
+            # Windowed/expression detectors (issue #51) compile at load time (fail-closed) and run
+            # over the SAME signal stream, feeding the SAME detection -> RCA path as thresholds.
+            windowed_detectors, detector_notes = load_windowed_detectors(ctx.packs, workload)
+            notes.extend(detector_notes)
+            _collect_detector_pack_sources(windowed_detectors, pack_sources)
+            if not rules and not windowed_detectors:
+                continue  # no telemetry detection content for this workload
 
-            metric_names = sorted({str(rule["name"]) for rule in rules})
+            # Fetch every metric named by a threshold rule OR a compiled detector, so a windowed
+            # detector over a metric no threshold watches still gets its observations.
+            metric_names = sorted(
+                {str(rule["name"]) for rule in rules}
+                | {str(det.name) for det in windowed_detectors}
+            )
             signals, available, unavailable = _observe_signals(ctx.clients, metric_names)
             sources_observed = True
             sources_available.update(available)
@@ -575,12 +797,36 @@ class AiopsModule(Module):
                 notes.append(f"{workload}: no telemetry observed from any source")
                 continue
 
-            workload_detections = fuse_detections(rules, signals, state.get_estate(workload))
-            blast_of = _blast_radius_map(state.get_graph(workload))
+            estate = state.get_estate(workload)
+            # Threshold path (unchanged, cross-pack collision-merge) + compiled windowed/expression
+            # detectors, combined into one order-free detection set for correlation.
+            workload_detections = fuse_detections(rules, signals, estate)
+            workload_detections.extend(
+                run_windowed_detectors(windowed_detectors, signals, estate)
+            )
+            workload_detections.sort(key=lambda finding: finding.id)
+            graph = state.get_graph(workload)
+            blast_of = _blast_radius_map(graph)
             for finding in workload_detections:
                 if finding.nodeId is not None:
                     finding.blastRadius = blast_of.get(finding.nodeId, 0)
-                rca_responses.append(correlate_rca(finding, blast_of))
+            # Graph-wide, multi-detection correlation (issue #50): one correlated RCA per workload's
+            # active detection set. Single-finding sets preserve the original single-node semantics.
+            if workload_detections:
+                rca = correlate_root_cause(workload_detections, graph)
+                # Advisory-only remediation (issue #52): enrich the confidence-gated RCA with steps
+                # sourced from verified Ops packs, or advise "call support" (fail-closed). Pack
+                # loading/verification stays at this edge; the mapping is pure. NO infra-mutation.
+                # TODO(human): remediation Ops packs MUST be signature-enforced once the Key Vault
+                # signing key is provisioned (#37/#44). load_ops_remediations already uses the same
+                # verified load_for_workload path as Alerts and fails closed the moment a verifier/
+                # secret is configured; today the default runtime PacksEngine has no verifier, so
+                # local unsigned packs still load (the tracked pre-existing signing gap, out of
+                # scope for #52 — do NOT force enforcement here or CI/dev/packs_studio break).
+                ops_tables, ops_notes = load_ops_remediations(ctx.packs, workload)
+                notes.extend(ops_notes)
+                rca = enrich_rca_with_remediation(rca, graph, ops_tables)
+                rca_responses.append(rca)
             detections.extend(workload_detections)
 
         # Accurate accounting (partial outages preserved): ``sourcesAvailable`` = sources that
@@ -623,8 +869,15 @@ class AiopsModule(Module):
 
 __all__ = [
     "AiopsModule",
+    "RCA_CONFIDENCE_FLOOR",
     "correlate_rca",
+    "correlate_root_cause",
     "detect_metric_breach",
+    "enrich_rca_with_remediation",
     "fuse_detections",
+    "load_ops_remediations",
     "load_telemetry_rules",
+    "load_windowed_detectors",
+    "propose_remediation",
+    "run_windowed_detectors",
 ]

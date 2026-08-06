@@ -81,8 +81,29 @@ Notes:
 
 ## Pack integrity
 
-- Packs are hashed (**SHA‑256**) and signed (**HMAC**); the Packs Engine **verifies before
-  execute**. Version pinning records which pack version ran against which workload (auditable).
+- Packs carry a **SHA‑256 content hash over their canonical bytes** (the same canonicalization
+  `src/shared/signing.py` signs over — whole manifest + body, volatile integrity fields excluded);
+  the Packs Engine **verifies this hash before execute** (fail‑closed), so tampering with any
+  manifest field (`targets`/`type`/`id`/`version`) or the body is detected. This hash is
+  **tamper‑evidence in transit, NOT authenticity**.
+- **First‑party / shipped packs get hash‑only integrity today.** The canonical content hash is
+  **required** at the load boundary — a bundled pack that omits it is **refused** — but first‑party
+  **authenticity (signature) enforcement is DEFERRED** to the offline signing‑key / pinned
+  trust‑root decision (issues #37/#44). Shipped packs are **not signed or signature‑verified
+  today**. A first‑party pack that nonetheless carries a detached signature is still **not**
+  silently trusted: a present signature must cryptographically verify, so a present‑but‑unverifiable
+  signature is rejected **fail‑closed** (never accepted on the strength of its hash alone).
+- **Imported / third‑party packs are held to the stricter authenticity bar now.** They must carry a
+  **detached Ed25519 signature over their canonical bytes** (`src/shared/signing.py`) that verifies
+  before the pack is admitted or run. The signature envelope is self‑describing — it names the
+  algorithm, a base64 detached signature, a `key_id` hint (never a secret), and the SHA‑256
+  `canonical_digest` it covers.
+- **Keyless + offline signing (verification path).** Signing is done **offline** in Microsoft's own
+  infrastructure; the customer platform holds **no private key** and only **verifies**, selecting a
+  pinned Ed25519 **public** key from a trust bundle by the signature's `key_id`. An empty/unpinned
+  trust root rejects the pack (fail‑closed). (A legacy symmetric HMAC check remains as an
+  independent, optional gate and is not the direction of record.)
+- Version pinning records which pack version ran against which workload (auditable).
 
 ## Multi‑tenant isolation (MSP model)
 

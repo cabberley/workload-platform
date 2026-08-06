@@ -16,7 +16,8 @@ Trust is the product. This skill is the human+agent gate behind
 - **Fail-closed:** invalid pack signature → refuse; unknown/low-confidence → surface, don't act.
 - **No auto-remediation** of customer infrastructure — advisory only.
 - **Least privilege:** narrowest Azure RBAC role; justification present.
-- **Pack integrity:** SHA-256 + HMAC verified before execute; versions pinned/auditable.
+- **Pack integrity:** SHA-256 content hash + detached **Ed25519** signature over canonical bytes,
+  verified before execute (keyless, offline signing); versions pinned/auditable.
 - **No PHI/PII/proprietary IP** committed — synthetic fixtures only.
 - **Multi-tenant isolation** (MSP): per-client partitioning/RBAC; no cross-client visibility.
 

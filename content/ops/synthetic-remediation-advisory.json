@@ -1,0 +1,37 @@
+{
+  "manifest": {
+    "id": "synthetic-remediation-advisory",
+    "type": "ops",
+    "name": "SYNTHETIC advisory remediation (clearly-fake, issue #52)",
+    "version": "1.0.0",
+    "targets": ["acme-remediation-demo"],
+    "sha256": "f09bd4559bc6b6c01bbee389f09e0f7370047efb4cb0cc59ac7bbd6c990bcd8b",
+    "author": "microsoft"
+  },
+  "body": {
+    "remediations": {
+      "odb": [
+        {
+          "description": "Confirm the operational database node is reachable and check its failover/replication health before any change.",
+          "runbook": "https://aka.ms/workloads-platform/runbook/odb",
+          "escalateSeverity": "high"
+        },
+        {
+          "description": "Review recent operational database latency and connection-pool saturation over the alerting window."
+        }
+      ],
+      "web": [
+        {
+          "description": "Check the web tier's dependency on its upstream data node and verify health probes are passing.",
+          "runbook": "https://aka.ms/workloads-platform/runbook/web"
+        }
+      ],
+      "*": [
+        {
+          "description": "Capture a diagnostic snapshot and contact support if the root cause remains unclear.",
+          "escalateSeverity": "critical"
+        }
+      ]
+    }
+  }
+}

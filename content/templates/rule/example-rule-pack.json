@@ -1,0 +1,22 @@
+{
+  "manifest": {
+    "id": "example-rule-pack",
+    "type": "rule",
+    "name": "Example Rule pack — REPLACE ME",
+    "version": "0.1.0",
+    "targets": [],
+    "author": "your-org"
+  },
+  "body": {
+    "rules": [
+      {
+        "id": "example-rule-01-required-tag",
+        "title": "REPLACE ME — one-line statement of what must be true",
+        "resourceType": "Example.ResourceProvider/replaceMeType",
+        "requiredTag": "example-required-tag",
+        "severity": "medium",
+        "description": "REPLACE ME — cite the WAF/WARA/APRL guidance this rule enforces. The node FAILS (fail-closed) when it lacks the required tag."
+      }
+    ]
+  }
+}

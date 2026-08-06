@@ -72,3 +72,41 @@ def test_transitive_propagation():
     )
     # a fails -> b down -> c down => radius 2
     assert blast_radius(g, "a") == 2
+
+
+def test_graph_revision_changes_when_an_edge_changes_with_same_nodes():
+    from shared.blast_radius import graph_revision
+
+    nodes = [_node("a"), _node("b")]
+    with_edge = WorkloadGraph(
+        nodes=nodes, edges=[DependencyEdge(source="b", target="a", redundant=False)]
+    )
+    without_edge = WorkloadGraph(nodes=nodes, edges=[])
+    # Same node set, different edges => DIFFERENT revision (edge-level staleness is detectable).
+    assert graph_revision(with_edge) != graph_revision(without_edge)
+
+    # A redundant flag flip is also a topology change.
+    redundant_edge = WorkloadGraph(
+        nodes=nodes, edges=[DependencyEdge(source="b", target="a", redundant=True)]
+    )
+    assert graph_revision(with_edge) != graph_revision(redundant_edge)
+
+
+def test_graph_revision_is_stable_under_reordering():
+    from shared.blast_radius import graph_revision
+
+    g1 = WorkloadGraph(
+        nodes=[_node("a"), _node("b"), _node("c")],
+        edges=[
+            DependencyEdge(source="b", target="a", redundant=False),
+            DependencyEdge(source="c", target="b", redundant=False),
+        ],
+    )
+    g2 = WorkloadGraph(
+        nodes=[_node("c"), _node("a"), _node("b")],  # reordered nodes
+        edges=[
+            DependencyEdge(source="c", target="b", redundant=False),  # reordered edges
+            DependencyEdge(source="b", target="a", redundant=False),
+        ],
+    )
+    assert graph_revision(g1) == graph_revision(g2)

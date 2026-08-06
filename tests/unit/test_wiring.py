@@ -5,9 +5,13 @@ No secret literals appear here — only Key Vault-backed env var names/values.
 """
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Mapping
 
+import pytest
+
 from cli.wiring import (
+    ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK,
     ENV_ALERT_WEBHOOK_URL,
     ENV_SUBSCRIPTION_ID,
     ENV_SYSTEM_PULSE_BASE_URL,
@@ -22,6 +26,18 @@ from shared.module_base import Module, ModuleContext, build_default_registry, ru
 
 # A synthetic, clearly-fake webhook value (a Key Vault-backed URL in production) — not a secret.
 FAKE_WEBHOOK_URL = "https://alerts.internal.invalid/hook"
+
+
+# Issue #95: require_https_webhook now resolves a webhook DNS name and range-blocks SSRF-sensitive
+# targets, failing closed on an unresolvable host. FAKE_WEBHOOK_URL's synthetic ``.invalid`` host is
+# deliberately unresolvable, so resolve every DNS name to a fixed PUBLIC address here to keep these
+# composition-root tests hermetic/offline (patches only the validator's thin resolver wrapper).
+@pytest.fixture(autouse=True)
+def _stub_public_dns(monkeypatch):
+    monkeypatch.setattr(
+        "modules.alerts.channels._resolve_host_ips",
+        lambda _host: [ipaddress.ip_address("93.184.216.34")],
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -41,11 +57,225 @@ def test_build_client_registry_includes_notifier_when_webhook_configured():
     assert "notifier" in registry
 
 
+# --------------------------------------------------------------------------------------
+# HTTPS enforcement (#84): a non-HTTPS webhook URL is REJECTED fail-closed at composition time.
+# --------------------------------------------------------------------------------------
+def test_build_client_registry_rejects_cleartext_http_webhook():
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "http://alerts.evil.invalid/hook"})
+
+
+def test_build_client_registry_rejects_scheme_less_webhook():
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "alerts.internal.invalid/hook"})
+
+
+def test_build_client_registry_rejects_invalid_port_at_composition():
+    # R1 MED 3: a malformed port fails closed at composition time, not late inside httpx at send().
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "https://alerts.internal.invalid:bad/hook"})
+
+
+def test_build_client_registry_invalid_port_error_is_sanitized():
+    # R1 MED 2: a leaking urlparse/.port ValueError (which can echo user:token@host) must not reach
+    # the surfaced error — a constant, URL-free message is raised instead.
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError) as excinfo:
+        build_client_registry(
+            config={ENV_ALERT_WEBHOOK_URL: "https://user:SECRET123@alerts.evil.invalid:bad/hook"}
+        )
+    message = str(excinfo.value)
+    for secret in ("SECRET123", "user", "alerts.evil.invalid", "bad", "/hook"):
+        assert secret not in message
+    assert excinfo.value.__cause__ is None
+
+
+def test_build_client_registry_error_does_not_leak_url_path():
+    # No-PII: the fail-closed error must not echo the path/query (which may carry a token).
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError) as excinfo:
+        build_client_registry(
+            config={ENV_ALERT_WEBHOOK_URL: "http://alerts.evil.invalid/hook?token=SECRET123"}
+        )
+    assert "SECRET123" not in str(excinfo.value)
+    assert "/hook" not in str(excinfo.value)
+
+
+def test_build_client_registry_loopback_http_rejected_without_flag():
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    with pytest.raises(InsecureWebhookError):
+        build_client_registry(config={ENV_ALERT_WEBHOOK_URL: "http://127.0.0.1:9000/hook"})
+
+
+def test_build_client_registry_loopback_http_accepted_with_flag():
+    registry = build_client_registry(
+        config={
+            ENV_ALERT_WEBHOOK_URL: "http://127.0.0.1:9000/hook",
+            ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK: "true",
+        }
+    )
+    assert "notifier" in registry
+
+
+def test_build_client_registry_localhost_http_accepted_with_flag():
+    registry = build_client_registry(
+        config={
+            ENV_ALERT_WEBHOOK_URL: "http://localhost:9000/hook",
+            ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK: "1",
+        }
+    )
+    assert "notifier" in registry
+
+
+def test_build_client_registry_spoofed_loopback_rejected_even_with_flag():
+    # Spoofed-loopback guard: an attacker host that merely *contains* a loopback token must NOT be
+    # treated as loopback, even with the opt-out set — cleartext to it stays rejected.
+    import pytest
+
+    from modules.alerts.channels import InsecureWebhookError
+
+    for spoofed in ("http://127.0.0.1.evil.com/hook", "http://localhost.evil.com/hook"):
+        with pytest.raises(InsecureWebhookError):
+            build_client_registry(
+                config={
+                    ENV_ALERT_WEBHOOK_URL: spoofed,
+                    ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK: "true",
+                }
+            )
+
+
 def test_build_client_registry_includes_system_pulse_when_base_url_configured():
     registry = build_client_registry(
         config={ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid"}
     )
     assert "system_pulse" in registry
+
+
+# --------------------------------------------------------------------------------------
+# Key Vault secret injection (#85): composition resolves the connector token BY identity when a
+# vault URI is configured, and FAILS CLOSED when the vault cannot supply a required secret.
+# --------------------------------------------------------------------------------------
+class _FakeKvSecret:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _FakeKvClient:
+    """A ``SecretClient``-shaped stub injected in place of the real Azure SDK (no network)."""
+
+    def __init__(self, secrets: dict[str, str]) -> None:
+        self._secrets = secrets
+
+    def get_secret(self, name: str) -> _FakeKvSecret:
+        if name not in self._secrets:
+            raise KeyError(name)  # stands in for azure ResourceNotFoundError → fail closed
+        return _FakeKvSecret(self._secrets[name])
+
+
+def test_build_client_registry_system_pulse_uses_key_vault_when_configured(monkeypatch):
+    from shared.secret_provider import ENV_KEY_VAULT_URI, KeyVaultSecretProvider
+
+    fake = _FakeKvClient({"system-pulse-read-token": "kv-token"})
+    monkeypatch.setattr(KeyVaultSecretProvider, "_client_or_build", lambda self: fake)
+    registry = build_client_registry(
+        config={
+            ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid",
+            ENV_KEY_VAULT_URI: "https://wp-vault.vault.azure.net",
+        }
+    )
+    assert "system_pulse" in registry
+    client = registry["system_pulse"]
+    # The connector is wired to resolve BY identity through the provider (keyless).
+    assert client._secret_provider is not None
+    assert client._config.token_secret_name == "system-pulse-read-token"
+
+
+def test_build_client_registry_fail_closed_when_vault_missing_required_token(monkeypatch):
+    from shared.secret_provider import (
+        ENV_KEY_VAULT_URI,
+        KeyVaultSecretProvider,
+        SecretResolutionError,
+    )
+
+    fake = _FakeKvClient({})  # vault configured but the required token is absent
+    monkeypatch.setattr(KeyVaultSecretProvider, "_client_or_build", lambda self: fake)
+    # Composition must REFUSE to start rather than wire a silently-broken connector.
+    with pytest.raises(SecretResolutionError):
+        build_client_registry(
+            config={
+                ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid",
+                ENV_KEY_VAULT_URI: "https://wp-vault.vault.azure.net",
+            }
+        )
+
+
+def test_build_client_registry_system_pulse_env_fallback_when_no_vault():
+    # No $WP_KEY_VAULT_URI ⇒ no provider ⇒ the connector uses the documented local-dev env fallback
+    # (no fail-closed), keeping existing local/CI workflows working unchanged.
+    registry = build_client_registry(
+        config={ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid"}
+    )
+    client = registry["system_pulse"]
+    assert client._secret_provider is None
+    assert client._config.token_secret_name is None
+
+
+def test_wired_system_pulse_fail_closed_increments_process_metric():
+    """MED 3: the composition root wires a registry-backed fail-closed observer into System Pulse.
+
+    A real fail-closed fetch (an HTTP error) increments ``connector_fail_closed_total{module=
+    "aiops"}`` on the SAME process registry the API exposes at ``/api/metrics``. Azure-free: we
+    drive the connector's edge with a fake httpx transport, no network, no secret.
+    """
+    import httpx
+
+    from shared.observability import METRIC_CONNECTOR_FAIL_CLOSED, process_metrics
+
+    registry = build_client_registry(
+        config={ENV_SYSTEM_PULSE_BASE_URL: "https://pulse.internal.invalid"}
+    )
+    client = registry["system_pulse"]
+    # Force the edge to fail closed: a fake transport that errors + a resolvable fake token.
+    client._client = httpx.Client(
+        transport=httpx.MockTransport(lambda _req: httpx.Response(503, text="unavailable"))
+    )
+    client._credential_provider = lambda: "fake-read-token"
+
+    proc = process_metrics()
+    before = next(
+        (s.value for s in proc.snapshot().counters if s.name == METRIC_CONNECTOR_FAIL_CLOSED),
+        0,
+    )
+    result = client.fetch_raw()
+    assert result.available is False  # still fails closed
+
+    after = next(
+        s.value
+        for s in proc.snapshot().counters
+        if s.name == METRIC_CONNECTOR_FAIL_CLOSED and s.labels == {"module": "aiops"}
+    )
+    assert after == before + 1
 
 
 def test_build_client_registry_network_absent_without_sdk_even_if_subscription_set():

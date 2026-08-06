@@ -1,0 +1,3 @@
+# Deploy-time rendered dashboards (template-variable defaults substituted with real deploy outputs).
+# These contain in-boundary ids and MUST NOT be committed — only the templated boards are source.
+.rendered/

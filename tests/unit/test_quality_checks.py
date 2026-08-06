@@ -94,7 +94,8 @@ def _vm(node_id: str, *, tags: dict[str, str] | None = None) -> ResourceNode:
 def test_evaluate_rule_passes_when_required_tag_present():
     node = _vm("vm-pass", tags={"availability-zone": "1"})
     rule = {"id": "r1", "title": "zone", "resourceType": VM_TYPE,
-            "requiredTag": "availability-zone", "severity": "high"}
+            "requiredTag": "availability-zone", "severity": "high",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is True
@@ -104,7 +105,8 @@ def test_evaluate_rule_passes_when_required_tag_present():
 def test_evaluate_rule_fails_closed_on_missing_tag():
     node = _vm("vm-fail")
     rule = {"id": "r1", "title": "zone", "resourceType": VM_TYPE,
-            "requiredTag": "availability-zone", "severity": "high"}
+            "requiredTag": "availability-zone", "severity": "high",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is False
@@ -121,7 +123,8 @@ def test_evaluate_rule_not_applicable_by_type_returns_none():
 def test_evaluate_rule_fails_closed_when_no_recognized_predicate():
     # Rule matches the node type but declares no supported predicate → must NOT silent-PASS.
     node = _vm("vm-x", tags={"availability-zone": "1"})
-    rule = {"id": "r-nopred", "title": "no predicate", "resourceType": VM_TYPE, "severity": "low"}
+    rule = {"id": "r-nopred", "title": "no predicate", "resourceType": VM_TYPE, "severity": "low",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is False
@@ -132,7 +135,8 @@ def test_evaluate_rule_fails_closed_when_no_recognized_predicate():
 def test_evaluate_rule_invalid_severity_does_not_crash():
     node = _vm("vm-bad")
     rule = {"id": "r1", "resourceType": VM_TYPE, "requiredTag": "availability-zone",
-            "severity": "not-a-severity"}
+            "severity": "not-a-severity",
+            "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
     finding = evaluate_rule(node, rule)
     assert finding is not None
     assert finding.passed is False
@@ -144,7 +148,8 @@ def test_evaluate_rule_non_scalar_severity_does_not_crash():
     node = _vm("vm-bad")
     for bad in (["high"], {"x": 1}, 3, True):
         rule = {"id": "r1", "resourceType": VM_TYPE, "requiredTag": "availability-zone",
-                "severity": bad}
+                "severity": bad,
+                "packId": "waf-reliability-baseline", "packVersion": "1.2.0"}
         finding = evaluate_rule(node, rule)
         assert finding is not None
         assert finding.severity == Severity.medium  # safe default, no crash
@@ -318,3 +323,90 @@ def test_run_does_not_crash_on_malformed_pack_body_and_surfaces_notes():
     assert result.ok is True
     assert result.findings == []
     assert result.extra["surfacedNotes"]  # malformed body surfaced, not raised
+
+
+# --------------------------------------------------------------------------------------
+# R4 — shipped rule ids are AUTHORITATIVE over imported rule ids. A Finding id is
+# ``{rule_id}::{node_id}`` (not pack-namespaced) and findings persist last-wins on
+# ``(workload, finding_id)``, so a NEW-pack-id imported rule REUSING a shipped rule id could
+# overwrite (and suppress a FAIL from) the shipped rule. ``load_rules`` runs a two-pass, shipped-
+# first merge keyed on ``pack.imported`` so an imported rule may ADD a new id but never shadow one.
+# --------------------------------------------------------------------------------------
+def _rule(rule_id: str, required_tag: str) -> dict[str, Any]:
+    return {
+        "id": rule_id,
+        "title": rule_id,
+        "resourceType": VM_TYPE,
+        "requiredTag": required_tag,
+        "severity": "high",
+        "description": rule_id,
+    }
+
+
+def _shipped_pack(*, pack_id: str, rules: list[dict[str, Any]]) -> Pack:
+    return Pack(
+        manifest=PackManifest(id=pack_id, type=PackType.rule, name=pack_id, version="1.0.0"),
+        body={"rules": rules},
+        imported=False,
+    )
+
+
+def _imported_pack(*, pack_id: str, rules: list[dict[str, Any]]) -> Pack:
+    return Pack(
+        manifest=PackManifest(id=pack_id, type=PackType.rule, name=pack_id, version="1.0.0"),
+        body={"rules": rules},
+        imported=True,
+    )
+
+
+def test_load_rules_imported_rule_shadowing_shipped_id_is_skipped():
+    # Shipped and a DIFFERENT-pack-id import both define rule id "rel-01" — the import is skipped.
+    shipped = _shipped_pack(pack_id="waf-shipped", rules=[_rule("rel-01", "availability-zone")])
+    attacker = _imported_pack(pack_id="attacker-rules", rules=[_rule("rel-01", "always-present")])
+    rules, notes = load_rules(FakePacks([shipped, attacker]), "epic")
+
+    # Exactly one rule for the shadowed id — the SHIPPED one (its requiredTag), not the import's.
+    matching = [r for r in rules if r["id"] == "rel-01"]
+    assert len(matching) == 1
+    assert matching[0]["requiredTag"] == "availability-zone"
+    assert matching[0]["packId"] == "waf-shipped"
+    # The collision is surfaced as a fail-closed skip note (shipped wins).
+    assert any(
+        "attacker-rules" in n and "shadows shipped rule id" in n and "rel-01" in n for n in notes
+    )
+
+
+def test_load_rules_imported_rule_with_unique_id_still_loads():
+    shipped = _shipped_pack(pack_id="waf-shipped", rules=[_rule("rel-01", "availability-zone")])
+    addon = _imported_pack(pack_id="team-addon", rules=[_rule("addon-01", "cost-centre")])
+    rules, notes = load_rules(FakePacks([shipped, addon]), "epic")
+
+    ids = sorted(r["id"] for r in rules)
+    assert ids == ["addon-01", "rel-01"]  # import AUGMENTS with its unique id
+    assert not any("shadows shipped rule id" in n for n in notes)
+
+
+def test_imported_pass_cannot_suppress_shipped_fail_in_persisted_state(tmp_path):
+    from shared.state import LocalStateStore
+
+    # Node HAS "env" (would PASS the attacker rule) but LACKS "availability-zone" (FAILs shipped).
+    node = _vm("vm-1", tags={"env": "prod"})
+    store = LocalStateStore(tmp_path)
+    store.put_estate("epic", [node])
+
+    shipped = _shipped_pack(pack_id="waf-shipped", rules=[_rule("rel-01", "availability-zone")])
+    # Same rule id "rel-01" but a predicate the node satisfies → would emit a PASS for rel-01::vm-1.
+    attacker = _imported_pack(pack_id="attacker-rules", rules=[_rule("rel-01", "env")])
+
+    ctx = ModuleContext(state=store, packs=FakePacks([shipped, attacker]))
+    result = QualityChecksModule().run(ctx, scope={"workload": "epic"})
+    # Only the shipped rule ran → exactly one finding for the shadowed id, and it FAILS.
+    assert len(result.findings) == 1
+    assert result.findings[0].id == "rel-01::vm-1"
+    assert result.findings[0].passed is False
+
+    # Persist + read back: the shipped FAIL is what lands in durable state (no imported PASS to
+    # last-wins-overwrite it).
+    store.add_findings("epic", result.findings)
+    persisted = store.get_findings("epic", module="quality_checks")
+    assert [(f.id, f.passed) for f in persisted] == [("rel-01::vm-1", False)]

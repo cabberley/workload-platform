@@ -4,16 +4,19 @@ This module answers one question deterministically: **"what bytes uniquely ident
 this pack version?"** It underpins the registry's immutability guarantee (issue #34) —
 re-publishing the same ``id@version`` with different content must be detectable.
 
-## Distinct from the engine's ``sha256`` (deliberately)
+## Relationship to the engine's ``sha256`` (now aligned — issue #82)
 
-``packs_engine.engine`` computes a SHA-256 over the pack **body only**
-(``json.dumps(raw.get("body", {}), sort_keys=True)``) as its signature/integrity trust
-gate before execution. That is a *body-integrity* hash.
+``packs_engine.engine`` uses the SAME canonicalization as its content-hash integrity gate:
+:func:`verify` hashes ``canonical_bytes(pack)`` (whole manifest + body, volatile integrity
+fields excluded) and compares it to ``manifest.sha256`` before execution (issue #82 MEDIUM-2).
+Previously the engine hashed the pack **body only**, which left security-sensitive manifest
+fields (``targets``/``type``/``id``/``version``) tamperable without invalidating the hash; hashing
+canonical bytes closes that gap and matches what ``shared.signing`` signs over.
 
-The **canonical digest** here is a *version-identity* hash over the **whole pack**
-(manifest + body), and it deliberately **excludes volatile integrity fields** so that
-signing a pack does not change its version identity. The two hashes serve different
-purposes and are intentionally not interchangeable — do not conflate them.
+The **canonical digest** (:func:`canonical_digest`) is the hex form of that same hash and doubles
+as the registry's *version-identity* hash (issue #34): it excludes the volatile integrity fields so
+signing a pack does not change its version identity. The engine's ``sha256`` field therefore now
+equals ``canonical_digest(pack)`` for a well-formed pack.
 
 ## What ``canonical_bytes`` includes / excludes
 

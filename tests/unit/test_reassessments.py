@@ -59,6 +59,8 @@ def _finding(fid: str, passed: bool | None, *, severity: Severity = Severity.med
         title=f"synthetic check {fid}",
         passed=passed,
         severity=severity,
+        packId="waf-reliability-baseline",
+        packVersion="1.2.0",
     )
 
 

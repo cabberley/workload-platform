@@ -1,5 +1,17 @@
-"""Packs engine — load, verify (SHA-256 + HMAC), and serve content packs."""
+"""Packs engine — load, verify integrity, and serve content packs.
+
+Integrity is a **SHA-256 content hash** plus a detached **Ed25519** signature over the pack's
+canonical bytes (``shared.signing``); a legacy symmetric HMAC remains an independent, optional gate.
+The shipped-pack load boundary requires the content hash fail-closed (issue #82).
+"""
 from packs_engine.canonical import canonical_bytes, canonical_digest
+from packs_engine.content_store import (
+    AzurePackContentStore,
+    LocalPackContentStore,
+    PackContentStore,
+    PackContentStoreError,
+    build_pack_content_store,
+)
 from packs_engine.engine import Pack, PacksEngine, PackVerificationError
 from packs_engine.registry import (
     CorruptRegistryError,
@@ -24,6 +36,12 @@ __all__ = [
     # Pack registry + versioning model (issue #34).
     "canonical_bytes",
     "canonical_digest",
+    # Digest-addressed content store for imported pack bytes (issue #44).
+    "AzurePackContentStore",
+    "LocalPackContentStore",
+    "PackContentStore",
+    "PackContentStoreError",
+    "build_pack_content_store",
     "CorruptRegistryError",
     "ImmutableVersionError",
     "InvalidVersionError",

@@ -22,9 +22,21 @@ from shared.contracts import (
 from shared.module_base import Module, ModuleContext
 
 from .arg import ResourceGraphClient, rows_to_nodes
+from .connectors.kuiper import (
+    KuiperConnector,
+    SupplementalResult,
+    apply_supplemental,
+    hints_from_result,
+)
 
 # Well-known name the worker/API uses to inject the ARG edge client into ``ctx.clients``.
 RESOURCE_GRAPH_CLIENT = "resource_graph"
+
+# Well-known name the worker/API uses to (optionally) inject the Kuiper discovery-assist connector
+# into ``ctx.clients`` (issue #47). Absent ⇒ Discovery runs exactly as before (ARG only); present
+# and available ⇒ its hints are merged as clearly-marked, non-authoritative SUPPLEMENTAL signals.
+# Discovery never hard-depends on Kuiper — this is an optional DI seam, keyless and fail-closed.
+KUIPER_CONNECTOR = "kuiper"
 
 
 class _WorkloadPack(Protocol):
@@ -174,12 +186,22 @@ class DiscoveryModule(Module):
 
         classified = classify(resources, definitions)
         classified_count = sum(1 for node in classified if node.workload is not None)
+        # Confidence reflects how much of the AUTHORITATIVE ARG estate we could classify; an empty
+        # or fully-unclassified estate stays at 0.0 (fail closed, do not over-claim). Kuiper is
+        # supplemental only and never inflates this figure.
+        confidence = (classified_count / len(classified)) if classified else 0.0
+
+        # Optional Kuiper discovery-assist (issue #47): when a connector is injected AND returns
+        # available hints, ANNOTATE matching ARG nodes with a bounded, non-authoritative
+        # supplemental tag. It never adds/removes/overrides a node and never emits a graph.
+        # Absent/failing-closed ⇒ Discovery behaves EXACTLY as ARG-only (estate + graph unchanged).
+        supplemental, kuiper_note = self._kuiper_assist(ctx, classified)
+        if kuiper_note:
+            notes.append(kuiper_note)
+        estate = supplemental.nodes if supplemental is not None else classified
 
         findings = [f"Classified {classified_count}/{len(classified)} discovered resources"]
         findings.extend(notes)
-        # Confidence reflects how much of the discovered estate we could actually classify; an
-        # empty or fully-unclassified estate stays at 0.0 (fail closed, do not over-claim).
-        confidence = (classified_count / len(classified)) if classified else 0.0
         response = AgentResponse(
             agentName="discovery",
             taskType="classify-estate",
@@ -188,10 +210,49 @@ class DiscoveryModule(Module):
             confidence=confidence,
             nextActions=["build-dependency-graph"],
         )
-        # TODO(human): optional Kuiper-assisted discovery (agent/dependency hints) arrives via a
-        # separate connector issue; when present it augments the ARG estate before classification.
+        extra: dict[str, Any] = {
+            "nodeCount": len(estate),
+            "classifiedCount": classified_count,
+            "skippedRows": len(skipped),
+        }
+        if supplemental is not None:
+            extra["supplementalSignals"] = len(supplemental.annotated_ids)
+        # NB: Discovery deliberately does NOT emit a WorkloadGraph — the state writer
+        # UPSERT-REPLACES a workload's graph, so a Kuiper-derived graph here would wipe
+        # dependency_graph's authoritative edges. Kuiper contributes supplemental estate-node
+        # annotations only; a future non-destructive edge integration is owned by dependency_graph.
         return ModuleRunResult(module=self.name, ok=True, response=response,
-                               estate=classified,
-                               extra={"nodeCount": len(classified),
-                                      "classifiedCount": classified_count,
-                                      "skippedRows": len(skipped)})
+                               estate=estate, extra=extra)
+
+    def _kuiper_assist(
+        self, ctx: ModuleContext, authoritative: list[ResourceNode]
+    ) -> tuple[SupplementalResult | None, str | None]:
+        """Fetch + apply optional Kuiper supplemental annotations — fail closed to a no-op.
+
+        Returns ``(supplemental, note)`` where ``supplemental`` is a :class:`SupplementalResult`
+        only when a Kuiper connector is injected AND returns available hints that annotate at least
+        one ARG node; otherwise ``None`` (Discovery then behaves exactly as ARG-only). ``note`` is a
+        human-readable surface line, or ``None`` when no connector is wired (so ARG-only output is
+        byte-for-byte unchanged). This never raises across the boundary and never lets a Kuiper
+        failure break Discovery. Kuiper only ANNOTATES existing ARG nodes — it never adds, removes,
+        or overrides a node, and never emits a graph.
+        """
+        connector = ctx.clients.get(KUIPER_CONNECTOR)
+        if connector is None:
+            return None, None
+        kuiper = cast(KuiperConnector, connector)
+        try:
+            result = kuiper.fetch_raw()
+            hints = hints_from_result(result)
+            applied = apply_supplemental(authoritative, hints)
+        except Exception as exc:  # noqa: BLE001 - Kuiper is optional assist; never break Discovery
+            return None, f"Kuiper assist unavailable ({type(exc).__name__}); estate from ARG only"
+        if not result.available:
+            return None, "Kuiper assist unavailable (fail-closed); estate from ARG only"
+        if not applied.annotated_ids:
+            return None, "Kuiper assist returned no usable supplemental hints"
+        note = (
+            f"Kuiper assist corroborated {len(applied.annotated_ids)} ARG node(s) with "
+            "supplemental signals (non-authoritative; ARG authoritative)"
+        )
+        return applied, note

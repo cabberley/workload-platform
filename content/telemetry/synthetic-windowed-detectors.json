@@ -1,0 +1,52 @@
+{
+  "manifest": {
+    "id": "synthetic-windowed-detectors",
+    "type": "telemetry",
+    "name": "SYNTHETIC demo — windowed + expression detectors (FAKE)",
+    "version": "0.1.0",
+    "targets": ["synthetic-demo"],
+    "sha256": "9954d72e2f9c7c823b3be8f72ac794b9a28dc83067604c480520b6ea4eda1392",
+    "author": "microsoft"
+  },
+  "body": {
+    "signals": [
+      {
+        "name": "fake_widget_latency_ms",
+        "op": "gt",
+        "threshold": 500,
+        "severity": "high",
+        "nodeId": "role:fake-widget",
+        "logAnalysisNote": "Plain single-sample threshold — behaves exactly as before (back-compat)."
+      },
+      {
+        "name": "fake_widget_latency_ms",
+        "op": "gt",
+        "threshold": 400,
+        "severity": "medium",
+        "nodeId": "role:fake-widget",
+        "window": { "samples": 5, "aggregate": "avg", "mode": "aggregate" }
+      },
+      {
+        "name": "fake_widget_error_rate",
+        "op": "gt",
+        "threshold": 0.02,
+        "severity": "high",
+        "nodeId": "role:fake-widget",
+        "window": { "durationSeconds": 300, "mode": "all" }
+      },
+      {
+        "name": "fake_widget_queue_depth",
+        "op": "gt",
+        "threshold": 1000,
+        "severity": "critical",
+        "nodeId": "role:fake-widget",
+        "window": { "samples": 10, "aggregate": "max" },
+        "expression": "max > threshold and rate > 5"
+      }
+    ],
+    "logAnalysis": {
+      "enabled": true,
+      "note": "SYNTHETIC/FAKE demo pack for issue #51: showcases a threshold, windowed (avg/all), and expression detector. All metrics/thresholds are fabricated; targets a fake 'synthetic-demo' workload so it never runs against a real estate."
+    }
+  }
+}

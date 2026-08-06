@@ -5,8 +5,10 @@
 import type {
   DriftReport,
   Finding,
+  ImpactResult,
   ModuleManifest,
   PackAssignment,
+  PackRegistryEntry,
   WorkloadGraph,
 } from "./types";
 
@@ -20,10 +22,35 @@ export class ApiError extends Error {
   }
 }
 
-async function getJson<T>(path: string): Promise<T> {
+// Keyless bearer-token seam (issue #64). When Entra sign-in is wired (see `auth/AuthProvider`), the
+// provider registers a getter that returns a FRESH access token (acquired silently from the MSAL
+// cache) for the API audience; `getJson` attaches it as `Authorization: Bearer`. No token is stored
+// in this module — it is fetched per request and never logged. When auth is not configured the
+// provider stays `null` and requests go out unauthenticated (the documented local/no-auth path).
+export type TokenProvider = () => Promise<string | null>;
+
+let tokenProvider: TokenProvider | null = null;
+
+/** Register (or clear, with `null`) the bearer-token provider used for every `/api/*` request. */
+export function setAuthTokenProvider(provider: TokenProvider | null): void {
+  tokenProvider = provider;
+}
+
+async function authHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (tokenProvider !== null) {
+    const token = await tokenProvider();
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+  }
+  return headers;
+}
+
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(path, { method: "GET", headers: { Accept: "application/json" } });
+    res = await fetch(path, { method: "GET", headers: await authHeaders(), signal });
   } catch (cause) {
     throw new ApiError(0, `network error: ${String(cause)}`);
   }
@@ -35,6 +62,16 @@ async function getJson<T>(path: string): Promise<T> {
 
 export function fetchModules(): Promise<ModuleManifest[]> {
   return getJson<ModuleManifest[]>("/api/modules");
+}
+
+/**
+ * The pack-version registry catalogue (issue #57). Read-only: the backend returns `[]` (never an
+ * error) when no registry is wired, so callers must treat an empty list as "no catalogue" — not as
+ * an all-clear. Assigning a version to a workload is a *write* that must go through the (not-yet-
+ * present) validated assignment backend — see `TODO(human)` in `PacksConsole`.
+ */
+export function fetchPacks(): Promise<PackRegistryEntry[]> {
+  return getJson<PackRegistryEntry[]>("/api/packs");
 }
 
 export function fetchWorkloads(): Promise<string[]> {
@@ -57,9 +94,26 @@ export function fetchDrift(workload: string): Promise<DriftReport> {
 }
 
 /**
+/**
  * Every pack-version assignment across all workloads (issue #37) — read-only visibility for both
  * Microsoft and the customer. The SPA never assigns; assignment writes go through the API (PUT).
  */
 export function fetchPackAssignments(): Promise<PackAssignment[]> {
   return getJson<PackAssignment[]>("/api/pack-assignments");
+}
+
+/**
+ * Canonical blast-radius impact of simulating `node`'s failure (issue #56). The core returns 404
+ * when no graph is persisted OR when `node` is not in the graph (fail-closed) — callers surface
+ * that, never a false all-clear. The math is server-side only; this just reads the projection.
+ */
+export function fetchImpact(
+  workload: string,
+  node: string,
+  signal?: AbortSignal,
+): Promise<ImpactResult> {
+  return getJson<ImpactResult>(
+    `/api/workloads/${encodeURIComponent(workload)}/impact?node=${encodeURIComponent(node)}`,
+    signal,
+  );
 }

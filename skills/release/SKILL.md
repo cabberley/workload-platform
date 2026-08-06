@@ -11,8 +11,9 @@ Bicep infra to the target Azure subscription — all keyless.
 ## Steps
 1. **Green main:** CI, security, and pack-validate all passing.
 2. **Version:** bump `version` in `pyproject.toml` and any changed pack manifests (semver).
-3. **Sign packs:** produce SHA-256 + HMAC for every changed pack; the Packs Engine verifies before
-   execute. Never release an unsigned or mutated-in-place pack version.
+3. **Sign packs:** produce a SHA-256 content hash + a detached **Ed25519** signature over canonical
+   bytes for every changed pack (signed offline; the platform is keyless and only verifies); the
+   Packs Engine verifies before execute. Never release an unsigned or mutated-in-place pack version.
 4. **Tag + GitHub Release:** publishing the release triggers `.github/workflows/release.yml`:
    - builds & pushes `api`, `worker`, `web` images to ACR (tagged with the release),
    - runs `az deployment group what-if`, then `az deployment group create` on `infra/bicep/main.bicep`.

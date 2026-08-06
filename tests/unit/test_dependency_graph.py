@@ -402,3 +402,110 @@ def test_run_resolves_all_workloads_when_scope_omitted():
     result = _run(state=state, scope={})
     assert result.graph is not None
     assert {n.id for n in result.graph.nodes} == {"lb", "web1", "web2", "ecp1", "odb"}
+
+
+# --- Citrix control-plane assist (issue #48): optional, default-off, supplement-only -------
+class _FakeCitrixConnector:
+    """A synthetic Citrix connector returning a canned FetchResult — no network, no real Citrix."""
+
+    def __init__(self, result):
+        self._result = result
+
+    def fetch_raw(self):
+        return self._result
+
+
+def _citrix_health(resource_id: str, health: str = "degraded") -> dict:
+    return {"kind": "host-health", "resource_id": resource_id, "health": health}
+
+
+def _citrix_dependency(source: str, target: str) -> dict:
+    return {"kind": "session-dependency", "resource_id": source, "depends_on": target}
+
+
+def test_run_is_identical_when_citrix_absent():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    baseline = _run(state=state, scope={"workload": "fake-epic"})
+    # A run WITHOUT any citrix client and one with an unavailable citrix client both leave the graph
+    # nodes byte-for-byte identical (no supplemental tags), proving default-off + fail-closed.
+    unavailable = _FakeCitrixConnector(FetchResult(available=False, error="NoCredential"))
+    with_failclosed = _run(
+        state=state, clients={"citrix": unavailable}, scope={"workload": "fake-epic"}
+    )
+    assert baseline.graph is not None and with_failclosed.graph is not None
+    assert [n.model_dump() for n in baseline.graph.nodes] == [
+        n.model_dump() for n in with_failclosed.graph.nodes
+    ]
+    assert all("aegis:source" not in n.tags for n in with_failclosed.graph.nodes)
+
+
+def test_run_annotates_existing_node_with_citrix_health():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    citrix = _FakeCitrixConnector(
+        FetchResult(available=True, raw=[_citrix_health("odb", "unreachable")])
+    )
+    result = _run(state=state, clients={"citrix": citrix}, scope={"workload": "fake-epic"})
+    assert result.graph is not None
+    odb = next(n for n in result.graph.nodes if n.id == "odb")
+    assert odb.tags["aegis:source"] == "citrix"
+    assert odb.tags["aegis:citrix-health"] == "unreachable"
+    # No node created/removed; only the matched node annotated.
+    assert {n.id for n in result.graph.nodes} == {"lb", "web1", "web2", "ecp1", "odb"}
+    other = next(n for n in result.graph.nodes if n.id == "web1")
+    assert "aegis:source" not in other.tags
+    # A human-readable note surfaces the supplemental annotation.
+    assert any("Citrix assist annotated" in f for f in result.response.findings)
+
+
+def test_run_does_not_persist_citrix_dependency_edges():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    # A dependency signal between two real estate nodes must NOT become a persisted edge (graph-
+    # replace hazard — deferred). The health signal is still applied.
+    citrix = _FakeCitrixConnector(
+        FetchResult(
+            available=True,
+            raw=[_citrix_health("odb", "degraded"), _citrix_dependency("ecp1", "odb")],
+        )
+    )
+    result = _run(state=state, clients={"citrix": citrix}, scope={"workload": "fake-epic"})
+    assert result.graph is not None
+    # No edge carries the citrix connector origin — dependency edges are deferred, never persisted.
+    assert all(e.origin != "connector:citrix" for e in result.graph.edges)
+    # But the health annotation IS applied (supplement-only contribution).
+    odb = next(n for n in result.graph.nodes if n.id == "odb")
+    assert odb.tags["aegis:citrix-health"] == "degraded"
+
+
+def test_run_citrix_signal_for_unknown_node_is_dropped():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    citrix = _FakeCitrixConnector(
+        FetchResult(available=True, raw=[_citrix_health("/does/not/exist", "healthy")])
+    )
+    result = _run(state=state, clients={"citrix": citrix}, scope={"workload": "fake-epic"})
+    assert result.graph is not None
+    assert all("aegis:source" not in n.tags for n in result.graph.nodes)
+    assert any("no usable supplemental" in f for f in result.response.findings)
+
+
+def test_run_survives_citrix_connector_that_raises():
+    class _Boom:
+        def fetch_raw(self):
+            raise RuntimeError("super-secret")
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    result = _run(state=state, clients={"citrix": _Boom()}, scope={"workload": "fake-epic"})
+    # The module never breaks; graph builds from estate only, and no token/message leaks into notes.
+    assert result.ok is True
+    assert result.graph is not None
+    assert all("aegis:source" not in n.tags for n in result.graph.nodes)
+    assert any("Citrix assist unavailable (RuntimeError)" in f for f in result.response.findings)
+    assert all("super-secret" not in f for f in result.response.findings)
+

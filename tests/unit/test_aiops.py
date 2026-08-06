@@ -18,7 +18,7 @@ from modules.aiops.connectors.azure_monitor import (
     map_metrics_response,
 )
 from modules.aiops.connectors.azure_monitor import to_signals as azure_monitor_to_signals
-from modules.aiops.connectors.system_pulse import FetchResult, Signal
+from modules.aiops.connectors.system_pulse import FetchResult, Signal, SignalSource
 from modules.aiops.module import (
     RCA_CONFIDENCE_FLOOR,
     AiopsModule,
@@ -84,6 +84,21 @@ def _telemetry_pack(
         _FakeManifest(pack_id, version, targets if targets is not None else ["epic"]),
         {"signals": signals},
         PackType.telemetry,
+    )
+
+
+def _ops_pack(
+    *,
+    pack_id: str = "synthetic-remediation-advisory",
+    version: str = "1.0.0",
+    targets: list[str] | None = None,
+    remediations: dict[str, Any],
+) -> tuple[_FakeManifest, dict[str, Any], PackType]:
+    """A synthetic Ops pack carrying an advisory ``remediations`` table (issue #52)."""
+    return (
+        _FakeManifest(pack_id, version, targets if targets is not None else []),
+        {"remediations": remediations},
+        PackType.ops,
     )
 
 
@@ -277,7 +292,8 @@ def test_fuse_unknown_role_selects_nothing() -> None:
 def _detection(node_id: str) -> Finding:
     return detect_metric_breach(
         {"name": "odb_latency_ms", "value": 512.0, "op": "gt",
-         "threshold": 500.0, "nodeId": node_id, "severity": "high"}
+         "threshold": 500.0, "nodeId": node_id, "severity": "high",
+         "packId": "telemetry-baseline", "packVersion": "1.0.0"}
     )  # type: ignore[return-value]
 
 
@@ -331,12 +347,57 @@ def test_run_fusion_happy_path_detection_and_rca() -> None:
     rca = result.extra["rca"]
     assert len(rca) == 1
     assert rca[0]["confidence"] >= RCA_CONFIDENCE_FLOOR
-    assert rca[0]["nextActions"] == ["propose-remediation"]
+    # Issue #52: with NO Ops remediation pack present, a confident RCA is enriched fail-closed —
+    # absent/unverified remediation content ⇒ advise "call support", never a guessed remediation.
+    assert rca[0]["nextActions"] == ["recommend-contact-support"]
     assert result.extra["sourcesUnavailable"] == ["azure_monitor"]
     assert result.extra["packSources"][0]["id"] == "system-pulse-core"
 
 
-def test_run_no_breach_yields_no_detection() -> None:
+def test_run_confident_rca_enriched_with_ops_remediation() -> None:
+    # Issue #52 end-to-end: a confident RCA on the odb node (classified role 'odb' ⇒ category 'odb')
+    # is enriched with the matching Ops-pack advisory steps, each citing pack id + version.
+    packs = FakePacksTargetAware(
+        [
+            _telemetry_pack(signals=[
+                {"name": "odb_latency_ms", "op": "gt", "threshold": 500,
+                 "severity": "high", "nodeId": "role:odb"},
+            ]),
+            _ops_pack(remediations={
+                "odb": [
+                    {"description": "Check the odb failover status.",
+                     "runbook": "https://aka.ms/odb", "escalateSeverity": "high"},
+                ],
+                "*": [{"description": "Capture diagnostics and contact support."}],
+            }),
+        ]
+    )
+    state = FakeState(workload="epic", estate=_odb_estate(), graph=_graph_with_dependent())
+    clients = {"system_pulse": _pulse_source(_sp_raw("odb_latency_ms", 512.0, _ODB_NODE))}
+    result = AiopsModule().run(ModuleContext(packs=packs, state=state, clients=clients))
+
+    rca = result.extra["rca"][0]
+    assert rca["taskType"] == "guided-remediation"
+    # Advisory steps become the next human actions — NOT the internal 'propose-remediation' token,
+    # and NOT 'call support' (a match was found at/above the floor).
+    assert rca["nextActions"] == ["Check the odb failover status."]
+    assert rca["confidence"] >= RCA_CONFIDENCE_FLOOR
+    # Provenance: the source Ops pack id + version is cited.
+    pack_cites = {
+        (r["id"], r["detail"]) for r in rca["sourceReferences"] if r["kind"] == "pack"
+    }
+    assert ("synthetic-remediation-advisory", "version 1.0.0") in pack_cites
+    # The advisory text is present in recommendations.
+    assert any("odb failover" in rec for rec in rca["recommendations"])
+    # MED 4: resource id stays in sourceReferences provenance only — never in advisory free text.
+    assert any(
+        r["kind"] == "resource" and _ODB_NODE in r["id"] for r in rca["sourceReferences"]
+    )
+    assert all("/subscriptions/" not in rec for rec in rca["recommendations"])
+    assert all("/subscriptions/" not in act for act in rca["nextActions"])
+
+
+
     packs = FakePacksTargetAware(
         [_telemetry_pack(signals=[
             {"name": "odb_latency_ms", "op": "gt", "threshold": 500,
@@ -595,11 +656,21 @@ def test_azure_monitor_client_fuses_into_module_detection() -> None:
 # --------------------------------------------------------------------------------------
 # FIX 1 — real SDK backend is an explicit fail-closed stub (not a misleading AttributeError)
 # --------------------------------------------------------------------------------------
-def test_default_sdk_backend_fails_closed_with_descriptive_error() -> None:
-    # The default (real) backend is not wired to the installed SDK; it must fail closed with a
-    # descriptive error class name — never a misleading AttributeError against a missing client.
+def test_default_sdk_backend_fails_closed_with_descriptive_error(monkeypatch) -> None:
+    # The default (real) backend fails closed with a descriptive error class name — never a
+    # misleading AttributeError. We give a complete, TRUSTED metrics config (endpoint + namespace,
+    # required since the metrics edge only runs when fully configured) and simulate the optional SDK
+    # being absent (sys.modules → None ⇒ ImportError) so this is deterministic in CI too.
+    import sys
+
+    monkeypatch.setitem(sys.modules, "azure.monitor.querymetrics", None)
     client = AzureMonitorClient(
-        AzureMonitorConfig(resource_ids=[_ODB_NODE], metric_names=["odb_latency_ms"]),
+        AzureMonitorConfig(
+            resource_ids=[_ODB_NODE],
+            metric_names=["odb_latency_ms"],
+            metrics_endpoint="https://westus3.metrics.monitor.azure.com",
+            metric_namespace="microsoft.insights/components",
+        ),
         credential_provider=lambda: object(),  # credential resolves, so the backend is invoked
     )
     result = client.fetch_raw()
@@ -655,11 +726,18 @@ def test_sdk_path_via_mocked_sdk_object_drives_pure_mapper() -> None:
     assert all(s.resourceId == _ODB_NODE for s in signals)
 
 
-def test_sdk_not_wired_error_carries_no_secret_upstream() -> None:
+def test_sdk_not_wired_error_carries_no_secret_upstream(monkeypatch) -> None:
     # The descriptive exception may carry context, but only its CLASS NAME reaches the FetchResult.
+    import sys
+
     assert issubclass(AzureMonitorSdkNotWired, RuntimeError)
+    monkeypatch.setitem(sys.modules, "azure.monitor.querymetrics", None)
     client = AzureMonitorClient(
-        AzureMonitorConfig(resource_ids=[_ODB_NODE]),
+        AzureMonitorConfig(
+            resource_ids=[_ODB_NODE],
+            metrics_endpoint="https://westus3.metrics.monitor.azure.com",
+            metric_namespace="microsoft.insights/components",
+        ),
         credential_provider=lambda: object(),
     )
     assert client.fetch_raw().error == "AzureMonitorSdkNotWired"
@@ -756,6 +834,59 @@ def test_fuse_merges_colliding_packs_into_one_detection_citing_all() -> None:
     # BOTH contributing packs are cited in evidence (provenance never lost).
     pack_ids = {e.id for e in finding.evidence if e.kind == "pack"}
     assert pack_ids == {"pack-a", "pack-b"}
+
+
+def _signal_src(
+    metric: str, value: float, resource_id: str, source: SignalSource,
+    *, timestamp: str = "2026-08-03T04:00:00Z",
+) -> Signal:
+    return Signal(
+        metric=metric, value=value, unit="ms",
+        timestamp=timestamp, resourceId=resource_id, source=source,  # type: ignore[arg-type]
+    )
+
+
+def test_fuse_finding_cites_azure_monitor_connector_source() -> None:
+    # MED 6: an azure_monitor-sourced observation must carry its connector provenance into the
+    # finding evidence so operators can trace which connector supplied the cited value.
+    findings = fuse_detections(
+        [_rule()],
+        [_signal_src("odb_latency_ms", 512.0, _ODB_NODE, SignalSource.azure_monitor)],
+        _odb_estate(),
+    )
+    assert len(findings) == 1
+    connector_ids = {e.id for e in findings[0].evidence if e.kind == "connector"}
+    assert connector_ids == {"azure-monitor"}
+    cited = next(e for e in findings[0].evidence if e.kind == "connector")
+    assert cited.id == "azure-monitor"
+    assert cited.detail == "cited observation source"
+
+
+def test_fuse_finding_cites_system_pulse_connector_source() -> None:
+    # MED 6: a system_pulse-sourced observation cites source=system-pulse (default provenance).
+    findings = fuse_detections(
+        [_rule()],
+        [_signal_src("odb_latency_ms", 512.0, _ODB_NODE, SignalSource.system_pulse)],
+        _odb_estate(),
+    )
+    assert len(findings) == 1
+    connector_ids = {e.id for e in findings[0].evidence if e.kind == "connector"}
+    assert connector_ids == {"system-pulse"}
+
+
+def test_fuse_finding_cites_both_connector_sources_when_merged() -> None:
+    # A (metric, node) breached by observations from BOTH connectors cites both, deterministically.
+    findings = fuse_detections(
+        [_rule()],
+        [
+            _signal_src("odb_latency_ms", 512.0, _ODB_NODE, SignalSource.system_pulse),
+            _signal_src("odb_latency_ms", 640.0, _ODB_NODE, SignalSource.azure_monitor),
+        ],
+        _odb_estate(),
+    )
+    assert len(findings) == 1
+    connector_ids = {e.id for e in findings[0].evidence if e.kind == "connector"}
+    assert connector_ids == {"system-pulse", "azure-monitor"}
 
 
 def _metric_evidence_detail(finding: Finding) -> str:

@@ -15,6 +15,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Protocol, cast
 
+from modules.dependency_graph.connectors.citrix import (
+    CitrixConnector,
+    apply_supplemental,
+    signals_from_result,
+)
 from modules.dependency_graph.topology import NetworkTopologyClient
 from shared.blast_radius import blast_radius, rank_spofs
 from shared.contracts import (
@@ -26,14 +31,24 @@ from shared.contracts import (
     ModuleManifest,
     ModuleRunResult,
     PackType,
+    ProvenanceKind,
     ResourceNode,
     ScaleProfile,
     ScaleTrigger,
     Severity,
     SourceReference,
+    StructuralFindingKind,
     WorkloadGraph,
 )
 from shared.module_base import Module, ModuleContext
+
+# Well-known name the worker/API uses to (optionally) inject the Citrix control-plane connector into
+# ``ctx.clients`` (issue #48). Absent ⇒ the module runs EXACTLY as before (estate/auto/pack only).
+# Present ⇒ Citrix HEALTH signals ANNOTATE existing estate nodes (bounded, closed-vocabulary,
+# non-authoritative supplemental tags); Citrix dependency EDGES are deliberately NOT merged (the
+# graph is UPSERT-REPLACED — a naive merge would wipe authoritative edges; deferred, see the
+# connector's ``dependency_edges`` TODO(human) + ADR 0015). Keyless, read-only, fail-closed.
+CITRIX_CONNECTOR = "citrix"
 
 
 class _PackManifestLike(Protocol):
@@ -108,7 +123,13 @@ def edges_from_backend_pool(lb_id: str, member_ids: list[str]) -> list[Dependenc
 
 
 def spof_findings(graph: WorkloadGraph, threshold: int = 1) -> list[Finding]:
-    """Emit a Finding for each node whose failure downs more than `threshold` nodes."""
+    """Emit a Finding for each node whose failure downs more than `threshold` nodes.
+
+    These are **structural** findings — computed by the platform from the dependency graph, not
+    derived from any signed pack — so they carry no ``packId``/``packVersion`` and are explicitly
+    marked ``provenance=structural`` with ``structuralKind=spof`` (issue #83). Evidence still cites
+    the resource id + blast radius (guardrail #8 / issue #59).
+    """
     findings: list[Finding] = []
     for node_id, radius in rank_spofs(graph):
         if radius < threshold:
@@ -127,6 +148,8 @@ def spof_findings(graph: WorkloadGraph, threshold: int = 1) -> list[Finding]:
                 severity=sev,
                 nodeId=node_id,
                 blastRadius=radius,
+                provenance=ProvenanceKind.structural,
+                structuralKind=StructuralFindingKind.spof,
                 evidence=[SourceReference(kind="resource", id=node_id,
                                           detail=f"blast radius = {radius}")],
                 detail=f"Failure of {node_id} takes down {radius} dependent node(s).",
@@ -146,6 +169,12 @@ class DependencyGraphModule(Module):
         estate_by_workload = self._estate_by_workload(ctx, workloads)
         nodes = _merge_nodes(estate_by_workload, workloads)
 
+        # Optional Citrix control-plane assist (issue #48): strictly additive + default-off. Absent
+        # ⇒ nodes unchanged, so the built/persisted graph is byte-for-byte identical to today. It
+        # only ANNOTATES existing nodes with supplemental health tags; it never adds/removes a node
+        # and never merges dependency edges (graph-replace hazard — deferred).
+        nodes, citrix_note = self._citrix_assist(ctx, nodes)
+
         auto_edges, unresolved = self._auto_edges(ctx, scope, nodes)
         pack_edges = self._pack_edges(ctx, workloads, estate_by_workload)
         edges = _dedupe_edges(auto_edges + pack_edges)
@@ -157,6 +186,9 @@ class DependencyGraphModule(Module):
         risks = [f"{nid}: blast radius {r}" for nid, r in top if r > 0]
         if unresolved:
             risks.append(f"{len(unresolved)} backend-pool member(s) unresolved to estate nodes")
+        agent_findings = [f"{len(findings)} SPOF(s) identified"]
+        if citrix_note:
+            agent_findings.append(citrix_note)
         response = AgentResponse(
             agentName="dependency_graph",
             taskType="build-graph-and-blast-radius",
@@ -165,7 +197,7 @@ class DependencyGraphModule(Module):
                 f"(auto={len(auto_edges)}, pack={len(pack_edges)}); "
                 f"unresolvedMembers={len(unresolved)}"
             ),
-            findings=[f"{len(findings)} SPOF(s) identified"],
+            findings=agent_findings,
             risks=risks,
             sourceReferences=[
                 SourceReference(kind="resource", id=nid, detail=f"blast radius = {r}")
@@ -177,6 +209,43 @@ class DependencyGraphModule(Module):
         return ModuleRunResult(module=self.name, ok=True, findings=findings, response=response,
                                graph=graph,
                                extra={"topSpofs": top, "unresolvedMembers": unresolved})
+
+    def _citrix_assist(
+        self, ctx: ModuleContext, nodes: list[ResourceNode]
+    ) -> tuple[list[ResourceNode], str | None]:
+        """Optionally annotate estate nodes with Citrix control-plane HEALTH signals — fail closed.
+
+        Strictly additive and default-off: when no Citrix connector is injected into
+        ``ctx.clients["citrix"]`` this returns ``(nodes, None)`` unchanged, so the graph the module
+        builds and persists is byte-for-byte identical to today. When a connector IS injected it
+        fetches (read-only, fail-closed) and applies a bounded, closed-vocabulary supplemental
+        HEALTH tag to nodes whose id EXACTLY matches an existing estate node — never adding,
+        removing, or overriding a node.
+
+        Citrix DEPENDENCY edges are intentionally NOT merged here: the module UPSERT-REPLACES the
+        workload graph, so a naive edge merge would wipe the authoritative auto/pack edges (see the
+        connector's ``dependency_edges`` TODO(human) + ADR 0015). This never raises across the
+        boundary and never lets a Citrix failure break the module.
+        """
+        connector = ctx.clients.get(CITRIX_CONNECTOR)
+        if connector is None:
+            return nodes, None
+        citrix = cast(CitrixConnector, connector)
+        try:
+            result = citrix.fetch_raw()
+            signals = signals_from_result(result)
+            applied = apply_supplemental(nodes, signals.health)
+        except Exception as exc:  # noqa: BLE001 - Citrix is optional assist; never break the module
+            return nodes, f"Citrix assist unavailable ({type(exc).__name__}); estate-only graph"
+        if not result.available:
+            return nodes, "Citrix assist unavailable (fail-closed); graph from estate only"
+        if not applied.annotated_ids:
+            return nodes, "Citrix assist returned no usable supplemental health signals"
+        note = (
+            f"Citrix assist annotated {len(applied.annotated_ids)} estate node(s) with "
+            "supplemental health signals (non-authoritative; dependency edges deferred)"
+        )
+        return applied.nodes, note
 
     @staticmethod
     def _resolve_workloads(ctx: ModuleContext, scope: dict[str, str]) -> list[str]:
@@ -413,6 +482,7 @@ def _dedupe_edges(edges: list[DependencyEdge]) -> list[DependencyEdge]:
 
 # Keep an explicit reference so linters see the imported helper is part of the public surface.
 __all__ = [
+    "CITRIX_CONNECTOR",
     "DependencyGraphModule",
     "NetworkTopologyClient",
     "blast_radius",

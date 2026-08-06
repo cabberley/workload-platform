@@ -1,0 +1,39 @@
+{
+  "manifest": {
+    "id": "waf-security-baseline",
+    "type": "rule",
+    "name": "WAF Security baseline",
+    "version": "1.0.0",
+    "targets": [],
+    "sha256": "30ce46953d764117cb5b317c1694901e9011d5484a662d7777e4f00c3fc24614",
+    "author": "microsoft"
+  },
+  "body": {
+    "rules": [
+      {
+        "id": "sec-01-data-classification",
+        "title": "Storage accounts carry a data-classification tag",
+        "resourceType": "Microsoft.Storage/storageAccounts",
+        "requiredTag": "data-classification",
+        "severity": "high",
+        "description": "WAF Security (SE:03 data classification) & APRL storage guidance: data-at-rest stores should be labelled with a data-classification tag so protection controls can be applied per sensitivity."
+      },
+      {
+        "id": "sec-02-key-vault-owner",
+        "title": "Key Vaults declare a security owner",
+        "resourceType": "Microsoft.KeyVault/vaults",
+        "requiredTag": "security-owner",
+        "severity": "medium",
+        "description": "WAF Security (SE:04 segmentation & ownership): secret stores should name an accountable security owner so access reviews and incident response have a clear contact."
+      },
+      {
+        "id": "sec-03-public-ip-review",
+        "title": "Public IPs are tagged with an exposure justification",
+        "resourceType": "Microsoft.Network/publicIPAddresses",
+        "requiredTag": "exposure-justification",
+        "severity": "high",
+        "description": "WAF Security (SE:06 network controls) & WARA reliability/security review: internet-exposed public IPs should carry a documented exposure-justification tag; untagged public exposure is surfaced fail-closed for review."
+      }
+    ]
+  }
+}

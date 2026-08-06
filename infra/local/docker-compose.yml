@@ -8,6 +8,9 @@ services:
       - "8000:8000"
     environment:
       PYTHONPATH: /app/src
+      # Local/CI dev stack runs without Entra auth by explicit opt-out (fail-closed default
+      # is `required`, which would otherwise refuse to serve without tenant/audience config).
+      WP_AUTH_MODE: disabled
 
   web:
     build:
@@ -24,4 +27,7 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.worker
     command: ["--module", "discovery"]
+    environment:
+      # Match the api service: no keyless bearer minting in the local/CI dev stack.
+      WP_AUTH_MODE: disabled
     profiles: ["workers"]

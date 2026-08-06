@@ -31,7 +31,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from uuid import uuid4
 
+from shared.audit import GENESIS_HASH, chain_event
 from shared.contracts import (
+    AuditEvent,
     DriftReport,
     Finding,
     ModuleRunResult,
@@ -39,6 +41,7 @@ from shared.contracts import (
     ResourceNode,
     WorkloadGraph,
 )
+from shared.provenance import enforce_finding_provenance, revalidate_finding_provenance
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports, never needed at runtime
     from azure.data.tables import TableClient, TableServiceClient
@@ -155,6 +158,27 @@ class StateStore(ReadableState, Protocol):
         """Return every pack-version assignment across all workloads (MS + customer visibility)."""
         ...
 
+    def append_audit(self, event: AuditEvent) -> None:
+        """Append one event to the tamper-evident, **append-only** audit log.
+
+        Append-only is a hard invariant: an implementation must only ever add a new event and must
+        never rewrite or delete a prior one (see issue #59). The backends enforce this at rest.
+        """
+        ...
+
+    def list_audit(self, *, limit: int | None = None) -> list[AuditEvent]:
+        """Return audit events in chronological (append) order; ``limit`` caps the count."""
+        ...
+
+    def audit_head(self) -> str:
+        """Return the anchored chain HEAD (latest ``entryHash``), or the genesis anchor if empty.
+
+        The HEAD is updated as part of the same append operation as the event it anchors, so a
+        reader can pass it to :func:`shared.audit.verify_audit_chain` to detect a truncated tail
+        (an otherwise-valid but shortened chain whose terminal hash no longer matches the HEAD).
+        """
+        ...
+
 
 # --------------------------------------------------------------------------------------
 # Read-only view — the object handed to modules.
@@ -243,6 +267,15 @@ def _default_state_dir() -> Path:
     return Path(tempfile.gettempdir()) / _DEFAULT_DIR_NAME
 
 
+def _has_module_qualified_pk(findings_ddl: str) -> bool:
+    """True if a ``findings`` table DDL declares the 3-column PK ``(workload, module, finding_id)``.
+
+    Whitespace-insensitive so it matches regardless of how the DDL was formatted when created.
+    """
+    normalized = "".join(findings_ddl.lower().split())
+    return "primarykey(workload,module,finding_id)" in normalized
+
+
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS estate ("
     " workload TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)",
@@ -251,7 +284,7 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS findings ("
     " workload TEXT NOT NULL, finding_id TEXT NOT NULL, module TEXT NOT NULL,"
     " data TEXT NOT NULL, updated_at TEXT NOT NULL,"
-    " PRIMARY KEY (workload, finding_id))",
+    " PRIMARY KEY (workload, module, finding_id))",
     "CREATE TABLE IF NOT EXISTS snapshots ("
     " seq INTEGER PRIMARY KEY AUTOINCREMENT, workload TEXT NOT NULL,"
     " data TEXT NOT NULL, created_at TEXT NOT NULL)",
@@ -259,6 +292,22 @@ _SCHEMA = (
     " workload TEXT NOT NULL, pack_id TEXT NOT NULL, version TEXT NOT NULL,"
     " assigned_by TEXT NOT NULL, assigned_at TEXT NOT NULL,"
     " PRIMARY KEY (workload, pack_id))",
+    # Append-only audit trail (issue #59). ``seq`` gives a total append order; the triggers below
+    # make append-only a hard, storage-enforced invariant — a prior event can never be rewritten or
+    # deleted, so the log is tamper-evident even against the single writer itself.
+    "CREATE TABLE IF NOT EXISTS audit ("
+    " seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL,"
+    " data TEXT NOT NULL, recorded_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit"
+    " BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit"
+    " BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END",
+    # Anchored hash-chain HEAD (issue #59, tamper-evidence). A single mutable row holding the
+    # latest ``entryHash``; advanced in the SAME transaction that appends its event. It is
+    # deliberately NOT append-only (it is a moving pointer, not the log) — the immutable evidence
+    # is the ``audit`` rows; the HEAD lets a reader detect a truncated tail via verify_audit_chain.
+    "CREATE TABLE IF NOT EXISTS audit_head ("
+    " id INTEGER PRIMARY KEY CHECK (id = 0), head TEXT NOT NULL)",
 )
 
 
@@ -270,6 +319,7 @@ class LocalStateStore:
         base.mkdir(parents=True, exist_ok=True)
         self._db_path = base / "state.db"
         self._init_schema()
+        self._migrate_findings_pk()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path)
@@ -280,6 +330,86 @@ class LocalStateStore:
         with self._connect() as conn:
             for stmt in _SCHEMA:
                 conn.execute(stmt)
+
+    def _migrate_findings_pk(self) -> None:
+        """Upgrade a legacy ``findings`` table to the module-qualified primary key (idempotent).
+
+        The ``findings`` primary key evolved from ``(workload, finding_id)`` to
+        ``(workload, module, finding_id)`` (issue #44 R5) so two modules can emit findings that
+        share a ``finding_id`` — e.g. a quality_checks rule id ``spof`` and a dependency_graph SPOF
+        finding both key ``spof::<node>`` — without one silently overwriting the other. Because the
+        table is created with ``CREATE TABLE IF NOT EXISTS``, a ``state.db`` written before this
+        change keeps its old 2-column PK; the new ``ON CONFLICT(workload, module, finding_id)``
+        upsert then has no matching constraint and raises ``OperationalError`` on the next findings
+        write (and the state DB persists across runs — which is what drift detection relies on).
+        This atomic migration rewrites such a legacy table into the new shape, backfilling
+        ``module`` from the stored Finding JSON (``data``) when the column value is NULL. It is a
+        no-op when the table is absent (a fresh DB already has the new shape from ``_SCHEMA``) or
+        already has the 3-column PK, so it is safe to run on every init. Runs AFTER ``_init_schema``
+        so the ``CREATE TABLE IF NOT EXISTS`` has already no-oped on a legacy DB before we fix its
+        PK.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='findings'"
+            ).fetchone()
+            if row is None:
+                return  # no findings table yet — nothing to migrate
+            if _has_module_qualified_pk(str(row["sql"] or "")):
+                return  # already the new 3-column PK — idempotent no-op
+            columns = {str(c["name"]) for c in conn.execute("PRAGMA table_info(findings)")}
+            if "data" not in columns:
+                raise RuntimeError(
+                    "Cannot migrate legacy 'findings' table: no 'data' column to source the "
+                    "module from — refusing to drop rows (fail closed)."
+                )
+            has_module_col = "module" in columns
+            # Fixed, fully-static SQL per branch (no interpolation) — module is backfilled from the
+            # stored Finding JSON (``$.module``) when the column is missing/NULL.
+            if has_module_col:
+                unresolved_sql = (
+                    "SELECT COUNT(*) AS n FROM findings"
+                    " WHERE COALESCE(module, json_extract(data, '$.module')) IS NULL"
+                )
+                insert_sql = (
+                    "INSERT INTO findings_new (workload, finding_id, module, data, updated_at)"
+                    " SELECT workload, finding_id,"
+                    " COALESCE(module, json_extract(data, '$.module')),"
+                    " data, updated_at FROM findings"
+                )
+            else:
+                unresolved_sql = (
+                    "SELECT COUNT(*) AS n FROM findings"
+                    " WHERE json_extract(data, '$.module') IS NULL"
+                )
+                insert_sql = (
+                    "INSERT INTO findings_new (workload, finding_id, module, data, updated_at)"
+                    " SELECT workload, finding_id, json_extract(data, '$.module'),"
+                    " data, updated_at FROM findings"
+                )
+            unresolved = conn.execute(unresolved_sql).fetchone()
+            if unresolved is not None and int(unresolved["n"]) > 0:
+                raise RuntimeError(
+                    f"Cannot migrate legacy 'findings' table: {int(unresolved['n'])} row(s) have "
+                    "no resolvable module (NULL column and no '$.module' in data JSON) — refusing "
+                    "to drop rows (fail closed)."
+                )
+            conn.isolation_level = None  # take manual control of the migration transaction
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "CREATE TABLE findings_new ("
+                    " workload TEXT NOT NULL, finding_id TEXT NOT NULL, module TEXT NOT NULL,"
+                    " data TEXT NOT NULL, updated_at TEXT NOT NULL,"
+                    " PRIMARY KEY (workload, module, finding_id))"
+                )
+                conn.execute(insert_sql)
+                conn.execute("DROP TABLE findings")
+                conn.execute("ALTER TABLE findings_new RENAME TO findings")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     @contextlib.contextmanager
     def _transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -408,6 +538,16 @@ class LocalStateStore:
     def _write_findings(
         conn: sqlite3.Connection, workload: str, findings: list[Finding]
     ) -> None:
+        # Central provenance gate (issue #59, HIGH-1): no finding is persisted without evidence /
+        # sourceReferences. This is the authoritative choke point — every write path (API /results,
+        # /findings, /run commit, and any future writer) funnels through here — so a finding lacking
+        # provenance fails closed BEFORE any row is written, inside the caller's transaction, so the
+        # whole write rolls back and NOTHING is persisted.
+        enforce_finding_provenance(findings)
+        # Defense in depth (issue #83): also re-assert the pack-vs-structural provenance invariant
+        # at this durable boundary, so a finding that somehow reached persistence in an invalid
+        # provenance state (bypassing construction/assignment validation) is rejected fail-closed.
+        revalidate_finding_provenance(findings)
         now = _now_iso()
         rows = [
             (workload, finding.id, finding.module, finding.model_dump_json(), now)
@@ -416,9 +556,8 @@ class LocalStateStore:
         conn.executemany(
             "INSERT INTO findings (workload, finding_id, module, data, updated_at)"
             " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(workload, finding_id) DO UPDATE SET"
-            " module = excluded.module, data = excluded.data,"
-            " updated_at = excluded.updated_at",
+            " ON CONFLICT(workload, module, finding_id) DO UPDATE SET"
+            " data = excluded.data, updated_at = excluded.updated_at",
             rows,
         )
 
@@ -527,6 +666,49 @@ class LocalStateStore:
             ).fetchall()
         return [self._row_to_assignment(row) for row in rows]
 
+    # -- audit trail (append-only, hash-chained) -----------------------------------------
+    def append_audit(self, event: AuditEvent) -> None:
+        """Append one hash-chained audit event in a single ``BEGIN IMMEDIATE`` transaction.
+
+        The write lock is taken up front so the read of the current HEAD, the row INSERT, and the
+        HEAD advance are point-in-time atomic — a concurrent appender cannot interleave, so the
+        chain stays strictly linear. The event is linked onto the current HEAD (or the genesis
+        anchor for the first event) via :func:`shared.audit.chain_event`; the row INSERT is blocked
+        from any later rewrite by the append-only triggers, and the mutable ``audit_head`` pointer
+        is advanced to the new ``entryHash`` in the SAME transaction. If anything raises, the whole
+        transaction rolls back and neither the row nor the HEAD moves.
+        """
+        with self._transaction(immediate=True) as conn:
+            row = conn.execute("SELECT head FROM audit_head WHERE id = 0").fetchone()
+            prev_hash = str(row["head"]) if row is not None else GENESIS_HASH
+            chained = chain_event(event, prev_hash)
+            conn.execute(
+                "INSERT INTO audit (event_id, data, recorded_at) VALUES (?, ?, ?)",
+                (chained.id, chained.model_dump_json(), chained.recordedAt.isoformat()),
+            )
+            conn.execute(
+                "INSERT INTO audit_head (id, head) VALUES (0, ?)"
+                " ON CONFLICT(id) DO UPDATE SET head = excluded.head",
+                (chained.entryHash,),
+            )
+
+    def list_audit(self, *, limit: int | None = None) -> list[AuditEvent]:
+        """Return audit events in append (``seq``) order, oldest first; ``limit`` caps the count."""
+        query = "SELECT data FROM audit ORDER BY seq ASC"
+        params: tuple[int, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (limit,)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [AuditEvent.model_validate_json(row["data"]) for row in rows]
+
+    def audit_head(self) -> str:
+        """Return the anchored chain HEAD (latest ``entryHash``), or the genesis anchor if empty."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT head FROM audit_head WHERE id = 0").fetchone()
+        return str(row["head"]) if row is not None else GENESIS_HASH
+
 
 # --------------------------------------------------------------------------------------
 # Azure backend — same Protocol, azure SDK imports guarded (so ``import shared.state`` never needs
@@ -539,6 +721,12 @@ _AZ_SNAPSHOTS_TABLE = "snapshots"
 _AZ_INDEX_TABLE = "workloads"
 _AZ_ASSIGNMENTS_TABLE = "packassignments"
 _AZ_INDEX_PARTITION = "_index"
+_AZ_AUDIT_TABLE = "audit"
+_AZ_AUDIT_PARTITION = "_audit"
+# Reserved RowKey (in the audit partition) for the anchored chain HEAD entity. Sorts after the
+# zero-padded numeric event RowKeys, and is skipped by ``list_audit`` so it is never mistaken for an
+# event. It holds the latest ``entryHash`` (``head``) and the next chain index (``index``).
+_AZ_AUDIT_HEAD_ROW = "_head"
 _MAX_COMMIT_RETRIES = 8
 
 
@@ -589,7 +777,7 @@ class AzureStateStore:
         container_name = os.environ.get("WORKLOADS_STATE_CONTAINER", "state")
 
         table_service = TableServiceClient(endpoint=table_endpoint, credential=credential)
-        for table in (_AZ_SNAPSHOTS_TABLE, _AZ_INDEX_TABLE, _AZ_ASSIGNMENTS_TABLE):
+        for table in (_AZ_SNAPSHOTS_TABLE, _AZ_INDEX_TABLE, _AZ_ASSIGNMENTS_TABLE, _AZ_AUDIT_TABLE):
             table_service.create_table_if_not_exists(table)
 
         blob_service = BlobServiceClient(account_url=blob_endpoint, credential=credential)
@@ -615,7 +803,21 @@ class AzureStateStore:
         return str(downloader.readall())
 
     def _write_blob(self, name: str, data: str) -> None:
-        self._container.upload_blob(name, data.encode("utf-8"), overwrite=True)
+        """Write a blob **create-if-absent** (write-once) — never clobber an existing name.
+
+        Every blob this store writes is addressed by a UNIQUE, version-scoped name: the commit
+        components use a per-attempt ``{commit_id}=uuid4().hex`` (``_commit``) and the snapshot
+        blob uses a table-claimed monotonic sequence (``snapshot``). None of these paths ever
+        legitimately re-write an existing name — the mutable commit point is the *manifest table
+        entity*, guarded by its own ETag, NOT a blob. So we upload with ``overwrite=False``, which
+        the Azure SDK sends as a conditional ``If-None-Match: *`` create: a name collision (a
+        ret/racing rewrite, or an attacker overwriting a committed artifact in place) FAILS CLOSED
+        with ``ResourceExistsError`` instead of silently clobbering. This is the SDK-level
+        tamper-RESISTANCE that backs the storage-layer immutability/versioning posture (issue #81)
+        and the append-only hash-chain tamper-EVIDENCE (issue #59). Blob **versioning** on the
+        account (see ``infra/bicep/modules/core.bicep``) additionally retains any prior bytes.
+        """
+        self._container.upload_blob(name, data.encode("utf-8"), overwrite=False)
 
     # -- the manifest: the single commit point AND the sole read path --------------------
     def _manifest_with_etag(self, workload: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -676,11 +878,20 @@ class AzureStateStore:
 
     @staticmethod
     def _merge_findings(previous: list[Finding], new: list[Finding]) -> list[Finding]:
-        """Additive upsert of findings by id (new wins), preserving prior findings."""
-        by_id = {finding.id: finding for finding in previous}
+        """Additive upsert of findings by ``(module, id)`` (new wins), preserving prior findings.
+
+        Findings are identified by the MODULE-QUALIFIED key ``(module, finding_id)`` — a finding
+        id is only unique within its emitting module (e.g. a quality_checks rule id ``spof`` mints
+        the same ``spof::<node>`` id a dependency_graph SPOF finding uses). Keying by id alone would
+        let one module's finding overwrite another's — e.g. an imported quality_checks PASS
+        ``spof::N`` clobbering the dependency_graph SPOF FAIL and hiding a real single point of
+        failure. Qualifying by ``(module, id)`` keeps cross-module same-id findings distinct;
+        new-wins applies only WITHIN the same ``(module, id)``.
+        """
+        by_key = {(finding.module, finding.id): finding for finding in previous}
         for finding in new:
-            by_id[finding.id] = finding
-        return list(by_id.values())
+            by_key[(finding.module, finding.id)] = finding
+        return list(by_key.values())
 
     def _commit(
         self,
@@ -703,6 +914,13 @@ class AzureStateStore:
         from azure.core import MatchConditions
         from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
+        # Central provenance gate (issue #59, HIGH-1): reject any un-provenanced finding BEFORE any
+        # blob is written, so neither the Azure nor the local backend can ever persist a finding
+        # without evidence. Raising here (before the first ``_write_blob``) leaves storage intact.
+        enforce_finding_provenance(findings)
+        # Defense in depth (issue #83): re-assert the pack-vs-structural provenance invariant at the
+        # durable boundary too, so an invalid-provenance finding is rejected before any blob write.
+        revalidate_finding_provenance(findings)
         scope = encode_storage_key(workload)
         last_error: Exception | None = None
         for _attempt in range(_MAX_COMMIT_RETRIES):
@@ -926,6 +1144,111 @@ class AzureStateStore:
         assignments = [self._entity_to_assignment(dict(entity)) for entity in entities]
         return sorted(assignments, key=lambda a: (a.workload, a.packId))
 
+    # -- audit trail (append-only, hash-chained) -----------------------------------------
+    def _audit_head_with_etag(self) -> tuple[dict[str, Any] | None, str | None]:
+        """Read the anchored chain HEAD entity + its ETag (both ``None`` if no event yet)."""
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            entity = self._table(_AZ_AUDIT_TABLE).get_entity(
+                _AZ_AUDIT_PARTITION, _AZ_AUDIT_HEAD_ROW
+            )
+        except ResourceNotFoundError:
+            return None, None
+        metadata = getattr(entity, "metadata", None)
+        etag = metadata.get("etag") if metadata else None
+        return dict(entity), etag
+
+    def append_audit(self, event: AuditEvent) -> None:
+        """Append one hash-chained audit event, advancing the anchored HEAD **atomically**.
+
+        The event row and the chain HEAD live in the SAME partition (``_AZ_AUDIT_PARTITION``), so
+        both writes are committed in a SINGLE Azure Table entity-group transaction
+        (``submit_transaction``) — either both land or neither does. There is therefore **no
+        window** in which the HEAD points at an event row that does not exist (no orphan), and
+        **no fork**:
+
+        1. Read the current HEAD entity (``head`` hash + next ``index``) and its ETag, or the
+           genesis anchor if this is the first event.
+        2. Build the chained event row (create-only) AND the HEAD row (create for the first event,
+           else an ETag-conditional ``IfNotModified`` replace) and submit them as ONE transaction.
+        3. If the transaction fails (a concurrent appender advanced the HEAD, so our ETag is stale,
+           or the event/HEAD row already exists), retry from step 1 with the fresh HEAD — the chain
+           stays strictly linear. The event row is create-only, so a prior row is never rewritten.
+
+        Because the two writes are atomic, an event-insert failure cannot advance the HEAD, and a
+        HEAD advance cannot occur without its event row — the chain can never be poisoned.
+        """
+        from azure.core import MatchConditions
+        from azure.core.exceptions import HttpResponseError
+
+        table = self._table(_AZ_AUDIT_TABLE)
+        last_error: Exception | None = None
+        for _attempt in range(_MAX_COMMIT_RETRIES):
+            head_entity, etag = self._audit_head_with_etag()
+            prev_hash = str(head_entity["head"]) if head_entity else GENESIS_HASH
+            index = (int(head_entity["index"]) + 1) if head_entity else 1
+            chained = chain_event(event, prev_hash)
+            event_row = {
+                "PartitionKey": _AZ_AUDIT_PARTITION,
+                "RowKey": f"{index:012d}",
+                "event_id": chained.id,
+                "data": chained.model_dump_json(),
+                "recorded_at": chained.recordedAt.isoformat(),
+            }
+            head_row = {
+                "PartitionKey": _AZ_AUDIT_PARTITION,
+                "RowKey": _AZ_AUDIT_HEAD_ROW,
+                "head": chained.entryHash,
+                "index": index,
+            }
+            head_op: tuple[str, dict[str, Any], dict[str, Any]] | tuple[str, dict[str, Any]] = (
+                ("create", head_row)
+                if head_entity is None
+                else (
+                    "update",
+                    head_row,
+                    {
+                        "mode": "replace",
+                        "etag": etag,
+                        "match_condition": MatchConditions.IfNotModified,
+                    },
+                )
+            )
+            # ONE partition, ONE transaction: the immutable event row + HEAD advance land together.
+            operations = [("create", event_row), head_op]
+            try:
+                table.submit_transaction(operations)
+            except HttpResponseError as exc:  # TableTransactionError (ETag/exists) — retry cleanly
+                last_error = exc
+                continue
+            return
+        raise RuntimeError(
+            f"AzureStateStore.append_audit: chain HEAD contention exceeded "
+            f"{_MAX_COMMIT_RETRIES} retries"
+        ) from last_error
+
+    def list_audit(self, *, limit: int | None = None) -> list[AuditEvent]:
+        """Return audit events in chain (``RowKey``) order; ``limit`` caps the count.
+
+        The reserved HEAD entity is filtered out — it is the anchor pointer, not an event.
+        """
+        entities = [
+            entity
+            for entity in self._table(_AZ_AUDIT_TABLE).query_entities(
+                "PartitionKey eq @pk", parameters={"pk": _AZ_AUDIT_PARTITION}
+            )
+            if str(entity["RowKey"]) != _AZ_AUDIT_HEAD_ROW
+        ]
+        entities.sort(key=lambda entity: str(entity["RowKey"]))
+        events = [AuditEvent.model_validate_json(str(entity["data"])) for entity in entities]
+        return events[:limit] if limit is not None else events
+
+    def audit_head(self) -> str:
+        """Return the anchored chain HEAD (latest ``entryHash``), or the genesis anchor if empty."""
+        head_entity, _etag = self._audit_head_with_etag()
+        return str(head_entity["head"]) if head_entity else GENESIS_HASH
+
 
 # --------------------------------------------------------------------------------------
 # Factory + drift read model.
@@ -959,22 +1282,32 @@ def compute_drift(
     * ``addedNodes``/``removedNodes`` — estate node ids gained/lost since the previous snapshot.
 
     A finding is "failing" when ``passed is False`` (fail-closed: ``None``/unknown is not a fail).
-    """
-    prev_failing = {finding.id: finding for finding in previous if finding.passed is False}
-    cur_failing = {finding.id: finding for finding in current if finding.passed is False}
 
-    new_failures = [f for fid, f in cur_failing.items() if fid not in prev_failing]
-    still_failing = [f for fid, f in cur_failing.items() if fid in prev_failing]
-    recovered = [f for fid, f in prev_failing.items() if fid not in cur_failing]
+    Findings are identified by the MODULE-QUALIFIED key ``(module, id)``: a finding id is only
+    unique within its emitting module, so a quality_checks ``spof::N`` and a dependency_graph
+    ``spof::N`` are DISTINCT findings. Keying by id alone would mis-diff them — e.g. report a
+    quality_checks ``spof::N`` PASS as "recovered" against a dependency_graph ``spof::N`` FAIL,
+    hiding a still-live single point of failure.
+    """
+    prev_failing = {
+        (finding.module, finding.id): finding for finding in previous if finding.passed is False
+    }
+    cur_failing = {
+        (finding.module, finding.id): finding for finding in current if finding.passed is False
+    }
+
+    new_failures = [f for key, f in cur_failing.items() if key not in prev_failing]
+    still_failing = [f for key, f in cur_failing.items() if key in prev_failing]
+    recovered = [f for key, f in prev_failing.items() if key not in cur_failing]
 
     prev_ids = set(previous_nodes)
     cur_ids = set(current_nodes)
 
     return DriftReport(
         workload=workload,
-        newFailures=sorted(new_failures, key=lambda f: f.id),
-        recovered=sorted(recovered, key=lambda f: f.id),
-        stillFailing=sorted(still_failing, key=lambda f: f.id),
+        newFailures=sorted(new_failures, key=lambda f: (f.module, f.id)),
+        recovered=sorted(recovered, key=lambda f: (f.module, f.id)),
+        stillFailing=sorted(still_failing, key=lambda f: (f.module, f.id)),
         addedNodes=sorted(cur_ids - prev_ids),
         removedNodes=sorted(prev_ids - cur_ids),
     )

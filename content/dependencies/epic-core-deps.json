@@ -5,6 +5,7 @@
     "name": "Epic core dependencies",
     "version": "1.0.0",
     "targets": ["epic"],
+    "sha256": "62ef3be9d9a56ecacccba52e54d8394e07f887da2f6e77e653970f83e31f26ef",
     "author": "microsoft"
   },
   "body": {

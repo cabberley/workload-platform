@@ -45,6 +45,23 @@ export type ModuleManifest = {
   scaleProfile: ScaleProfile;
 };
 
+/**
+ * Read model for one published pack version — mirrors the API app's `PackRegistryEntryView`
+ * (issue #57), the keyless/PII-free projection of a `packs_engine.registry.RegistryEntry`. Every
+ * field is REQUIRED (always serialized). `digest` is the content-address / version identity (a
+ * lowercase sha256 hex — NOT a secret); `signed` reflects whether the entry carries a well-formed
+ * detached signature. The SPA only ever *reads* this shape. The raw key id / signature bytes are
+ * intentionally NOT part of this contract (never egressed by the backend).
+ */
+export type PackRegistryEntry = {
+  id: string;
+  version: string;
+  type: PackType;
+  digest: string;
+  createdAt: string;
+  signed: boolean;
+};
+
 /** Mirrors `contracts.ResourceNode`. `workload`/`tier`/`role` are nullable-but-present. */
 export type ResourceNode = {
   id: string;
@@ -68,10 +85,14 @@ export type DependencyEdge = {
   origin: string;
 };
 
-/** Mirrors `contracts.WorkloadGraph`. */
+/** Mirrors `contracts.WorkloadGraph`. The API's graph endpoint additionally returns an opaque
+ *  server-computed `graphRevision` over the FULL topology (nodes + edges) — optional so this stays
+ *  back-compatible with the pure contract shape. The web treats it as an OPAQUE string (never
+ *  hashes the graph itself). */
 export type WorkloadGraph = {
   nodes: ResourceNode[];
   edges: DependencyEdge[];
+  graphRevision?: string;
 };
 
 /** Mirrors `contracts.SourceReference`. `detail` is nullable-but-present. */
@@ -84,8 +105,13 @@ export type SourceReference = {
 /**
  * Mirrors `contracts.Finding`. `passed` is tri-state (`null` = unknown, treated as NOT a failure —
  * fail-closed). `nodeId`, `packId`, `packVersion`, `detail` are nullable-but-present; `createdAt`
- * is an ISO-8601 datetime string.
+ * is an ISO-8601 datetime string. `provenance` is the explicit pack-vs-structural attribution
+ * marker (issue #83): a `pack` finding carries `packId`+`packVersion`; a `structural` finding names
+ * a `structuralKind` and has null pack id/version.
  */
+export type ProvenanceKind = "pack" | "structural";
+export type StructuralFindingKind = "spof";
+
 export type Finding = {
   id: string;
   module: string;
@@ -95,8 +121,10 @@ export type Finding = {
   nodeId: string | null;
   blastRadius: number;
   evidence: SourceReference[];
+  provenance: ProvenanceKind;
   packId: string | null;
   packVersion: string | null;
+  structuralKind: StructuralFindingKind | null;
   detail: string | null;
   createdAt: string;
 };
@@ -112,6 +140,7 @@ export type DriftReport = {
 };
 
 /**
+/**
  * Mirrors `contracts.PackAssignment` (issue #37). Which pack version a workload is pinned to.
  * `assignedAt` is an ISO-8601 datetime string. The SPA only ever *reads* this shape — all
  * assignment writes go through the API (single writer).
@@ -122,4 +151,21 @@ export type PackAssignment = {
   version: string;
   assignedBy: string;
   assignedAt: string;
+};
+
+/**
+ * Mirrors the API app's `ImpactResult` read model (issue #56) — the projection of the CANONICAL
+ * server-side `shared.blast_radius.compute_impact`. `states` maps every node id to its simulated
+ * `HealthState` when `failedNode` is down; `blastRadius === down.length`. This is a *read* shape
+ * only (the SPA never posts an impact). Do not add fields the backend does not send.
+ */
+export type ImpactResult = {
+  failedNode: string;
+  states: Record<string, HealthState>;
+  blastRadius: number;
+  down: string[];
+  degraded: string[];
+  /** Opaque server-computed revision of the topology the impact was computed on. Compare (as a
+   *  string) with the displayed graph's `graphRevision` to detect edge-level staleness. */
+  graphRevision: string;
 };

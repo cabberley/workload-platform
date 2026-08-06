@@ -28,7 +28,15 @@ concrete pack/edge-client types, and wire it into both entry points:
   returns `None` if absent.
 - `build_client_registry()` builds the keyless edge clients whose config + SDK are present:
   `resource_graph`, `network`, `notifier`, `system_pulse`. A documented extension hook is left for
-  `azure_monitor` (issue #6, not yet on `main`).
+  `azure_monitor` (issue #6, not yet on `main`). The `notifier` webhook URL
+  (`$WP_ALERT_WEBHOOK_URL`) MUST be `https://` — a cleartext `http://` URL is rejected fail-closed
+  (`InsecureWebhookError`) so findings can never egress over the wire in the clear. A documented,
+  **loopback-only** opt-out (`$WP_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK=true`) permits `http://`
+  *only* to `127.0.0.0/8` / `::1` / `localhost` for a local test sink; cleartext to any
+  non-loopback host is always rejected, even with the flag set (spoofed-loopback hosts such as
+  `127.0.0.1.evil.com` are not treated as loopback). The IPv6 loopback sink is exactly `::1`;
+  ipv4-mapped forms (e.g. `::ffff:127.0.0.1`) are a disguised loopback and are rejected everywhere
+  (default-off, `https://`, and the opt-in) with the constant sanitized error.
 - `run_module()` gains a `packs` parameter and forwards it verbatim.
 - **API** (`/api/modules/{name}/run`): keeps its fast in-process `ReadOnlyState(store)` and *also*
   injects packs + clients via cached, override-able FastAPI dependencies (`get_packs`,
@@ -47,8 +55,11 @@ concrete pack/edge-client types, and wire it into both entry points:
 - **+** **Keyless / fail-closed / guarded.** Clients authenticate via `DefaultAzureCredential`
   (Managed Identity); only Key Vault-backed env *names/values* are read. A missing SDK, missing
   config, or missing content root leaves the pack/client simply **absent** (module fails closed) —
-  no builder ever raises. Every Azure import is lazy/guarded, so importing the composition root
-  needs no Azure SDK and `mypy src` stays clean without them installed.
+  builders do not raise for absent/optional dependencies. The one deliberate exception is a
+  security misconfiguration: a non-HTTPS `notifier` webhook URL is rejected fail-closed
+  (`InsecureWebhookError`) rather than silently accepted. Every Azure import is lazy/guarded, so
+  importing the composition root needs no Azure SDK and `mypy src` stays clean without them
+  installed.
 - **+** The `azure_monitor` client (issue #6) drops in as a ~2-line, guarded follow-up at the
   documented extension point.
 - **−** One more module (`cli.wiring`) concentrates the concrete-type knowledge; that is deliberate
