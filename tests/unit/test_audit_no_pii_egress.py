@@ -28,20 +28,30 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, encoders, respon
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import (
+    AfterValidator,
     AliasChoices,
     BaseModel,
+    BeforeValidator,
     Field,
     PlainSerializer,
+    PlainValidator,
     RootModel,
     SerializeAsAny,
     WrapSerializer,
+    WrapValidator,
     computed_field,
+    create_model,
     field_serializer,
+    field_validator,
     model_serializer,
+    model_validator,
 )
 from starlette.applications import Starlette
 from starlette.routing import Route
-from typing_extensions import TypedDict  # Pydantic needs typing_extensions.TypedDict on py<3.12
+from typing_extensions import (
+    TypeAliasType,  # PEP 695 alias, backported for py<3.12
+    TypedDict,  # Pydantic needs typing_extensions.TypedDict on py<3.12
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO_ROOT / "scripts" / "audit_no_pii_egress.py"
@@ -2636,3 +2646,474 @@ def test_r18_response_model_none_response_annotation_sanitized_passes() -> None:
     assert not any(v.target.endswith("<unredacted egress>") for v in auditor.violations), (
         auditor.violations
     )
+
+
+# =======================================================================================
+# R103 — validator / Annotated-metadata callables that raise structured PII (issue #103).
+#
+# FastAPI/Pydantic run user callables embedded in a parameter's ``Annotated[...]`` metadata
+# (BeforeValidator/AfterValidator/PlainValidator/WrapValidator) and the @field_validator/
+# @model_validator methods of a Pydantic-model parameter, before/around a handler or class
+# dependency. A validator raising a STRUCTURED HTTPException detail egresses PII exactly like a
+# handler/dependency, so it must FLAG UNWAIVABLY. Bounded string / ValueError / framework-builtin /
+# safe validators must NOT false-positive; an opaque (unresolvable) validator must fail closed.
+# All fixtures are synthetic, clearly-fake, secret-free.
+# =======================================================================================
+_V103_STRUCT_KEY = _HTTP_STRUCTURED_KEY
+
+
+def _v103_before_structured(v: str) -> str:
+    raise HTTPException(status_code=403, detail={"patientEmail": v})  # structured PII detail
+
+
+def _v103_after_structured(v: str) -> str:
+    raise HTTPException(status_code=403, detail={"patientEmail": v})
+
+
+def _v103_plain_structured(v: str) -> str:
+    raise HTTPException(status_code=403, detail={"patientEmail": v})
+
+
+def _v103_wrap_structured(v: str, handler: Any) -> str:
+    raise HTTPException(status_code=403, detail={"patientEmail": v})
+
+
+def _v103_safe_returns_v(v: str) -> str:
+    return v  # a plain, safe validator — must NOT flag
+
+
+def _v103_scalar_detail(v: str) -> str:
+    raise HTTPException(status_code=403, detail=str(v))  # bounded string coercion (scalar)
+
+
+def _v103_literal_detail(v: str) -> str:
+    raise HTTPException(status_code=403, detail="forbidden")  # bounded literal, no PII
+
+
+def _v103_valueerror(v: str) -> str:
+    raise ValueError("must be non-empty")  # not an HTTPException — not an egress detail
+
+
+# An opaque validator: a real function whose source is NOT on disk (compiled from a string), a
+# stand-in for an imported-from-outside-app callable the auditor cannot introspect.
+_V103_OPAQUE_NS: dict[str, Any] = {}
+exec(  # noqa: S102 - synthetic fixture: models a callable with no readable source.
+    compile(
+        "def _v103_opaque(v):\n    raise RuntimeError('no source on disk')\n",
+        "<opaque-dynamic-103>",
+        "exec",
+    ),
+    _V103_OPAQUE_NS,
+)
+_v103_opaque = _V103_OPAQUE_NS["_v103_opaque"]
+
+
+class _V103Body(BaseModel):
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def _reject(cls, v: str) -> str:  # @field_validator raising structured PII
+        raise HTTPException(status_code=403, detail={"patientEmail": v})
+
+
+class _V103ModelBody(BaseModel):
+    email: str
+
+    @model_validator(mode="after")
+    def _reject(self) -> _V103ModelBody:  # @model_validator raising structured PII
+        raise HTTPException(status_code=403, detail={"patientEmail": self.email})
+
+
+class _V103SafeBody(BaseModel):
+    id: str
+
+    @field_validator("id")
+    @classmethod
+    def _ok(cls, v: str) -> str:  # a safe validator — returns v / raises ValueError only
+        if not v:
+            raise ValueError("empty")
+        return v
+
+
+def _has_structured(auditor: Any, path: str) -> bool:
+    return any(
+        v.kind == "dynamic" and v.target == f"{path} {_V103_STRUCT_KEY}"
+        for v in auditor.violations
+    )
+
+
+# --- Functional validators on a CLASS-DEPENDENCY constructor param flag structured PII --
+@pytest.mark.parametrize(
+    ("marker", "func"),
+    [
+        (BeforeValidator, _v103_before_structured),
+        (AfterValidator, _v103_after_structured),
+        (PlainValidator, _v103_plain_structured),
+        (WrapValidator, _v103_wrap_structured),
+    ],
+)
+def test_r103_functional_validator_on_class_dep_param_flags(marker: Any, func: Any) -> None:
+    ann = Annotated[str, marker(func)]
+
+    def __init__(self: Any, email: Any) -> None:  # noqa: N807 - dynamic dunder for the fixture
+        self.email = email
+
+    __init__.__annotations__ = {"email": ann, "return": None}
+    guard = type("_V103DynGuard", (), {"__init__": __init__})
+
+    app = FastAPI()
+
+    @app.get("/dep", response_model=_Safe, dependencies=[Depends(guard)])
+    def h() -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "GET /dep"), auditor.violations
+
+
+# --- The SAME functional validators on a ROUTE-HANDLER param flag structured PII --------
+@pytest.mark.parametrize(
+    ("marker", "func"),
+    [
+        (BeforeValidator, _v103_before_structured),
+        (AfterValidator, _v103_after_structured),
+        (PlainValidator, _v103_plain_structured),
+        (WrapValidator, _v103_wrap_structured),
+    ],
+)
+def test_r103_functional_validator_on_handler_param_flags(marker: Any, func: Any) -> None:
+    def handler(name: Any) -> Any:
+        return _Safe(id="ok")
+
+    handler.__annotations__ = {"name": Annotated[str, marker(func)], "return": Any}
+
+    app = FastAPI()
+    app.get("/h", response_model=_Safe)(handler)
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "GET /h"), auditor.violations
+
+
+# --- @field_validator raising a structured detail flags (model as handler-body param) ---
+def test_r103_field_validator_structured_detail_flags() -> None:
+    app = FastAPI()
+
+    @app.post("/fv", response_model=_Safe)
+    def h(body: _V103Body) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "POST /fv"), auditor.violations
+
+
+# --- @model_validator raising a structured detail flags (model on a class-dep param) ----
+def test_r103_model_validator_structured_detail_flags_on_class_dep() -> None:
+    class _Guard:
+        def __init__(self, body: _V103ModelBody) -> None:
+            self.body = body
+
+    app = FastAPI()
+
+    @app.get("/mv", response_model=_Safe, dependencies=[Depends(_Guard)])
+    def h() -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "GET /mv"), auditor.violations
+
+
+# --- The structured validator finding is UNWAIVABLE by a route-level string waiver ------
+def test_r103_structured_validator_is_unwaivable() -> None:
+    app = FastAPI()
+
+    @app.get("/uw", response_model=_Safe)
+    def h(name: Annotated[str, BeforeValidator(_v103_before_structured)]) -> Any:
+        return _Safe(id="ok")
+
+    # A per-validator scalar-detail waiver must NOT silence the STRUCTURED finding.
+    waivers = {"GET /uw <validator _v103_before_structured raise detail>": "#96 str(exc)"}
+    auditor = AUDIT.Auditor(waivers)
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "GET /uw"), auditor.violations
+
+
+# --- NEGATIVE: a plain/safe validator (returns v) does not false-positive ---------------
+def test_r103_safe_returns_v_validator_passes() -> None:
+    app = FastAPI()
+
+    @app.get("/safe", response_model=_Safe)
+    def h(name: Annotated[str, AfterValidator(_v103_safe_returns_v)]) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert not any("validator" in v.target for v in auditor.violations), auditor.violations
+    assert not _has_structured(auditor, "GET /safe")
+
+
+# --- NEGATIVE: a safe field_validator (ValueError / returns v) does not false-positive --
+def test_r103_safe_field_validator_body_passes() -> None:
+    app = FastAPI()
+
+    @app.post("/safebody", response_model=_Safe)
+    def h(body: _V103SafeBody) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert not any("validator" in v.target for v in auditor.violations), auditor.violations
+    assert not _has_structured(auditor, "POST /safebody")
+
+
+# --- NEGATIVE: a validator raising ValueError (not HTTPException) does not flag ----------
+def test_r103_valueerror_validator_passes() -> None:
+    app = FastAPI()
+
+    @app.get("/verr", response_model=_Safe)
+    def h(name: Annotated[str, BeforeValidator(_v103_valueerror)]) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert not any(v.target.startswith("GET /verr") for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+# --- NEGATIVE: a validator raising a bounded LITERAL detail does not flag ----------------
+def test_r103_bounded_literal_detail_validator_passes() -> None:
+    app = FastAPI()
+
+    @app.get("/lit", response_model=_Safe)
+    def h(name: Annotated[str, BeforeValidator(_v103_literal_detail)]) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert not any(v.target.startswith("GET /lit") for v in auditor.violations), (
+        auditor.violations
+    )
+
+
+# --- A bounded STRING-COERCION detail is scalar (waivable), never structured -------------
+def test_r103_scalar_detail_validator_is_waivable_not_structured() -> None:
+    app = FastAPI()
+
+    @app.get("/scalar", response_model=_Safe)
+    def h(name: Annotated[str, BeforeValidator(_v103_scalar_detail)]) -> Any:
+        return _Safe(id="ok")
+
+    # Unwaived: it surfaces on the per-validator waivable key (scalar), NOT the structured key.
+    unwaived = AUDIT.Auditor({})
+    unwaived.audit_app(app)
+    scalar_key = "GET /scalar <validator _v103_scalar_detail raise detail>"
+    assert any(v.target == scalar_key for v in unwaived.violations), unwaived.violations
+    assert not _has_structured(unwaived, "GET /scalar")
+
+    # Waived: the scalar coercion may be signed off, and then the route is clean.
+    waived = AUDIT.Auditor({scalar_key: "#96 bounded str(exc)"})
+    waived.audit_app(app)
+    assert not any(v.target.startswith("GET /scalar") for v in waived.violations), (
+        waived.violations
+    )
+
+
+# --- NEGATIVE: a framework/builtin validator (str) is skipped, not audited --------------
+def test_r103_framework_builtin_validator_is_skipped() -> None:
+    app = FastAPI()
+
+    @app.get("/fw", response_model=_Safe)
+    def h(name: Annotated[str, AfterValidator(str)]) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert not any("validator" in v.target for v in auditor.violations), auditor.violations
+
+
+# --- An OPAQUE / unresolvable validator FAILS CLOSED (flagged, requiring a waiver) -------
+def test_r103_opaque_validator_fails_closed() -> None:
+    app = FastAPI()
+
+    @app.get("/opaque", response_model=_Safe)
+    def h(name: Annotated[str, AfterValidator(_v103_opaque)]) -> Any:
+        return _Safe(id="ok")
+
+    key = "GET /opaque <validator _v103_opaque unresolved>"
+
+    # Unwaived: the opaque validator is a fail-closed violation, NOT silently skipped.
+    unwaived = AUDIT.Auditor({})
+    unwaived.audit_app(app)
+    assert any(v.target == key for v in unwaived.violations), unwaived.violations
+
+    # It is waivable (human sign-off), mirroring the file's opaque-surface convention.
+    waived = AUDIT.Auditor({key: "#103 reviewed opaque validator"})
+    waived.audit_app(app)
+    assert not any(v.target == key for v in waived.violations)
+    assert any(k == key for k, _issue, _note in waived.waived)
+
+
+# --- The real app stays GREEN with NO new waivers after the #103 change -----------------
+def test_r103_real_app_has_no_validator_findings() -> None:
+    auditor = AUDIT.run_audit(_REPO_ROOT)
+    assert not any("validator" in v.target for v in auditor.violations), auditor.violations
+    assert auditor.violations == []
+
+
+# =======================================================================================
+# R103 (round 2) — TRANSITIVE validator shapes surfaced by adversarial review.
+#
+# HIGH-1: a functional validator nested inside a model-field CONTAINER/UNION/ALIAS (pydantic keeps
+#   it in ``FieldInfo.annotation``, not ``.metadata``) must still be audited.
+# HIGH-2: a model reached through a ``TypeAliasType`` / PEP 695 alias must still have its
+#   ``@field_validator``/``@model_validator`` methods discovered.
+# Plus: Optional/Union members, nested models, assignment-held detail, and recursion termination.
+# All fixtures synthetic; sentinels only (``patientEmail`` key, ``nobody@example.invalid``).
+# =======================================================================================
+def _v103_assign_structured(v: str) -> str:
+    d = {"patientEmail": v}  # assignment-held structured detail — build_assignment_map must resolve
+    raise HTTPException(status_code=403, detail=d)
+
+
+# A functional validator nested inside a list container on a model field (HIGH-1 repro).
+_V103DeepField = create_model(
+    "_V103DeepField",
+    xs=(list[Annotated[str, BeforeValidator(_v103_before_structured)]], ...),
+)
+
+# A functional validator behind Optional (union member) on a model field.
+_V103OptField = create_model(
+    "_V103OptField",
+    x=(Annotated[str, BeforeValidator(_v103_before_structured)] | None, None),
+)
+
+# A model whose field is ANOTHER model that carries the raising @field_validator (nested model).
+_V103NestedOuter = create_model("_V103NestedOuter", inner=(_V103Body, ...))
+
+# A model reached through a TypeAliasType alias, carrying a @field_validator (HIGH-2 repro).
+_V103FieldAlias = TypeAliasType(
+    "_V103FieldAlias", Annotated[_V103Body, AfterValidator(_v103_safe_returns_v)]
+)
+# ...and one carrying a @model_validator, for the class-dependency path.
+_V103ModelAlias = TypeAliasType(
+    "_V103ModelAlias", Annotated[_V103ModelBody, AfterValidator(_v103_safe_returns_v)]
+)
+
+
+class _V103RecModel(BaseModel):
+    """Self-referential model — proves the model/alias traversal TERMINATES (no RecursionError)."""
+
+    name: str = ""
+    child: _V103RecModel | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _reject(cls, v: str) -> str:  # raises structured PII
+        raise HTTPException(status_code=403, detail={"patientEmail": v})
+
+
+_V103RecModel.model_rebuild()
+
+
+# --- HIGH-1: functional validator in a list container on a model field flags ------------
+def test_r103_high1_functional_validator_in_list_container_flags() -> None:
+    app = FastAPI()
+
+    @app.post("/deep", response_model=_Safe)
+    def h(body: _V103DeepField) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "POST /deep"), auditor.violations
+
+
+# --- HIGH-1: functional validator behind Optional on a model field flags ----------------
+def test_r103_high1_functional_validator_behind_optional_flags() -> None:
+    app = FastAPI()
+
+    @app.post("/opt", response_model=_Safe)
+    def h(body: _V103OptField) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "POST /opt"), auditor.violations
+
+
+# --- Nested model: a model field whose type is another model carrying the validator ------
+def test_r103_nested_model_field_validator_flags() -> None:
+    app = FastAPI()
+
+    @app.post("/nested", response_model=_Safe)
+    def h(body: _V103NestedOuter) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "POST /nested"), auditor.violations
+
+
+# --- HIGH-2: TypeAliasType hides a model's @field_validator (HANDLER param) --------------
+def test_r103_high2_type_alias_field_validator_on_handler_flags() -> None:
+    def handler(body: Any) -> Any:
+        return _Safe(id="ok")
+
+    handler.__annotations__ = {"body": _V103FieldAlias, "return": Any}
+
+    app = FastAPI()
+    app.post("/aliasfv", response_model=_Safe)(handler)
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "POST /aliasfv"), auditor.violations
+
+
+# --- HIGH-2: TypeAliasType hides a model's @model_validator (CLASS-DEPENDENCY param) -----
+def test_r103_high2_type_alias_model_validator_on_class_dep_flags() -> None:
+    def __init__(self: Any, body: Any) -> None:  # noqa: N807 - dynamic dunder for the fixture
+        self.body = body
+
+    __init__.__annotations__ = {"body": _V103ModelAlias, "return": None}
+    guard = type("_V103AliasGuard", (), {"__init__": __init__})
+
+    app = FastAPI()
+
+    @app.get("/aliasmv", response_model=_Safe, dependencies=[Depends(guard)])
+    def h() -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "GET /aliasmv"), auditor.violations
+
+
+# --- Assignment-held structured detail inside a validator (build_assignment_map reuse) --
+def test_r103_assignment_held_structured_detail_flags() -> None:
+    app = FastAPI()
+
+    @app.get("/assign", response_model=_Safe)
+    def h(name: Annotated[str, BeforeValidator(_v103_assign_structured)]) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)
+    assert _has_structured(auditor, "GET /assign"), auditor.violations
+
+
+# --- Termination: a self-referential model flags once and does NOT recurse forever ------
+def test_r103_recursive_model_terminates_and_flags() -> None:
+    app = FastAPI()
+
+    @app.post("/rec", response_model=_Safe)
+    def h(body: _V103RecModel) -> Any:
+        return _Safe(id="ok")
+
+    auditor = AUDIT.Auditor({})
+    auditor.audit_app(app)  # must return (no RecursionError) despite the self-reference
+    assert _has_structured(auditor, "POST /rec"), auditor.violations
