@@ -35,12 +35,18 @@ account and **fails the release fail-closed** if one remains. The gate's enforce
 **Storage Blob Data Owner** (`b7e6dc6d-f1e8-4753-8033-0f276bb0955b`), **Storage Blob Data
 Contributor** (`ba92f5b4-…`) and **Storage Table Data Contributor** (`0a9a7e1f-…`); the Bicep grants
 the two Contributor roles (not Owner) to `api` only, and the gate additionally treats Blob Data
-**Owner** as a write role to catch any legacy/stray Owner grant. **Scope limit:** the gate matches on
-these three **built-in role GUIDs** only — a principal granted equivalent write access via a **custom
-RBAC role** (e.g. `dataActions` like `Microsoft.Storage/.../blobs/write|delete` or the Table
-equivalent) has a different definition id and is **not** detected/cleaned; extending the gate to
-inspect custom-role `dataActions` is tracked as **#98**. *(Shared-key exfiltration is out of scope —
-`allowSharedKeyAccess=false`.)*
+**Owner** as a write role to catch any legacy/stray Owner grant. **Coverage (issue #98):** the gate
+detects a state-writer via EITHER of two paths — (1) the role-definition id is one of the three
+enumerated **built-in** GUIDs above (fast path), OR (2) the assignment's resolved role DEFINITION
+grants equivalent Blob/Table write/delete through its effective `dataActions`. Path (2) catches a
+principal granted equivalent write access via a **custom RBAC role** (e.g. `dataActions` like
+`Microsoft.Storage/.../blobs/write|delete`, the Table-entity equivalent, or a wildcard such as
+`Microsoft.Storage/*` / `.../blobServices/*` that expands to cover them); `notDataActions` that
+revoke those actions are honoured, and a role definition that cannot be resolved is treated
+fail-closed as a possible writer. Only **data-plane** actions are inspected: management/control-plane
+rights (`actions` — e.g. `Microsoft.Storage/storageAccounts/write`, `.../listKeys/action`) are
+**out of scope** while shared-key access is disabled. *(Shared-key / key-exfiltration and
+management-plane roles are out of scope — `allowSharedKeyAccess=false`.)*
 
 **Runtime is keyless — via three distinct mechanisms (do not conflate them).** (a) **In-process
 SDK clients** authenticate with the component's **own** user-assigned Managed Identity via
@@ -269,9 +275,11 @@ identity is read-only: `worker` = read-plane roles only (AcrPull · Queue · KV 
 Monitoring/LA Reader); `web` = AcrPull only; `grafana` = Monitoring/LA Reader only. The boundary is
 **RBAC-enforced** and re-verified fail-closed by the post-deploy CD gate
 ([`cleanup_verify_state_writers.py`](../../scripts/cleanup_verify_state_writers.py), invoked with
-`--allow $API_PID` only), which matches
-the **three built-in state-write role GUIDs** only — a **custom RBAC role** granting equivalent
-Blob/Table write `dataActions` is **not** detected (residual **#98**).
+`--allow $API_PID` only), which flags a state-writer via EITHER the **three built-in state-write role
+GUIDs** OR a **custom RBAC role** whose effective `dataActions` grant equivalent Blob/Table
+write/delete (including wildcards that expand to them; `notDataActions` revocations honoured;
+unresolvable role definitions treated fail-closed) — **#98**. Only data-plane actions are inspected;
+management/control-plane (key-exfil) roles are out of scope while `allowSharedKeyAccess=false`.
 
 **Roles deployed but the consuming flow is intended / not wired (⚠️ flow):** the Azure **state
 backend** (Blob/Table roles deployed, but persistence — including job/assessment writes and the

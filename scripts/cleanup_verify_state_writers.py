@@ -44,9 +44,20 @@ This script does BOTH, idempotently and least-privilege, using the CD OIDC login
    clear error (naming the principal, role and, for inherited grants, the ancestor scope to
    remediate) so CD fails the release. This also catches regressions.
 
+A principal counts as a state-writer if EITHER its role-definition id is one of the three enumerated
+built-in write roles (:data:`STATE_WRITE_ROLE_IDS`) OR its resolved role DEFINITION grants
+equivalent blob/table write/delete via effective ``dataActions`` — including a **custom RBAC role**
+or a wildcard (``*``, ``Microsoft.Storage/*``, ``.../blobServices/*``, …) that expands to cover
+them (issue #98). ``notDataActions`` that revoke those actions are honoured. Only DATA-plane actions
+are inspected: MANAGEMENT/control-plane rights (``actions`` — e.g. ``storageAccounts/write`` or key
+listing) are OUT OF SCOPE while ``allowSharedKeyAccess=false``, so key-exfil / management-plane
+roles are intentionally not flagged. A role definition that cannot be RESOLVED (unknown/opaque) is
+treated fail-closed as a POSSIBLE writer (surfaced / failing), never silently ignored.
+
 Object ids are not credentials, and ``allowSharedKeyAccess`` is ``false`` on the account, so this is
 keyless and in-boundary. The Azure I/O is isolated behind thin helpers; the decision logic
-(:func:`find_stray_state_writers`, :func:`is_legacy_shared_identity_name`) is pure and unit-tested
+(:func:`find_stray_state_writers`, :func:`role_definition_grants_state_write`,
+:func:`is_legacy_shared_identity_name`) is pure and unit-tested
 (``tests/unit/test_state_writer_cleanup.py``).
 
 Usage (as run by CD):
@@ -99,6 +110,32 @@ STATE_WRITE_ROLE_IDS: frozenset[str] = frozenset(
 # Storage Queue Data Contributor (974c5e8b-45b9-4653-ba55-5f855dd0fb88) is a queue role, not a
 # state-store role, so it is also intentionally excluded from the state-write set.
 
+# Representative concrete data-plane WRITE/DELETE actions on the state store (issue #98). A CUSTOM
+# RBAC role that grants equivalent write access via its ``dataActions`` — even without one of the
+# three built-in GUIDs above — is just as much a state-writer, so the gate must also detect it. We
+# do NOT enumerate every possible action: instead we test whether the role's effective data actions
+# (dataActions minus notDataActions) would grant ANY of these canonical blob/table mutation targets,
+# accounting for wildcards (``*``, ``Microsoft.Storage/*``, ``.../blobServices/*``, …) that expand
+# to cover them. If any target is granted and not revoked, the role is a writer. The set includes
+# the granular ``add/action`` / ``update/action`` / ``move/action`` mutation verbs (NOT just the
+# coarse ``write``/``delete``) so a custom role granting only those still trips the gate.
+#
+# SCOPE NOTE (keyless assumption): only DATA-plane actions (``dataActions``) are inspected.
+# MANAGEMENT-plane / control-plane actions (``actions`` — e.g. ``Microsoft.Storage/storageAccounts/
+# write`` or ``.../listKeys/action``) are OUT OF SCOPE for this gate: with ``allowSharedKeyAccess=
+# false`` on the account, control-plane rights cannot be turned into state writes via shared keys.
+# Key-exfiltration / management-plane roles are therefore intentionally NOT flagged here.
+_STATE_WRITE_DATA_ACTIONS: tuple[str, ...] = (
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+    "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/move/action",
+    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/write",
+    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/delete",
+    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action",
+    "Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action",
+)
+
 # Per-component identity name segments introduced by issue #79 — a name whose segment after
 # "wp-id-" is one of these (i.e. contains a hyphen) is NOT the legacy shared identity.
 _LEGACY_IDENTITY_RE = re.compile(r"^wp-id-[a-z0-9]+$")
@@ -150,19 +187,25 @@ def _normalize_uuid(value: object) -> str | None:
 
 
 def validate_allowlist(raw_allow: list[str]) -> set[str]:
-    """Return the normalized {api, worker} principal-id allowlist, or raise ``PreconditionError``.
+    """Return the normalized set of allow-listed writer principal ids, or raise
+    ``PreconditionError``.
 
-    Each entry must be present (non-blank) and a valid UUID, and there must be at least two
-    DISTINCT ids (the api and the worker identities). Normalization uses :func:`_normalize_uuid`
-    (the same helper used by classification/correlation) so config-side whitespace/case cannot split
-    classification from correlation. This guards against empty/missing deployment outputs that would
-    otherwise yield an empty allowlist — which would make cleanup treat every legitimate api/worker
-    assignment as a stray and delete it.
+    The allow-list is the set of service principal (object) ids permitted to hold a state-write role
+    at the storage account — the ``api`` identity, and optionally others. Since #97 the boundary is
+    **API-only**, so CD passes exactly ONE ``--allow "$API_PID"``; the gate therefore accepts **one
+    or more** entries (earlier it wrongly demanded two, a stale pre-#97 api+worker assumption that
+    made the whole gate unreachable — ``main`` returned 2 before cleanup/verify ever ran).
+
+    Each entry must be present (non-blank) and a valid UUID; duplicates collapse via
+    :func:`_normalize_uuid` (the same helper used by classification/correlation, so config-side
+    whitespace/case cannot split classification from correlation). This still guards against
+    empty/missing deployment outputs that would otherwise yield an empty allow-list — which would
+    make cleanup treat every legitimate ``api`` assignment as a stray and delete it.
     """
     if not raw_allow:
         raise PreconditionError(
-            "no allowed principals given — pass the api and worker identity principal ids "
-            "via --allow twice"
+            "no allowed principals given — pass at least one service principal id permitted to "
+            "hold a state-write role (the api identity) via --allow"
         )
     normalized: set[str] = set()
     for raw in raw_allow:
@@ -170,16 +213,11 @@ def validate_allowlist(raw_allow: list[str]) -> set[str]:
         if norm is None:
             if not (isinstance(raw, str) and raw.strip()):
                 raise PreconditionError(
-                    "an allowed principal id is missing/blank — the api and worker principal ids "
-                    "must both be present (check the deployment outputs)"
+                    "an allowed principal id is missing/blank — every --allow value must be a "
+                    "present, valid UUID (check the deployment outputs)"
                 )
             raise PreconditionError(f"allowed principal id {raw!r} is not a valid UUID")
         normalized.add(norm)
-    if len(normalized) < 2:
-        raise PreconditionError(
-            "the api and worker principal ids must be two DISTINCT UUIDs "
-            "(fewer than two distinct values were given)"
-        )
     return normalized
 
 
@@ -203,6 +241,136 @@ def _role_guid(role_definition_id: str) -> str:
 
 def _norm_scope(scope: str) -> str:
     return scope.rstrip("/").lower()
+
+
+def _action_pattern_matches(pattern: str, action: str) -> bool:
+    """True iff an Azure RBAC action ``pattern`` matches the concrete ``action``.
+
+    Azure permission strings use ``*`` as a wildcard that matches any sequence of characters —
+    INCLUDING ``/`` separators — so ``Microsoft.Storage/*`` and even a bare ``*`` expand to cover
+    ``Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write``. We translate ``*`` to
+    a regex ``.*`` (escaping every other character) and anchor a full, case-insensitive match. This
+    is a PURE string test — no Azure I/O.
+    """
+    if not isinstance(pattern, str) or not pattern:
+        return False
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*") + "$"
+    return re.match(regex, action, re.IGNORECASE) is not None
+
+
+def data_actions_grant_state_write(
+    data_actions: list[str],
+    not_data_actions: list[str],
+    targets: tuple[str, ...] = _STATE_WRITE_DATA_ACTIONS,
+) -> bool:
+    """PURE: do the effective data actions grant blob/table WRITE or DELETE on the state store?
+
+    A target write/delete action counts as GRANTED when some ``dataActions`` pattern matches it AND
+    no ``notDataActions`` pattern matches it (``notDataActions`` revoke specific data actions). This
+    is evaluated PER target, so a role that grants ``.../blobs/*`` but revokes only ``.../blobs/
+    write`` via ``notDataActions`` is still a writer (it retains ``.../blobs/delete``); a wildcard
+    ``*`` fully revoked by an equally-broad ``notDataActions`` grants nothing. Returns ``True`` as
+    soon as any target is granted-and-not-revoked. No Azure I/O.
+    """
+    for target in targets:
+        granted = any(_action_pattern_matches(p, target) for p in data_actions)
+        if not granted:
+            continue
+        revoked = any(_action_pattern_matches(p, target) for p in not_data_actions)
+        if not revoked:
+            return True
+    return False
+
+
+def role_definition_grants_state_write(role_def: dict[str, Any]) -> bool:
+    """PURE: does a resolved role-DEFINITION dict grant state-store write via its data actions?
+
+    Inspects every ``permissions[]`` block's ``dataActions`` / ``notDataActions`` (control-plane
+    ``actions`` / ``notActions`` are intentionally ignored — see the scope note by
+    ``_STATE_WRITE_DATA_ACTIONS``: management-plane rights are out of scope while shared-key access
+    is disabled). Missing / null keys are treated as empty lists. Returns ``True`` if ANY permission
+    block grants an un-revoked blob/table write-or-delete data action. Operates only on an
+    already-fetched dict — the fetch stays at the Azure I/O edge, keeping this Azure-free.
+    """
+    for perm in role_def.get("permissions") or []:
+        if not isinstance(perm, dict):
+            continue
+        data_actions = [a for a in (perm.get("dataActions") or []) if isinstance(a, str)]
+        not_data_actions = [a for a in (perm.get("notDataActions") or []) if isinstance(a, str)]
+        if data_actions_grant_state_write(data_actions, not_data_actions):
+            return True
+    return False
+
+
+def build_role_definition_index(
+    role_definitions: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Index resolved role-definition dicts by their lowercased GUID (from ``id`` or ``name``).
+
+    The index is what :func:`find_effective_state_writers` consults to resolve a non-built-in
+    assignment's role definition. A definition whose id/name yields no GUID is skipped (it can never
+    be soundly correlated); an assignment referencing a GUID absent from the index is treated as
+    UNRESOLVABLE (fail-closed → possible writer) by the matcher.
+    """
+    index: dict[str, dict[str, Any]] = {}
+    for role_def in role_definitions:
+        if not isinstance(role_def, dict):
+            continue
+        rid = role_def.get("id")
+        guid = _role_guid(rid) if isinstance(rid, str) and rid.strip() else None
+        if not guid:
+            name = role_def.get("name")
+            guid = name.strip().lower() if isinstance(name, str) and name.strip() else None
+        if guid:
+            index[guid] = role_def
+    return index
+
+
+def assignment_writer_status(
+    assignment: dict[str, Any],
+    write_role_ids: frozenset[str],
+    role_definitions: dict[str, dict[str, Any]] | None,
+) -> str:
+    """Classify an assignment's state-write status as ``"proven"`` | ``"possible"`` | ``"no"``.
+
+    * ``"proven"`` — POSITIVE evidence the assignment grants state write: its role-definition GUID
+      is one of the enumerated built-in write roles (:data:`STATE_WRITE_ROLE_IDS`, fast path), OR a
+      RESOLVED role definition whose effective data actions grant blob/table write/delete
+      (:func:`role_definition_grants_state_write`). Safe to act on destructively (cleanup).
+    * ``"possible"`` — the GUID is NOT built-in and is ABSENT from a supplied (non-``None``) role
+      definition index: an UNRESOLVED / opaque definition. Fail-closed for VERIFICATION (counts as a
+      writer → surface / fail) but NOT proof — cleanup must never DELETE on this alone.
+    * ``"no"`` — a resolved definition that does not grant write, OR (legacy/offline-without-defs,
+      ``role_definitions is None``) any non-built-in role. Not a state-writer.
+
+    This is the single pure classifier both the verify path (proven+possible ⇒ writer) and the
+    destructive cleanup path (only ``proven`` may be deleted) share, so the two never diverge.
+    """
+    guid = _role_guid(str(assignment.get("roleDefinitionId", "")))
+    if guid in write_role_ids:
+        return "proven"
+    if role_definitions is None:
+        return "no"
+    role_def = role_definitions.get(guid)
+    if role_def is None:
+        return "possible"  # unresolvable / opaque definition — writer for verify, not for delete
+    return "proven" if role_definition_grants_state_write(role_def) else "no"
+
+
+def _assignment_is_state_writer(
+    assignment: dict[str, Any],
+    write_role_ids: frozenset[str],
+    role_definitions: dict[str, dict[str, Any]] | None,
+) -> bool:
+    """Does this assignment grant (or possibly grant) a state-write role? (verification semantics.)
+
+    Returns ``True`` for BOTH proven writers (built-in fast path OR a resolved role definition that
+    grants write) AND unresolved/opaque roles ("possible" — fail-closed for verification). Returns
+    ``False`` only for a resolved non-writer, or — when no ``role_definitions`` index is supplied
+    (legacy/offline-without-defs) — any non-built-in role (prior behaviour). Thin wrapper over
+    :func:`assignment_writer_status` so verification and cleanup share one classifier.
+    """
+    return assignment_writer_status(assignment, write_role_ids, role_definitions) != "no"
 
 
 def canonical_assignment_id_under_scope(assignment_id: object, scope: str) -> str | None:
@@ -258,6 +426,8 @@ def find_stray_state_writers(
     allowed_principal_ids: set[str],
     scope_id: str,
     write_role_ids: frozenset[str] = STATE_WRITE_ROLE_IDS,
+    *,
+    role_definitions: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return SA-scope assignments granting a state-write role to a non-allowed principal.
 
@@ -265,12 +435,16 @@ def find_stray_state_writers(
     ones cleanup may safely DELETE. Assignments inherited from an ancestor (RG/subscription) are
     excluded here on purpose: they cannot be deleted from this scope. Use
     :func:`find_effective_state_writers` for the fail-closed verify gate, which must also see
-    inherited grants. Comparison is case-insensitive.
+    inherited grants. Comparison is case-insensitive. ``role_definitions`` (a GUID→role-def index)
+    extends detection to CUSTOM roles whose data actions grant equivalent write access; when
+    ``None`` only the built-in ``write_role_ids`` are considered (legacy behaviour).
     """
     scope_norm = _norm_scope(scope_id)
     return [
         a
-        for a in find_effective_state_writers(assignments, allowed_principal_ids, write_role_ids)
+        for a in find_effective_state_writers(
+            assignments, allowed_principal_ids, write_role_ids, role_definitions=role_definitions
+        )
         if _norm_scope(str(a.get("scope", ""))) == scope_norm
     ]
 
@@ -279,6 +453,8 @@ def find_effective_state_writers(
     assignments: list[dict[str, Any]],
     allowed_principal_ids: set[str],
     write_role_ids: frozenset[str] = STATE_WRITE_ROLE_IDS,
+    *,
+    role_definitions: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return EVERY assignment granting a state-write role to a non-allowed principal, any scope.
 
@@ -287,11 +463,18 @@ def find_effective_state_writers(
     EFFECTIVE at the account — is detected. Each returned assignment keeps its own ``scope`` so the
     caller can tell SA-scoped (deletable) from inherited (manual remediation). Case-insensitive.
     An empty result means the boundary holds: only the allowed writers can write state.
+
+    A role assignment counts as a state-writer when EITHER its role-definition GUID is a built-in in
+    ``write_role_ids`` (fast path, unchanged) OR its resolved role DEFINITION grants blob/table
+    write/delete via effective data actions (custom-role detection, issue #98). ``role_definitions``
+    is a GUID→role-def index (see :func:`build_role_definition_index`); when supplied, a GUID that
+    is not built-in AND is ABSENT from the index is treated as UNRESOLVABLE and, if held by a
+    non-allowed principal, surfaced as a POSSIBLE writer (fail closed) — never silently ignored.
     """
     allowed = {norm for p in allowed_principal_ids if (norm := _normalize_uuid(p))}
     strays: list[dict[str, Any]] = []
     for a in assignments:
-        if _role_guid(str(a.get("roleDefinitionId", ""))) not in write_role_ids:
+        if not _assignment_is_state_writer(a, write_role_ids, role_definitions):
             continue
         if _normalize_uuid(a.get("principalId")) not in allowed:
             strays.append(a)
@@ -452,6 +635,18 @@ def delete_identity(identity_id: str) -> None:
     _az(["identity", "delete", "--ids", identity_id])
 
 
+def list_role_definitions(scope: str) -> list[dict[str, Any]]:
+    """List role definitions (built-in AND custom) visible at ``scope``.
+
+    Used to RESOLVE each assignment's role definition so the gate can inspect a custom role's
+    ``dataActions`` (issue #98). Fail-closed: a failed/timed-out `az` call or a non-array response
+    raises :class:`AzureOutputError` and never looks like an empty/clean result. The Azure I/O stays
+    here at the edge; the decision logic in :func:`role_definition_grants_state_write` is pure.
+    """
+    data = _az_json(["role", "definition", "list", "--scope", scope])
+    return _require_list(data, "`az role definition list`")
+
+
 # --------------------------------------------------------------------------------------------------
 # Orchestration.
 # --------------------------------------------------------------------------------------------------
@@ -470,6 +665,33 @@ def _load_assignments(
     return list_role_assignments(scope, include_inherited=include_inherited)
 
 
+def _load_role_definitions(
+    scope: str, role_definitions_file: str | None, *, offline: bool
+) -> dict[str, dict[str, Any]] | None:
+    """Build the GUID→role-definition index for custom-role detection, or ``None`` (built-in only).
+
+    * Live mode (``offline=False``): always fetch role definitions from Azure so a custom role's
+      ``dataActions`` can be inspected; an unresolved reference then fails closed in the matcher.
+    * Offline mode: use ``role_definitions_file`` when given (for local dry-runs / tests), else
+      return ``None`` so only the three built-in write GUIDs are considered (legacy behaviour, no
+      Azure call).
+    """
+    if role_definitions_file:
+        text = Path(role_definitions_file).read_text(encoding="utf-8")
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AzureOutputError(
+                f"role-definitions file {role_definitions_file} is not valid JSON"
+            ) from exc
+        return build_role_definition_index(
+            _require_list(raw, f"role-definitions file {role_definitions_file}")
+        )
+    if offline:
+        return None
+    return build_role_definition_index(list_role_definitions(scope))
+
+
 def _stray_descriptor(a: dict[str, Any]) -> str:
     """Non-secret one-line descriptor of a stray assignment (role GUID + assignment id only)."""
     role = _role_guid(str(a.get("roleDefinitionId", ""))) or "<unknown-role>"
@@ -483,6 +705,7 @@ def _cleanup(
     allowed: set[str],
     resource_group: str | None,
     assignments_file: str | None,
+    role_definitions_file: str | None = None,
     *,
     dry_run: bool,
 ) -> int:
@@ -503,13 +726,41 @@ def _cleanup(
     additionally scope-bound: ``delete_role_assignment`` only ever runs for a canonical assignment
     id directly under the target SA, and ``delete_identity`` only for a canonical
     userAssignedIdentities id in the expected resource group whose name is the legacy convention.
+
+    Destructive-op gate (issue #98 MEDIUM): only PROVEN writers are ever deleted — a built-in
+    write-role GUID, or a RESOLVED custom role whose data actions grant blob/table write/delete.
+    A stray whose role definition is UNRESOLVED/opaque (``assignment_writer_status`` ==
+    ``"possible"``) is NEVER auto-deleted on that uncertainty (it could be read-only): it is
+    surfaced with a WARNING, its principal is NOT correlated for identity deletion, and the run
+    exits non-zero (fail closed). Verification (:func:`_verify`) still treats such a role as a
+    writer, so it is never silently ignored — but destruction requires proof, not mere uncertainty.
     """
     offline = assignments_file is not None
-    strays = find_stray_state_writers(_load_assignments(scope, assignments_file), allowed, scope)
+    role_definitions = _load_role_definitions(scope, role_definitions_file, offline=offline)
+    strays = find_stray_state_writers(
+        _load_assignments(scope, assignments_file),
+        allowed,
+        scope,
+        role_definitions=role_definitions,
+    )
 
     stray_principal_ids: set[str] = set()
     malformed: list[dict[str, Any]] = []
+    unresolved_writers: list[dict[str, Any]] = []
     for a in strays:
+        # DESTRUCTIVE-op gate: only PROVEN writers may be deleted. An UNRESOLVED/opaque role
+        # ("possible") is fail-closed for VERIFICATION but must never be auto-deleted on uncertainty
+        # — it could be read-only. Surface it and fail the run; delete nothing, correlate nothing.
+        if assignment_writer_status(a, STATE_WRITE_ROLE_IDS, role_definitions) == "possible":
+            print(
+                "[cleanup] WARNING: stray assignment with an UNRESOLVED/opaque role definition "
+                f"({_stray_descriptor(a)}); refusing to auto-delete on uncertainty — failing "
+                "closed. Investigate/remediate this principal manually.",
+                file=sys.stderr,
+            )
+            unresolved_writers.append(a)
+            continue
+
         norm_pid = _normalize_uuid(a.get("principalId"))
         canonical_aid = canonical_assignment_id_under_scope(a.get("id"), scope)
         pid_ok = norm_pid is not None
@@ -544,9 +795,9 @@ def _cleanup(
         )
 
     # Legacy identity deletion requires live az + a resource group; skipped in offline dry-run — but
-    # malformed strays still fail the run closed (they were removed yet could not be accounted for).
+    # malformed / unresolved strays still fail the run closed (surfaced but not accounted for).
     if offline or not resource_group:
-        return 1 if malformed else 0
+        return 1 if (malformed or unresolved_writers) else 0
 
     to_delete: list[dict[str, Any]] = []
     unresolved: list[str] = []
@@ -583,13 +834,14 @@ def _cleanup(
                 file=sys.stderr,
             )
 
-    return 1 if (unresolved or malformed or scope_blocked) else 0
+    return 1 if (unresolved or malformed or scope_blocked or unresolved_writers) else 0
 
 
 def _verify(
     scope: str,
     allowed: set[str],
     assignments_file: str | None,
+    role_definitions_file: str | None = None,
     *,
     retries: int,
     delay: float,
@@ -600,15 +852,28 @@ def _verify(
     inherited from an ancestor scope (resource group / subscription) is caught. Strays whose
     assignment scope is the account itself should have been removed by cleanup; strays inherited
     from an ancestor cannot be deleted from here, so the gate fails with a manual-remediation
-    message naming the offending principal, role and actual (ancestor) scope.
+    message naming the offending principal, role and actual (ancestor) scope. Custom roles granting
+    equivalent write data actions are detected via the resolved role-definition index (issue #98);
+    an unresolvable role held by a non-allowed principal fails the gate closed.
     """
     offline = assignments_file is not None
     scope_norm = _norm_scope(scope)
     strays: list[dict[str, Any]] = []
+    role_definitions: dict[str, dict[str, Any]] | None = None
+    role_defs_loaded = False
     attempts = 1 if offline else max(1, retries)
     for attempt in range(1, attempts + 1):
         assignments = _load_assignments(scope, assignments_file, include_inherited=True)
-        strays = find_effective_state_writers(assignments, allowed)
+        if not role_defs_loaded:
+            # Loaded once, AFTER a successful assignments fetch so a failing assignments listing
+            # fails the gate before any extra Azure work.
+            role_definitions = _load_role_definitions(
+                scope, role_definitions_file, offline=offline
+            )
+            role_defs_loaded = True
+        strays = find_effective_state_writers(
+            assignments, allowed, role_definitions=role_definitions
+        )
         if not strays:
             print(
                 "[verify] OK: only the allowed writer principals hold a state-store WRITE role "
@@ -686,6 +951,13 @@ def main(argv: list[str]) -> int:
         "(verify-only; used for local dry-runs and tests).",
     )
     parser.add_argument(
+        "--role-definitions-file",
+        default=None,
+        help="Offline mode: read role DEFINITIONS (built-in + custom) from this JSON file instead "
+        "of calling az. Enables custom-role dataAction detection (issue #98) in offline dry-runs "
+        "and tests; live runs fetch definitions from Azure automatically.",
+    )
+    parser.add_argument(
         "--retries", type=int, default=6, help="Verify re-list attempts (RBAC propagation)."
     )
     parser.add_argument(
@@ -708,6 +980,7 @@ def main(argv: list[str]) -> int:
                 allowed,
                 args.resource_group,
                 args.assignments_file,
+                args.role_definitions_file,
                 dry_run=args.dry_run,
             )
 
@@ -715,6 +988,7 @@ def main(argv: list[str]) -> int:
             args.scope,
             allowed,
             args.assignments_file,
+            args.role_definitions_file,
             retries=args.retries,
             delay=args.retry_delay,
         )
