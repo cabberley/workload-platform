@@ -61,8 +61,9 @@ param manageStateImmutabilityPolicy bool = true
 var laName = '${namePrefix}-log-${resourceToken}'
 var envName = '${namePrefix}-env-${resourceToken}'
 // Per-component user-assigned identities (issue #79). Each ACA app/job runs as ITS OWN identity so
-// component-level least privilege is enforced by RBAC, not just by convention. The writers (api +
-// worker/job) are the ONLY principals granted the state-store WRITE data roles; the web front-end
+// component-level least privilege is enforced by RBAC, not just by convention. The api identity is
+// the ONLY principal granted the state-store WRITE data roles (#97); the worker/job is compute-only
+// (it reads and writes state via the API), so it holds no Blob/Table write role; the web front-end
 // is a reader; the grafana identity is a read-only Azure Monitor data-source principal.
 var idApiName = '${namePrefix}-id-api-${resourceToken}'
 var idWorkerName = '${namePrefix}-id-worker-${resourceToken}'
@@ -91,9 +92,10 @@ var logAnalyticsReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'           
 // ---- Per-component user-assigned managed identities (issue #79) ----
 // api    : the single-writer API core.
 // worker : ALL module workers (aiops, alerts) and jobs (discovery, quality_checks, reassessments,
-//          dependency_graph) — they run modules, so they are writers and hold the read-plane roles
-//          their connectors need. Per the issue's "one for the worker/job" guidance this is a single
-//          identity whose role set is the UNION of what the module workers/jobs need.
+//          dependency_graph) — COMPUTE-ONLY. They read prior state via the API and POST results to
+//          the API (the single writer), so they hold NO state-store write role (#97); they hold only
+//          the read-plane roles their connectors need. Per the issue's "one for the worker/job"
+//          guidance this is a single identity whose role set is the UNION of what the modules need.
 // web    : the read-only front-end — it talks only to the API and gets NO state-store write role.
 // grafana: read-only Azure Monitor data-source principal (see grafana.bicep) — no write, no AcrPull.
 resource identityApi 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -256,14 +258,17 @@ resource envDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-previe
 // per-component identity produces a DISTINCT name for the same role+scope.
 //
 // Component → identity → roles matrix enforced below:
-//   api     (writer) : AcrPull · Queue Data Contributor · KV Secrets User · Blob+Table Data Contributor
-//   worker  (writer) : AcrPull · Queue Data Contributor · KV Secrets User · Blob+Table Data Contributor
-//                      · Reader (RG) · Monitoring Reader (RG) · Log Analytics Reader (workspace)
-//   web     (reader) : AcrPull · KV Secrets User          ← NO storage data role, NO queue role
-//   grafana (reader) : Monitoring Reader + Log Analytics Reader (assigned in grafana.bicep)
-// The state-store WRITE data roles (Blob/Table Data Contributor) are granted to the api and worker
-// identities ONLY. The web identity never receives them, so the "API is the only writer" boundary
-// (with the worker/job that runs modules) is enforced by RBAC, not merely by convention.
+//   api     (writer)  : AcrPull · Queue Data Contributor · KV Secrets User · Blob+Table Data Contributor
+//   worker  (compute) : AcrPull · Queue Data Contributor · KV Secrets User
+//                       · Reader (RG) · Monitoring Reader (RG) · Log Analytics Reader (workspace)
+//                       ← NO Blob/Table Data Contributor: the worker is compute-only (#97)
+//   web     (reader)  : AcrPull · KV Secrets User          ← NO storage data role, NO queue role
+//   grafana (reader)  : Monitoring Reader + Log Analytics Reader (assigned in grafana.bicep)
+// The state-store WRITE data roles (Blob/Table Data Contributor) are granted to the api identity
+// ONLY (issue #97). The worker is COMPUTE-ONLY — it reads state via the API (a read-only
+// ApiStateReader) and POSTs module results to the API, the sole code path that commits state — so it
+// holds no Blob/Table write role. The web identity never receives them either. The "API is the sole
+// state writer" boundary is therefore enforced by RBAC, not merely by convention.
 // ======================================================================================
 
 // ---- AcrPull: each container principal pulls its image without a registry credential ----
@@ -404,7 +409,7 @@ resource logAnalyticsReaderWorker 'Microsoft.Authorization/roleAssignments@2022-
   }
 }
 
-// ---- State-store WRITE data roles (the API-only-writer boundary) — api + worker ONLY ----
+// ---- State-store WRITE data roles (the API-only-writer boundary) — api ONLY (#97) ----
 // Consumer: the Azure state backend — src/shared/state.py (AzureStateStore). It creates the
 // snapshots/workloads tables and writes the manifest entities that are its single commit point
 // (create_table_if_not_exists / create_entity / update_entity), and creates the state container +
@@ -413,10 +418,13 @@ resource logAnalyticsReaderWorker 'Microsoft.Authorization/roleAssignments@2022-
 // read-only *Data Reader variants (Contributor ⊇ Reader). FORWARD-LOOKING: the backend defaults to
 // local and is selected only when WORKLOADS_STATE_BACKEND=azure with the state endpoints wired.
 //
-// These are granted to the api (the single writer) and the worker/job (which runs modules) ONLY.
-// The web (reader) identity is deliberately absent from these four assignments, so the web front-end
-// CANNOT write blobs or tables — the least-privilege boundary this issue enforces. Scoped to the
-// storage account (narrowest inline scope); allowSharedKeyAccess is false, so access is keyless.
+// These are granted to the api (the single writer) ONLY (issue #97). The worker/job is COMPUTE-ONLY
+// — it reads prior state via the API (a read-only ApiStateReader) and POSTs its ModuleRunResult to
+// the API, which is the ONLY code path that commits state; it therefore holds NO Blob/Table write
+// role. The web (reader) identity is likewise absent, so neither the worker nor the web front-end
+// CAN write blobs or tables — the "API is the sole state writer" boundary this issue enforces at the
+// RBAC layer. Scoped to the storage account (narrowest inline scope); allowSharedKeyAccess is false,
+// so access is keyless.
 //
 // TABLE AUDIT STORE DESTRUCTIVE PERMISSIONS (issue #81) — why they are NOT restricted, this stays
 // Table Data Contributor, and NOT a narrower/custom append-only role:
@@ -452,15 +460,6 @@ resource stateTableDataContributorApi 'Microsoft.Authorization/roleAssignments@2
     principalType: 'ServicePrincipal'
   }
 }
-resource stateTableDataContributorWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, identityWorker.id, storageTableDataContributorRoleId)
-  scope: storage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageTableDataContributorRoleId)
-    principalId: identityWorker.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
 resource stateBlobDataContributorApi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, identityApi.id, storageBlobDataContributorRoleId)
   scope: storage
@@ -470,24 +469,17 @@ resource stateBlobDataContributorApi 'Microsoft.Authorization/roleAssignments@20
     principalType: 'ServicePrincipal'
   }
 }
-resource stateBlobDataContributorWorker 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, identityWorker.id, storageBlobDataContributorRoleId)
-  scope: storage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
-    principalId: identityWorker.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
 
 output environmentId string = env.id
 // Per-component identity outputs (issue #79). main.bicep threads each component's OWN identity into
 // its ACA app/job; grafana.bicep receives the read-only grafana identity.
 output identityApiId string = identityApi.id
 output identityApiClientId string = identityApi.properties.clientId
-// Principal (object) ids of the two WRITER identities — surfaced so the post-deploy CD gate can
-// assert that ONLY these principals hold Blob/Table Data Contributor at the storage-account scope
-// (issue #79 brownfield fix). No secrets: an object id is not a credential.
+// Principal (object) id of the API WRITER identity — surfaced so the post-deploy CD gate can assert
+// that ONLY this principal holds Blob/Table Data Contributor at the storage-account scope (issue #97;
+// the worker is compute-only and holds no state-write role). identityWorkerPrincipalId is still
+// surfaced below for telemetry-export's publisher role — NOT as a state writer. No secrets: an object
+// id is not a credential.
 output identityApiPrincipalId string = identityApi.properties.principalId
 output identityWorkerId string = identityWorker.id
 output identityWorkerClientId string = identityWorker.properties.clientId
