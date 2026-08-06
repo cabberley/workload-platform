@@ -16,6 +16,28 @@ from shared.connectors import FetchResult
 FAKE_RESOURCE_ID = "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/widget-01"
 FAKE_METRIC = "fake_latency_ms"
 
+# A clearly-fake second resource id for Kuiper supplemental-hint fixtures (never a real id).
+FAKE_KUIPER_RESOURCE_ID = (
+    "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/kuiper-widget-99"
+)
+
+
+def synthetic_kuiper_hint(
+    *,
+    resource_id: str = FAKE_RESOURCE_ID,
+    signal: str | None = "corroborated",
+) -> dict[str, Any]:
+    """A synthetic Kuiper *entity-signal* discovery hint — obviously fake, PII/PHI-free.
+
+    The closed hint schema is ``{kind, resourceId, signal}``: a resource id to CORROBORATE
+    (matched against an existing ARG node id — never used to create a node) plus an optional
+    closed-vocabulary ``signal``. There is deliberately no free-form field to carry PII.
+    """
+    hint: dict[str, Any] = {"kind": "entity-signal", "resourceId": resource_id}
+    if signal is not None:
+        hint["signal"] = signal
+    return hint
+
 
 def make_fetch_result(
     *,
