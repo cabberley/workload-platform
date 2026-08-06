@@ -2,6 +2,14 @@
 
 Date: 2026-08-04 · Status: accepted
 
+> **Superseded in part by [ADR 0014](0014-fail-closed-audit-emission.md) (issue #99).** Decision 3
+> below states `emit()` "never raises" and Decision 4 records `finding.emitted` as best-effort/
+> fail-open. Per the accepted #99 decision, audit emission is now **fail-CLOSED for security-material
+> actions** (`run.executed` / `finding.emitted`, which also carry the estate/graph/snapshot
+> replacements): a durable-append failure raises `AuditPersistenceError` so the mutating write fails
+> (5xx) rather than proceeding unrecorded. The state-mutating `put_estate`/`put_graph`/`snapshot`
+> endpoints — noted as unaudited below — are now audited too. See ADR 0014 for the current policy.
+
 ## Context
 
 The platform performs consequential actions on a customer's estate — verifying and (soon)

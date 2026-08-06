@@ -7,6 +7,7 @@ low replica counts while the compute-heavy modules scale freely.
 """
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from time import perf_counter
@@ -46,7 +47,7 @@ from shared.observability import (
     process_metrics,
     store_reachable_probe,
 )
-from shared.provenance import ProvenanceError
+from shared.provenance import ProvenanceError, enforce_finding_provenance
 from shared.state import (
     ReadOnlyState,
     StateStore,
@@ -127,16 +128,69 @@ def get_store() -> StateStore:
 StoreDep = Annotated[StateStore, Depends(get_store)]
 
 
-def get_audit_emitter(store: StoreDep) -> AuditEmitter:
+def get_audit_emitter(store: StoreDep, metrics: MetricsDep) -> AuditEmitter:
     """Return an audit emitter bound to the single-writer store (issue #59).
 
     Built per request over the same ``StoreDep`` the endpoints use, so a test overriding
-    ``get_store`` with an isolated backend automatically audits into that same backend.
+    ``get_store`` with an isolated backend automatically audits into that same backend. The process
+    ``metrics`` registry is injected so a durable-append failure (fail-closed, issue #99) is
+    surfaced as the PII-free ``audit_emit_failures_total`` counter on ``/api/metrics``.
     """
-    return AuditEmitter(store)
+    return AuditEmitter(store, metrics=metrics)
 
 
 AuditDep = Annotated[AuditEmitter, Depends(get_audit_emitter)]
+
+
+def _emit_or_fail_closed(
+    audit: AuditEmitter,
+    *,
+    actor: str,
+    action: AuditAction,
+    subject: str,
+    result: AuditResult,
+) -> None:
+    """Emit a fail-closed audit record as a state-mutation PRECONDITION (audit-BEFORE-write, #99).
+
+    The ACCEPTED, compliance-first decision (ADR 0014) is that a hard audit-store outage must BLOCK
+    security-material mutations. To guarantee that, the consequential endpoints call this and let it
+    return *before* they mutate durable state:
+
+      * a durable-append failure raises :class:`~shared.audit.AuditPersistenceError` (the emitter is
+        fail-closed for these actions) — so the mutation is never performed and the API surfaces a
+        5xx;
+      * a rejected (un-constructable / PII-invalid) event yields ``None`` from
+        :meth:`~shared.audit.AuditEmitter.emit` — which we ALSO convert to a fail-closed 5xx, so a
+        subject we could not record can never let the write proceed.
+
+    Either way the caller must not mutate state unless this returns normally, so no committed-but-
+    unaudited state can result. Over-recording (an audit record whose subsequent write then fails)
+    is the deliberately-chosen safe direction for a repudiation control; committed-unaudited state
+    is not.
+    """
+    event = audit.emit(actor=actor, action=action, subject=subject, result=result)
+    if event is None:
+        raise HTTPException(status_code=500, detail="audit precondition failed (fail closed)")
+
+
+def _workload_token(workload: str) -> str:
+    """Return an opaque, bounded, PII-free token for the caller-controlled ``workload`` id.
+
+    The workload name reaches the API from the caller and is only weakly constrained by the audit
+    contract's :func:`~shared.contracts.is_audit_safe` denylist, which still admits values that look
+    like PII (e.g. ``John.Doe``, ``MRN-123456``, ``123-45-6789``). To keep the durable audit
+    subjects of the state-mutating endpoints **PII-free BY CONSTRUCTION**, we never embed the raw
+    name — we derive a one-way, fixed-charset, fixed-length digest (``wl:<sha256(workload)>``, the
+    full 64-char hex). A hash cannot carry PII (or unbounded text) regardless of the input, while
+    the trail stays correlatable via the stable per-workload token. The FULL digest is retained (not
+    a truncated prefix) so the token is collision-resistant (>=128-bit): a caller controlling
+    workload names cannot birthday-collide two distinct names to the same token and make their
+    durable audit subjects ambiguous. Tightening the authoritative workload-ID *grammar* itself (in
+    the ``shared.contracts`` contract) is a separate follow-up owned by the tenant-isolation work
+    (#65); it is deliberately NOT attempted here.
+    """
+    digest = hashlib.sha256(workload.encode("utf-8")).hexdigest()
+    return f"wl:{digest}"
 
 
 def _finding_emitted_subject(workload: str, count: int) -> str:
@@ -193,20 +247,83 @@ def _require_auditable_findings_subject(workload: str, count: int) -> None:
 def _emit_findings_persisted(
     audit: AuditEmitter, *, actor: str, workload: str, count: int
 ) -> None:
-    """Emit a PII-free ``finding.emitted`` event AFTER findings were successfully persisted (#59).
+    """Emit a PII-free ``finding.emitted`` event as a PRECONDITION for persisting findings (#59).
 
     The subject encodes ONLY the non-PII workload id and a COUNT of findings
     (``<workload>#count=N``) — never a resource id, log body, or other free text. Provenance is
-    enforced at the persistence choke point BEFORE the write, so reaching here means the write
-    succeeded; the fail-closed emitter then records the event best-effort and never disrupts the
-    request (emit-after-write, not a two-phase transaction — see ADR 0006).
+    validated by the caller BEFORE this is called (so a malformed submission is rejected 422 without
+    recording a spurious event), and the durable findings write happens AFTER this returns.
+    ``finding.emitted`` is a **security-material** action, so emission is fail-CLOSED (issue #99 /
+    ADR 0014): a durable-append failure (or a rejected event) surfaces as 5xx via
+    :func:`_emit_or_fail_closed`, so findings can never be persisted with no audit record
+    (audit-BEFORE-write). See :func:`_workload_token` for the note on the workload id embedded here.
     """
-    audit.emit(
+    _emit_or_fail_closed(
+        audit,
         actor=actor,
         action=AuditAction.finding_emitted,
         subject=_finding_emitted_subject(workload, count),
         result=AuditResult.success,
     )
+
+
+def _audit_run_executed(audit: AuditEmitter, *, actor: str, module: str, ok: bool) -> None:
+    """Emit the fail-closed ``run.executed`` audit record (subject = the module id; #59, ADR 0014).
+
+    Used as a PRECONDITION on the committing paths (before ``commit_run``) so an audit-store outage
+    blocks the commit, and in the ``run_module`` ``finally`` for non-committing (failed / no-
+    workload) runs so those are still recorded. Fail-closed via :func:`_emit_or_fail_closed`.
+    """
+    _emit_or_fail_closed(
+        audit,
+        actor=actor,
+        action=AuditAction.run_executed,
+        subject=_run_executed_subject(module),
+        result=AuditResult.success if ok else AuditResult.failure,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# State-mutating audit coverage (issue #99). `put_estate`/`put_graph`/`snapshot` replace/freeze
+# durable state but previously emitted NO audit event. Each now records a PII-free event with a
+# bounded, DERIVED subject, emitted as an audit-BEFORE-write PRECONDITION (see
+# `_emit_or_fail_closed`): the audit record is durably appended FIRST and only then is the state
+# mutation performed, so a hard audit-store outage BLOCKS the mutation (the ACCEPTED decision,
+# ADR 0014) rather than leaving committed-but-unaudited state.
+#
+# The subject is PII-free BY CONSTRUCTION: it is built from the opaque `_workload_token` digest
+# (never the raw caller-controlled workload name) plus a bounded COUNT — e.g. `wl:<digest>#estate=N`
+# — so no PII (or unbounded text) can appear regardless of the workload name.
+#
+# ASSUMPTION / TODO(human): the `AuditAction` enum (in the CONTRACT `src/shared/contracts.py`, out
+# of scope for this issue's disjointness) has no `estate.replaced`/`graph.replaced`/
+# `snapshot.created` members, so these reuse `AuditAction.run_executed` — the umbrella
+# "consequential state mutation by the single writer" action (`commit_run` already records
+# estate+graph writes as `run.executed`). The operation is disambiguated by the derived subject
+# (`#estate=`/`#graph=`/`#snapshot`). Dedicated action members would be cleaner and belong in a
+# follow-up CONTRACT change via the Architect + an ADR (they'd also be fail-closed by the same
+# `FAIL_CLOSED_ACTIONS` set).
+# --------------------------------------------------------------------------------------
+def _estate_replaced_subject(workload: str, count: int) -> str:
+    """PII-free-by-construction estate-replacement subject: opaque workload token + node COUNT."""
+    return f"{_workload_token(workload)}#estate={count}"
+
+
+def _graph_replaced_subject(workload: str, nodes: int, edges: int) -> str:
+    """PII-free-by-construction graph subject: opaque workload token + node/edge counts."""
+    return f"{_workload_token(workload)}#graph=nodes={nodes},edges={edges}"
+
+
+def _snapshot_created_subject(workload: str) -> str:
+    """PII-free-by-construction snapshot subject: opaque workload token + a bounded intent marker.
+
+    The store-generated snapshot id (``snap::<workload>::<seq>``) embeds the raw workload name and
+    is only known AFTER the write, so — to keep this a true audit-BEFORE-write precondition AND
+    PII-free by construction — the durable subject records the bounded intent (``wl:<digest>#
+    snapshot``) rather than the post-write id. Over-recording is the safe direction for a
+    repudiation control (ADR 0014).
+    """
+    return f"{_workload_token(workload)}#snapshot"
 
 
 # The packs engine and edge-client registry are built once per process and injected into modules
@@ -229,7 +346,7 @@ def get_packs() -> object | None:
             # The API is the single writer, so it (not the store-less composition root) gives the
             # pack-verify trust gate a store-backed audit emitter — a fail-closed rejection of a
             # tampered/invalid pack is then recorded to the append-only audit log (issue #59).
-            engine.attach_audit_emitter(AuditEmitter(get_store()))
+            engine.attach_audit_emitter(AuditEmitter(get_store(), metrics=metrics))
         _packs = engine
         _packs_built = True
     return _packs
@@ -578,36 +695,45 @@ def run_module_endpoint(
     actor = resolve_actor(request.headers)
     started = perf_counter()
     ok = False
+    run_audited = False
     with tracer.start_span("module.run", attributes={"module": name}) as span:
         try:
             result = run_module(
                 module, scope=req.scope, state=ReadOnlyState(store), packs=packs, clients=clients
             )
+            ok = result.ok
             workload = req.scope.get("workload")
             if workload:
-                # Validate the exact derived finding.emitted subject before any write (fail closed).
+                # Validate the exact derived finding.emitted subject + provenance before any write
+                # (fail closed) so a malformed run is rejected 422 without a spurious audit event.
                 _require_auditable_findings_subject(workload, len(result.findings))
-                store.commit_run(workload, result)  # API is the single writer
+                enforce_finding_provenance(result.findings)
+                # Audit-BEFORE-write (fail-closed, ADR 0014): record run.executed (+
+                # finding.emitted) FIRST so a hard audit-store outage BLOCKS the commit rather than
+                # leaving committed-but-unaudited state. Set ``run_audited`` up front so the
+                # ``finally`` never re-emits run.executed on this path (whether the append below
+                # succeeds, or fails 5xx).
+                run_audited = True
+                _audit_run_executed(audit, actor=actor, module=name, ok=ok)
                 if result.findings:
                     _emit_findings_persisted(
                         audit, actor=actor, workload=workload, count=len(result.findings)
                     )
-            ok = result.ok
+                store.commit_run(workload, result)  # API is the single writer
             return _redact_run_result_for_egress(result)
         except ProvenanceError as exc:
-            # Fail closed: an un-provenanced finding is rejected at the persistence gate; surface a
-            # clean 422 (never a 500) and persist nothing. The run is still audited in ``finally``.
+            # Fail closed: an un-provenanced finding is rejected before any write; surface a clean
+            # 422 (never a 500) and persist nothing. The run is still audited (failure) in the
+            # ``finally`` below.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             duration_ms = (perf_counter() - started) * 1000.0
             span.set_attribute("outcome", "ok" if ok else "error")
             metrics.record_module_run(name, ok=ok, duration_ms=duration_ms)
-            audit.emit(
-                actor=actor,
-                action=AuditAction.run_executed,
-                subject=_run_executed_subject(name),
-                result=AuditResult.success if ok else AuditResult.failure,
-            )
+            if not run_audited:
+                # Non-committing run (failed, or no-workload scope): no state was mutated, so record
+                # run.executed here. Fail-closed emission blocks nothing material on this path.
+                _audit_run_executed(audit, actor=actor, module=name, ok=ok)
 
 
 # --------------------------------------------------------------------------------------
@@ -662,18 +788,22 @@ def submit_results(
     # validator). But `result.module` / `Finding.module` are self-declared, so full enforcement
     # needs PER-MODULE identities or a signed, module-bound submission capability — #64 + #79 as
     # designed (a single shared worker identity) cannot distinguish modules. No auth logic here yet.
+    #
+    # Audit-BEFORE-write (fail-closed, ADR 0014): validate provenance FIRST (a malformed submission
+    # is rejected 422 without a spurious audit event), then record run.executed (+ finding.emitted)
+    # BEFORE commit so a hard audit-store outage BLOCKS the commit (5xx, nothing persisted) rather
+    # than leaving committed-but-unaudited state. commit_run re-enforces provenance at the durable
+    # boundary; both ProvenanceError sources share the single 422 below (no new error-body site).
     try:
+        enforce_finding_provenance(result.findings)
+        _audit_run_executed(audit, actor=actor, module=result.module, ok=result.ok)
+        if result.findings:
+            _emit_findings_persisted(
+                audit, actor=actor, workload=workload, count=len(result.findings)
+            )
         persisted = store.commit_run(workload, result)
     except ProvenanceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    audit.emit(
-        actor=actor,
-        action=AuditAction.run_executed,
-        subject=_run_executed_subject(result.module),
-        result=AuditResult.success if result.ok else AuditResult.failure,
-    )
-    if result.findings:
-        _emit_findings_persisted(audit, actor=actor, workload=workload, count=len(result.findings))
     return ResultsResponse(workload=workload, persisted=PersistCounts.model_validate(persisted))
 
 
@@ -698,18 +828,56 @@ class FindingsWriteResult(BaseModel):
 
 @app.post("/api/workloads/{workload}/estate")
 def put_estate(
-    workload: str, nodes: list[ResourceNode], store: StoreDep
+    workload: str,
+    nodes: list[ResourceNode],
+    request: Request,
+    store: StoreDep,
+    audit: AuditDep,
 ) -> EstateWriteResult:
-    """Replace the persisted estate for ``workload``."""
+    """Replace the persisted estate for ``workload`` (audited, fail-closed — issue #99).
+
+    Records a PII-free ``estate replaced`` audit event (subject = ``wl:<digest>#estate=N`` — an
+    opaque one-way workload token + node COUNT only, never the raw workload name or estate content;
+    PII-free BY CONSTRUCTION, see :func:`_workload_token`). Estate is security-material, so the
+    event is emitted as an audit-BEFORE-write PRECONDITION (ADR 0014): the durable append happens
+    FIRST and the state is replaced only if it succeeds, so a hard audit-store outage BLOCKS the
+    write (5xx, nothing replaced) rather than leaving committed-but-unaudited state.
+    """
+    count = len(nodes)
+    _emit_or_fail_closed(
+        audit,
+        actor=resolve_actor(request.headers),
+        action=AuditAction.run_executed,
+        subject=_estate_replaced_subject(workload, count),
+        result=AuditResult.success,
+    )
     store.put_estate(workload, nodes)
-    return EstateWriteResult(count=len(nodes))
+    return EstateWriteResult(count=count)
 
 
 @app.post("/api/workloads/{workload}/graph")
-def put_graph(workload: str, graph: WorkloadGraph, store: StoreDep) -> GraphWriteResult:
-    """Replace the persisted dependency graph for ``workload``."""
+def put_graph(
+    workload: str, graph: WorkloadGraph, request: Request, store: StoreDep, audit: AuditDep
+) -> GraphWriteResult:
+    """Replace the persisted dependency graph for ``workload`` (audited, fail-closed — issue #99).
+
+    Records a PII-free ``graph replaced`` audit event (subject ``wl:<digest>#graph=nodes=N,edges=M``
+    — an opaque one-way workload token + node/edge COUNTS only, never the raw name or graph content;
+    PII-free BY CONSTRUCTION). The graph is security-material, so the event is emitted as an audit-
+    BEFORE-write PRECONDITION (ADR 0014): a durable-append failure BLOCKS the write and surfaces as
+    5xx (nothing replaced).
+    """
+    node_count = len(graph.nodes)
+    edge_count = len(graph.edges)
+    _emit_or_fail_closed(
+        audit,
+        actor=resolve_actor(request.headers),
+        action=AuditAction.run_executed,
+        subject=_graph_replaced_subject(workload, node_count, edge_count),
+        result=AuditResult.success,
+    )
     store.put_graph(workload, graph)
-    return GraphWriteResult(nodes=len(graph.nodes), edges=len(graph.edges))
+    return GraphWriteResult(nodes=node_count, edges=edge_count)
 
 
 @app.post("/api/workloads/{workload}/findings")
@@ -726,6 +894,13 @@ def add_findings(
     sourceReferences fails closed with a 422 and NOTHING is written on either backend. On a
     successful write a PII-free ``finding.emitted`` event (subject = ``<workload>#count=N``) is
     recorded to the append-only audit log; auditing never blocks the write.
+
+    Findings persist through the central provenance gate (issue #59): a finding without evidence /
+    sourceReferences fails closed with a 422 and NOTHING is written on either backend. On acceptance
+    a PII-free ``finding.emitted`` event (subject = ``<workload>#count=N``) is recorded as an audit-
+    BEFORE-write PRECONDITION (ADR 0014): the durable append happens FIRST and the findings are
+    written only if it succeeds, so a hard audit-store outage BLOCKS the write (5xx, nothing
+    persisted) rather than leaving committed-but-unaudited findings.
 
     Returns a bounded :class:`FindingsWriteResult` (issue #91) rather than a raw dict.
     """
@@ -744,14 +919,23 @@ def add_findings(
     # #64 (Entra auth) + #79 as currently designed are INSUFFICIENT, because they cannot distinguish
     # `dependency_graph` from another module sharing the one worker identity. Do NOT add auth logic
     # here until per-module identities or a module-bound capability exist.
+    #
+    # Audit-BEFORE-write (fail-closed, ADR 0014): validate provenance FIRST (a malformed submission
+    # is rejected 422 without a spurious finding.emitted event), then record finding.emitted BEFORE
+    # the write so a hard audit-store outage BLOCKS it (5xx, nothing persisted). The emit is
+    # UNCONDITIONAL — even an EMPTY submission is audited (`#count=0`) before store.add_findings,
+    # because add_findings([]) is NOT a no-op on the durable store (it creates the workload manifest
+    # and advances its version), so skipping the audit for the empty case would allow a committed-
+    # but-unaudited mutation. add_findings re-enforces provenance at the durable boundary; both
+    # ProvenanceError sources share the single 422 below (no new error-body site).
     try:
-        store.add_findings(workload, findings)
-    except ProvenanceError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if findings:
+        enforce_finding_provenance(findings)
         _emit_findings_persisted(
             audit, actor=resolve_actor(request.headers), workload=workload, count=len(findings)
         )
+        store.add_findings(workload, findings)
+    except ProvenanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return FindingsWriteResult(count=len(findings))
 
 
@@ -762,9 +946,27 @@ class SnapshotResult(BaseModel):
 
 
 @app.post("/api/workloads/{workload}/snapshot")
-def snapshot(workload: str, store: StoreDep) -> SnapshotResult:
-    """Freeze the current findings into a point-in-time snapshot; return its id."""
-    return SnapshotResult(snapshotId=store.snapshot(workload))
+def snapshot(
+    workload: str, request: Request, store: StoreDep, audit: AuditDep
+) -> SnapshotResult:
+    """Freeze current findings into a point-in-time snapshot; return its id (audited — issue #99).
+
+    Records a PII-free ``snapshot created`` audit event (subject = ``wl:<digest>#snapshot`` — an
+    opaque one-way workload token + a bounded intent marker; PII-free BY CONSTRUCTION, and NOT the
+    store-generated id which embeds the raw workload name and is only known post-write). A snapshot
+    is security-material state, so the event is emitted as an audit-BEFORE-write PRECONDITION
+    (ADR 0014): the durable append happens FIRST and the snapshot is frozen only if it succeeds, so
+    a hard audit-store outage BLOCKS the write (5xx, nothing frozen).
+    """
+    _emit_or_fail_closed(
+        audit,
+        actor=resolve_actor(request.headers),
+        action=AuditAction.run_executed,
+        subject=_snapshot_created_subject(workload),
+        result=AuditResult.success,
+    )
+    snapshot_id = store.snapshot(workload)
+    return SnapshotResult(snapshotId=snapshot_id)
 
 
 # --------------------------------------------------------------------------------------
