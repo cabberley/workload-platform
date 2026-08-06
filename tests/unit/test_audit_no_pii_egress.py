@@ -92,18 +92,11 @@ def test_all_default_waivers_track_issue_91() -> None:
     assert all(issue in {"#91", "#96"} for issue in AUDIT._DEFAULT_WAIVERS.values())
 
 
-def test_default_waivers_include_issue_96_http_detail_sites() -> None:
-    # R6 HIGH 2: the real src/** non-literal HTTPException detail sites are waived under #96. The
-    # results/findings sites became visible once those routes gained a bounded response_model
-    # (issue #91) — the detail check only runs for routes that declare one.
+def test_default_waivers_no_longer_waive_issue_96_http_detail_sites() -> None:
+    # Issue #96 (DONE): the src/** HTTPException detail sites are now BOUNDED constant literals, so
+    # their former #96 waivers were removed — no route may ride a non-literal-detail waiver anymore.
     issue_96 = {k for k, v in AUDIT._DEFAULT_WAIVERS.items() if v == "#96"}
-    assert issue_96 == {
-        "POST /api/modules/{name}/run <raise HTTPException detail>",
-        "GET /api/workloads/{workload}/graph <raise HTTPException detail>",
-        "GET /api/workloads/{workload}/impact <raise HTTPException detail>",
-        "POST /api/workloads/{workload}/results <raise HTTPException detail>",
-        "POST /api/workloads/{workload}/findings <raise HTTPException detail>",
-    }
+    assert issue_96 == set()
 
 
 def test_real_egress_audit_passes_with_default_waivers() -> None:
@@ -2248,11 +2241,11 @@ def test_r15_pairable_scalar_tuple_no_false_positive() -> None:
     assert not any(v.target.startswith("GET /m1d") for v in auditor.violations)
 
 
-# --- M1-inv: the real tree stays EXIT-0-equivalent with EXACTLY 11 tracked waivers -------
+# --- M1-inv: the real tree stays EXIT-0-equivalent with EXACTLY 4 tracked waivers -------
 def test_r15_real_tree_invariant_waivers_intact() -> None:
     auditor = AUDIT.run_audit(_REPO_ROOT)
     assert auditor.violations == []
-    assert len(auditor.waived) == 11
+    assert len(auditor.waived) == 4
 
 
 # ======================================================================================
@@ -2335,11 +2328,11 @@ def test_r16_helper_scalar_pair_no_false_positive() -> None:
     assert not any(v.target.startswith("GET /n1d") for v in auditor.violations)
 
 
-# --- N1e: the real tree stays EXIT-0-equivalent with EXACTLY 11 tracked waivers ----------
+# --- N1e: the real tree stays EXIT-0-equivalent with EXACTLY 4 tracked waivers ----------
 def test_r16_real_tree_invariant_waivers_intact() -> None:
     auditor = AUDIT.run_audit(_REPO_ROOT)
     assert auditor.violations == []
-    assert len(auditor.waived) == 11
+    assert len(auditor.waived) == 4
 
 
 # ======================================================================================
@@ -2421,7 +2414,7 @@ def test_r17_unredacted_egress_is_unwaivable() -> None:
 def test_r17_real_tree_invariant_waivers_intact() -> None:
     auditor = AUDIT.run_audit(_REPO_ROOT)
     assert auditor.violations == []
-    assert len(auditor.waived) == 11
+    assert len(auditor.waived) == 4
 
 
 # ======================================================================================

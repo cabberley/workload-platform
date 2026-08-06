@@ -14,6 +14,8 @@ from time import perf_counter
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from packs_engine.engine import PacksEngine
@@ -67,6 +69,29 @@ app = FastAPI(
     version="0.1.0",
     description="In-boundary control plane for discovery, quality, dependency, AIOps and alerts.",
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _bounded_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Bounded, PII-free 422 for request-body/query validation errors (issue #96).
+
+    FastAPI's DEFAULT ``RequestValidationError`` handler serialises ``exc.errors()`` — which embeds
+    the raw rejected ``input`` (and ``body``) straight into the response, so a malformed POST whose
+    payload carries PHI/PII (e.g. a medical-record id or email in a ``findings``/``results``/``run``
+    body) would be reflected back verbatim in ``{"detail": [{"input": ...}]}``. That is the same
+    error-body egress channel #96 closes for explicit ``raise HTTPException`` sites; the
+    no-PII-egress auditor does not see the framework's default handler, so we override it here to a
+    single constant body that NEVER echoes ``exc.errors()``/``exc.body``/per-field
+    ``input``/``loc``/``msg``. Status 422 is preserved. 500 handling is deliberately left to the
+    framework default (bounded "Internal Server Error", no exception text) — no catch-all handler
+    that could mask fail-closed re-raises.
+    """
+    return JSONResponse(
+        status_code=422, content={"detail": "request validation failed (fail closed)"}
+    )
+
 
 # The ASGI next-handler signature for the request-boundary tracing middleware below.
 RequestHandler = Callable[[Request], Awaitable[Response]]
@@ -815,7 +840,9 @@ def run_module_endpoint(
     try:
         module = registry.get(name)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Bounded, PII-free body (issue #96): the caller-controlled ``name`` path param must never
+        # echo back through the error body (which bypasses the response_model). Constant literal.
+        raise HTTPException(status_code=404, detail="unknown module") from exc
     # Validate the derived run.executed subject (the module id) before any write, so a run whose
     # audit event would be dropped is never persisted (defense in depth; registered names are safe).
     _require_auditable_run_subject(name)
@@ -851,8 +878,12 @@ def run_module_endpoint(
         except ProvenanceError as exc:
             # Fail closed: an un-provenanced finding is rejected before any write; surface a clean
             # 422 (never a 500) and persist nothing. The run is still audited (failure) in the
-            # ``finally`` below.
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            # ``finally`` below. Bounded, PII-free body (issue #96): ``str(exc)`` would echo the
+            # finding id / module through the error body (which bypasses the response_model), so we
+            # map every provenance failure to a single constant message.
+            raise HTTPException(
+                status_code=422, detail="finding provenance validation failed (fail closed)"
+            ) from exc
         finally:
             duration_ms = (perf_counter() - started) * 1000.0
             span.set_attribute("outcome", "ok" if ok else "error")
@@ -931,7 +962,11 @@ def submit_results(
             )
         persisted = store.commit_run(workload, result)
     except ProvenanceError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # Bounded, PII-free body (issue #96): map the provenance failure to a constant message
+        # rather than echoing ``str(exc)`` (finding id / module) through the error body.
+        raise HTTPException(
+            status_code=422, detail="finding provenance validation failed (fail closed)"
+        ) from exc
     return ResultsResponse(workload=workload, persisted=PersistCounts.model_validate(persisted))
 
 
@@ -1070,7 +1105,11 @@ def add_findings(
         )
         store.add_findings(workload, findings)
     except ProvenanceError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # Bounded, PII-free body (issue #96): map the provenance failure to a constant message
+        # rather than echoing ``str(exc)`` (finding id / module) through the error body.
+        raise HTTPException(
+            status_code=422, detail="finding provenance validation failed (fail closed)"
+        ) from exc
     return FindingsWriteResult(count=len(findings))
 
 
@@ -1156,7 +1195,9 @@ def get_graph(workload: str, store: StoreDep, _principal: ReaderDep) -> GraphRes
     """
     graph = store.get_graph(workload)
     if graph is None:
-        raise HTTPException(status_code=404, detail=f"no graph for workload {workload!r}")
+        # Bounded, PII-free body (issue #96): never echo the caller-controlled ``workload`` path
+        # param (it bypasses the response_model) — use a constant literal.
+        raise HTTPException(status_code=404, detail="no dependency graph for workload")
     return GraphResponse(
         nodes=[redact_node_tags(n) for n in graph.nodes],
         edges=graph.edges,
@@ -1204,11 +1245,12 @@ def get_impact(
     """
     graph = store.get_graph(workload)
     if graph is None:
-        raise HTTPException(status_code=404, detail=f"no graph for workload {workload!r}")
+        # Bounded, PII-free body (issue #96): constant literal, never the ``workload`` path param.
+        raise HTTPException(status_code=404, detail="no dependency graph for workload")
     if node not in {n.id for n in graph.nodes}:
-        raise HTTPException(
-            status_code=404, detail=f"node {node!r} not in graph for workload {workload!r}"
-        )
+        # Bounded, PII-free body (issue #96): neither the ``node`` nor ``workload`` path param may
+        # egress through the error body (which bypasses the response_model) — constant literal.
+        raise HTTPException(status_code=404, detail="node not in dependency graph")
     states = compute_impact(graph, node)
     down = sorted(
         nid for nid, st in states.items() if st == HealthState.down and nid != node

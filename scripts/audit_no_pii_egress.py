@@ -1379,17 +1379,6 @@ _DEFAULT_WAIVERS: dict[str, str] = {
     # the keys are scaler-defined (not enumerable). Tracked by #91 as a tightly-scoped field waiver
     # (replaces the former endpoint-level ``GET /api/modules`` waiver — a precision improvement).
     "ScaleTrigger.metadata": "#91",
-    # Non-literal HTTPException ``detail`` on bounded routes: today the app raises a coerced
-    # exception message (``str(exc)``) or an f-string naming the workload. These are bounded error
-    # strings, but the detector fails closed on any non-literal detail; constant-ifying them
-    # src-side is tracked in **#96** (this compliance tooling must not edit src/**). The results/
-    # findings sites become visible now that those routes carry a bounded ``response_model`` (the
-    # detail check only runs for routes that declare one).
-    "POST /api/modules/{name}/run <raise HTTPException detail>": "#96",
-    "GET /api/workloads/{workload}/graph <raise HTTPException detail>": "#96",
-    "GET /api/workloads/{workload}/impact <raise HTTPException detail>": "#96",
-    "POST /api/workloads/{workload}/results <raise HTTPException detail>": "#96",
-    "POST /api/workloads/{workload}/findings <raise HTTPException detail>": "#96",
 }
 
 _DICT_CONTRACTS: tuple[DictReturnContract, ...] = (
