@@ -66,6 +66,59 @@ lives in [`src/shared/connectors`](../src/shared/connectors); see
     the `dependency_graph` module (which holds the authoritative graph) and requires an Architect
     ADR — Discovery must not emit edges into the persisted graph. See the `TODO(human):` notes in
     `kuiper.py`.
+- **Citrix** — Citrix control-plane **health + dependency assist**
+  (`src/modules/dependency_graph/connectors/citrix.py`). A defensive twin of Kuiper that feeds the
+  **Dependency & Blast Radius** module. Like Kuiper it is **fail-closed by default**: the concrete
+  Citrix endpoint, payload contract, and auth scheme are an external dependency owned by the product
+  team (`TODO(human):` seams, [ADR 0015](adr/0015-citrix-dependency-edge-merge-deferred.md)), so
+  until a human wires an **approved `https` endpoint** the connector stays *unavailable*, resolves
+  **no** credential, builds **no** `Authorization` header, and makes **no** network call. Endpoint
+  validation runs **before** any credential is resolved with the same guarantees as Kuiper —
+  `https`-only; no userinfo/query/fragment; a real (non-placeholder) host; **no** explicit port; not
+  an **IP literal** (loopback/link-local and legacy octal/hex/integer/short numeric forms such as
+  `0177.0.0.1`/`0x7f.0.0.1`/`2130706433`/`127.1` included); host canonicalized with the **same IDNA
+  implementation HTTPX uses** (`idna.encode`, non-encodable host fails **closed**); and then present
+  in an explicit operator-configured **approved-host allowlist** (**no** default host). The request
+  target is **rebuilt from the validated canonical host**, never the raw `base_url`.
+  - **Keyless via a `TokenProvider` abstraction.** The bearer is resolved (keyless order) via an
+    injected `TokenProvider` → a Key Vault `SecretProvider` → a documented local-dev env-var
+    fallback (`CITRIX_READ_TOKEN`), using the shared `resolve_bearer_token`. A **contract-mock**
+    `MockCitrixTokenProvider` plus synthetic health/dependency payloads exercise the whole path
+    without any real Citrix — no schema or endpoint is baked in.
+  - **Supplement-only, never authoritative.** Citrix emits a **closed two-kind** signal model:
+    `host-health` maps to a bounded, fixed-vocabulary supplemental **node tag**
+    (`aegis:citrix-health` ∈ `{healthy, degraded, unreachable, maintenance}`, plus its provenance in
+    `aegis:source`) applied **only** when its `resourceId` **exactly matches** an existing estate
+    node id (via `apply_supplemental`). Provenance is **additive**: `aegis:source` is treated as a
+    sorted, comma-joined **set** of contributing connectors, so a node already annotated by Kuiper
+    (`aegis:source=kuiper`) becomes `aegis:source=citrix,kuiper` — Citrix **never clobbers** another
+    connector's provenance (Kuiper's own tags are untouched). Citrix **never** creates, renames,
+    retypes, or removes a node; a signal matching no node id is **dropped**; the estate always wins.
+  - **Dependency edges parsed but NOT persisted (deferred).** `session-dependency` signals are
+    validated and mapped to `DependencyEdge` objects by a **pure** `dependency_edges(...)` function
+    (origin `connector:citrix`), but this mapping is **never merged into the returned graph** and
+    never reaches the state writer. The module UPSERT-**replaces** a workload's whole graph, so a
+    naive edge merge would wipe authoritative auto/pack edges — exactly the hazard Kuiper deferred.
+    The non-destructive merge is owned by the `dependency_graph` module as a documented
+    `TODO(human)` + [ADR 0015](adr/0015-citrix-dependency-edge-merge-deferred.md).
+  - **PII-safe & atomic.** Each signal kind has a **closed** key set; any unexpected key,
+    charset/length-invalid id, or non-allowlisted health token **rejects the entire fetch**. Only
+    fixed constants / closed-vocabulary tokens are ever written; no free-form Citrix string is
+    persisted. Both hint models **self-validate**, and — because `model_construct`/`model_copy`
+    bypass validators — `apply_supplemental` **re-validates every signal at the persistence-adjacent
+    boundary**. The module also treats any injected connector `FetchResult` as untrusted and
+    re-validates it (`signals_from_result`) before applying, failing closed on the whole batch.
+  - **Bounded.** TLS verify on, finite timeout, a **streamed** size- AND time-bounded response body
+    (over-limit `Content-Length` rejected before reading; the running byte total checked **before**
+    each append so a decompression bomb is aborted, never buffered whole; non-identity
+    `Content-Encoding` refused), a max record count, a max per-field length, capped retries/delays,
+    and an overall elapsed deadline checked **before every attempt and sleep** and on **every**
+    chunk. `httpx` is imported **lazily inside the edge**, so importing the connector (or the
+    `dependency_graph` module) never imports `httpx` when Citrix is absent.
+  - **Off by default.** Optional, injected via `ctx.clients["citrix"]`; when absent — the default —
+    the `dependency_graph` module runs **exactly as today** (byte-for-byte identical graph). A
+    fail-closed, failing, or empty/unusable connector is swallowed as "estate-only graph" with a
+    bounded, PII-free note (error **class name only**) — a Citrix problem can never break the module.
 
 ## The pattern
 
