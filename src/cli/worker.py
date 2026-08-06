@@ -20,10 +20,39 @@ import httpx
 
 from cli.state_client import DEFAULT_API_BASE_URL, ApiStateReader
 from cli.wiring import build_client_registry, build_packs_engine
+from shared.auth.token_source import ApiTokenProvider, build_api_token_provider
 from shared.module_base import build_default_registry, run_module
 
 # `DEFAULT_API_BASE_URL` is defined in `cli.state_client` (the read client) and re-exported here so
 # the worker's compute (read via HTTP) and write-back (POST results) agree on the API base URL.
+
+
+def _submit_result(
+    base_url: str,
+    workload: str,
+    payload: dict[str, object],
+    *,
+    token_provider: ApiTokenProvider | None,
+    client: httpx.Client | None = None,
+) -> None:
+    """POST a module result to the API (the single writer), keylessly authenticated when enabled.
+
+    When ``token_provider`` is set (auth enabled) a fresh bearer for the API audience is minted via
+    the worker's Managed Identity (issue #64/#79) and attached as ``Authorization: Bearer`` — no
+    shared key. Inability to mint fails closed inside the provider (raises), so the worker never
+    falls back to an unauthenticated write. When ``token_provider`` is ``None`` (``WP_AUTH_MODE=
+    disabled``) no header is sent, matching a server that is not enforcing. ``client`` is injectable
+    so tests assert header attachment without any network or real Entra.
+    """
+    headers: dict[str, str] = {}
+    if token_provider is not None:
+        headers["Authorization"] = f"Bearer {token_provider()}"
+    url = f"{base_url}/api/workloads/{workload}/results"
+    if client is not None:
+        response = client.post(url, json=payload, headers=headers, timeout=30.0)
+    else:
+        response = httpx.post(url, json=payload, headers=headers, timeout=30.0)
+    response.raise_for_status()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,13 +97,14 @@ def main(argv: list[str] | None = None) -> int:
 
     workload = scope.get("workload")
     if workload:
-        # TODO(human): authenticate worker->API (Entra/mTLS) — M4. Keyless/internal for MVP.
-        response = httpx.post(
-            f"{base_url}/api/workloads/{workload}/results",
-            json=result.model_dump(mode="json"),
-            timeout=30.0,
+        # Authenticate worker→API KEYLESSLY with the worker's own Managed Identity (issue #64/#79):
+        # under `WP_AUTH_MODE=required` a bearer for the API audience is minted and attached;
+        # inability to mint fails closed. Under `disabled` no token is sent (local/dev). No shared
+        # key anywhere. `build_api_token_provider` reads the same auth config as the API server.
+        token_provider = build_api_token_provider()
+        _submit_result(
+            base_url, workload, result.model_dump(mode="json"), token_provider=token_provider
         )
-        response.raise_for_status()
 
     print(json.dumps(result.model_dump(), default=str, indent=2))
     return 0 if result.ok else 1

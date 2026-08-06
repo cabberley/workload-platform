@@ -22,6 +22,15 @@ param imageTag string = 'latest'
 @description('Manage (create/update) the state container time-based immutability (WORM) policy from IaC (issue #81). Set FALSE once the policy has been LOCKED out-of-band — Azure rejects any PUT on a LOCKED immutability policy, so leaving this true would break every subsequent deployment (core is always deployed).')
 param manageStateImmutabilityPolicy bool = true
 
+@description('Entra auth mode for the deployed API (issue #64). Fail-closed by default: "required" means the API validates a bearer token on every request and REFUSES TO SERVE unless authTenantId + authAudience are supplied. Set to "disabled" ONLY for a deliberate no-auth environment. Never a secret.')
+param authMode string = 'required'
+
+@description('Entra tenant (directory) id the API validates tokens against, and the worker authenticates from (issue #64). Non-secret identifier. Empty by default — MUST be provided (with authAudience) for the fail-closed "required" default, or the API will refuse to serve.')
+param authTenantId string = ''
+
+@description('Expected API token audience — the API app registration Application ID URI / client id (issue #64). Non-secret. Empty by default — MUST be provided (with authTenantId) for the "required" default.')
+param authAudience string = ''
+
 // Long-running service modules run the persistent service entrypoint (cli.serve), which stays alive
 // and dispatches the module named by WP_MODULE. Jobs use cli.worker (run-once) via module-job.
 var serviceCommand = [ 'python', '-m', 'cli.serve' ]
@@ -114,6 +123,12 @@ module coreApps 'modules/module-app.bicep' = [for s in coreServices: {
     // URI so its app-side provider can resolve secrets by identity. The web SPA reads NO runtime
     // secret and holds no KV role, so it is deliberately excluded (least privilege, issue #85).
     keyVaultUri: s.name == 'api' ? core.outputs.keyVaultUri : ''
+    // Entra auth (issue #64): ONLY the API core enforces bearer validation (it runs the FastAPI
+    // app). Fail-closed by default — with authMode=required the API refuses to serve unless tenant +
+    // audience are supplied. The static web SPA does not enforce server-side auth, so it is excluded.
+    authMode: s.name == 'api' ? authMode : ''
+    authTenantId: s.name == 'api' ? authTenantId : ''
+    authAudience: s.name == 'api' ? authAudience : ''
   }
 }]
 
@@ -245,6 +260,13 @@ module jobApps 'modules/module-job.bicep' = [for m in jobModules: {
     // wp-api) so the value is correct by construction — never a hardcoded host. Referencing this
     // output also orders the API app before the jobs.
     apiBaseUrl: 'https://${coreApps[0].outputs.fqdn}'
+    // Entra auth (issue #64): when authMode=required the worker mints a bearer for the API audience
+    // via its own Managed Identity (#79) before submitting results — no shared key. Threaded so the
+    // worker's auth config matches the API it calls. Both tenant + audience are required together
+    // (a partial config fails closed).
+    authMode: authMode
+    authTenantId: authTenantId
+    authAudience: authAudience
   }
 }]
 

@@ -1690,7 +1690,8 @@ class Auditor:
         Resolve the handler's return annotation and decide (FIX 4, issue #91 R4):
         * references a redaction-required model (``ResourceNode``/``ModuleRunResult``) → True;
         * a ``Response``/``JSONResponse``/... subclass (an opaque already-serialized body that
-          bypasses ``response_model``) → True (fail closed — its payload is not statically knowable);
+          bypasses ``response_model``) → True (fail closed — its payload is not statically
+          knowable);
         * unresolvable / absent / raw-or-unbounded (bare ``dict``/``list``, ``Any``, ...) → True
           (fail closed — we cannot prove the payload is free of a redaction-required value);
         * a resolvable, bounded, non-redaction annotation → False (no redaction check needed).

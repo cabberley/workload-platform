@@ -18,6 +18,13 @@ from pydantic import BaseModel, Field
 
 from packs_engine.engine import PacksEngine
 from shared.audit import AuditEmitter, resolve_actor
+from shared.auth import (
+    AuthError,
+    Principal,
+    Role,
+    TokenValidator,
+    build_token_validator,
+)
 from shared.blast_radius import compute_impact, graph_revision
 from shared.contracts import (
     AuditAction,
@@ -140,6 +147,125 @@ def get_audit_emitter(store: StoreDep, metrics: MetricsDep) -> AuditEmitter:
 
 
 AuditDep = Annotated[AuditEmitter, Depends(get_audit_emitter)]
+
+
+# --------------------------------------------------------------------------------------
+# Entra (Azure AD) auth — keyless, fail-closed, deny-by-default RBAC (issue #64).
+#
+# Fail-closed BY DEFAULT (not gated on mere config presence). An EXPLICIT `WP_AUTH_MODE` governs
+# behaviour: `required` (the default when unset) MUST authenticate every request and the API
+# REFUSES TO SERVE when unconfigured (see the startup guard below); `disabled` is the ONLY, explicit
+# way to run without auth (local dev / CI / tests) and logs a prominent warning. A partial config
+# (one of tenant id / audience present, the other blank) always aborts startup. Signature
+# verification is KEYLESS — the tenant's PUBLIC JWKS keys only, at the injectable edge inside
+# `shared.auth` — so no secret ever lives here.
+# --------------------------------------------------------------------------------------
+_auth_validator: TokenValidator | None = None
+_auth_validator_built = False
+
+# Where `require_role` stashes the VALIDATED principal so `_request_actor` can derive the audit
+# actor from the token's `oid` (never a spoofable header) — see issue #64 / `shared.audit`.
+AUTH_PRINCIPAL_STATE_ATTR = "auth_principal"
+
+
+def get_auth_validator() -> TokenValidator | None:
+    """Return the process-wide keyless token validator, or ``None`` when auth is explicitly off.
+
+    Built once from env via :func:`shared.auth.build_token_validator` (public JWKS keys only — no
+    secret). ``None`` occurs ONLY under ``WP_AUTH_MODE=disabled`` (the deliberate local-dev / CI /
+    test opt-out); under the default ``required`` mode an unconfigured deployment raises
+    :class:`~shared.auth.AuthConfigError` (the API refuses to serve — see the startup guard
+    :func:`_enforce_auth_startup`), never a wide-open permit. Exposed as a dependency so tests
+    override it with a validator over an INJECTED key provider (network-free).
+    """
+    global _auth_validator, _auth_validator_built
+    if not _auth_validator_built:
+        _auth_validator = build_token_validator()
+        _auth_validator_built = True
+    return _auth_validator
+
+
+@app.on_event("startup")
+def _enforce_auth_startup() -> None:
+    """Fail-closed startup guard (issue #64): a deployed API must NEVER run wide-open.
+
+    Resolves the auth mode + config ONCE at startup by building the validator eagerly. Under the
+    default ``WP_AUTH_MODE=required`` an unconfigured (or partially configured) deployment raises
+    :class:`~shared.auth.AuthConfigError`, which aborts startup so the process refuses to serve
+    rather than silently disabling authentication. ``WP_AUTH_MODE=disabled`` is the only way to
+    start without auth and logs a prominent warning (emitted inside ``build_token_validator``). The
+    resolved validator is cached for :func:`get_auth_validator`; tests select ``disabled`` mode via
+    ``conftest`` and still override the dependency for the auth-enabled cases.
+    """
+    get_auth_validator()
+
+
+AuthValidatorDep = Annotated["TokenValidator | None", Depends(get_auth_validator)]
+
+
+def _extract_bearer_token(headers: Mapping[str, str]) -> str:
+    """Return the bearer token from the ``Authorization`` header, or fail closed (401).
+
+    The reason is generic — the token is never echoed. ``request.headers`` is case-insensitive.
+    """
+    header = headers.get("authorization") or ""
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="authentication required")
+    return token.strip()
+
+
+def require_role(required: Role) -> Callable[..., Principal | None]:
+    """Build a FastAPI dependency enforcing ``required`` (deny-by-default) when auth is enabled.
+
+    * Auth explicitly DISABLED (validator ``None`` — only under ``WP_AUTH_MODE=disabled``) → the
+      deliberate local-dev / CI / test path: the request is permitted and NO validated principal is
+      attached, so audit falls back to the header/``system`` actor. (A misconfigured deployment can
+      never reach this branch — the startup guard refuses to serve first.)
+    * Auth enabled → the bearer token is REQUIRED and cryptographically validated against the
+      tenant's public keys (401 on any validation failure — missing/expired/wrong-audience/wrong-
+      issuer/bad-signature/unknown-kid), and the principal must satisfy ``required`` (403 if not).
+      The validated principal is stashed on ``request.state`` so the endpoint's audit actor derives
+      from the validated ``oid`` (:func:`_request_actor`), never a spoofable header.
+
+    Fail-closed throughout: no valid token ⇒ 401; valid token but insufficient role ⇒ 403; a
+    mutating request can NEVER fall open to the ``system`` actor while auth is enabled. Error bodies
+    are fixed, non-sensitive strings — the token, claims, and PII are never leaked.
+    """
+
+    def dependency(request: Request, validator: AuthValidatorDep) -> Principal | None:
+        if validator is None:
+            return None
+        token = _extract_bearer_token(request.headers)
+        try:
+            principal = validator.validate(token)
+        except AuthError as exc:
+            # Reason/class only — never echo the token, claims, or PII into the response body.
+            raise HTTPException(status_code=401, detail="authentication failed") from exc
+        if not principal.grants(required):
+            raise HTTPException(status_code=403, detail="insufficient role")
+        setattr(request.state, AUTH_PRINCIPAL_STATE_ATTR, principal)
+        return principal
+
+    return dependency
+
+
+# Pre-built dependency handles (one per required role) so endpoints declare intent table-driven.
+ReaderDep = Annotated[Principal | None, Depends(require_role(Role.reader))]
+OperatorDep = Annotated[Principal | None, Depends(require_role(Role.operator))]
+
+
+def _request_actor(request: Request) -> str:
+    """Resolve the audit actor: the VALIDATED ``oid`` when present, else the header/system fallback.
+
+    When auth is enabled and ``require_role`` has stashed a validated :class:`Principal`, its
+    ``oid`` is authoritative and the spoofable ``x-ms-client-principal-id`` header is ignored
+    entirely (closing the forged-actor gap, issue #64). On the no-auth local/dev/worker path no
+    principal is present, so :func:`shared.audit.resolve_actor` uses its documented header fallback.
+    """
+    principal = getattr(request.state, AUTH_PRINCIPAL_STATE_ATTR, None)
+    principal_id = principal.oid if isinstance(principal, Principal) else None
+    return resolve_actor(request.headers, principal_id=principal_id)
 
 
 def _emit_or_fail_closed(
@@ -520,7 +646,7 @@ def _clients_probe(build_clients: Callable[[], Mapping[str, object]]) -> ProbeRe
 
 
 @app.get("/api/metrics")
-def get_metrics_snapshot(metrics: MetricsDep) -> MetricsSnapshotView:
+def get_metrics_snapshot(metrics: MetricsDep, _principal: ReaderDep) -> MetricsSnapshotView:
     """Read-only, vendor-neutral JSON snapshot of the in-process metrics registry.
 
     Keyless and PII-free: the raw registry accepts arbitrary label maps, so on egress the snapshot
@@ -535,7 +661,7 @@ def get_metrics_snapshot(metrics: MetricsDep) -> MetricsSnapshotView:
 
 
 @app.get("/api/modules")
-def list_modules() -> list[ModuleManifest]:
+def list_modules(_principal: ReaderDep) -> list[ModuleManifest]:
     """Enumerate modules and their scale profiles (drives infra + the web console)."""
     return registry.manifests()
 
@@ -561,7 +687,7 @@ class PackRegistryEntryView(BaseModel):
 
 
 @app.get("/api/packs")
-def list_packs(packs: PacksDep) -> list[PackRegistryEntryView]:
+def list_packs(packs: PacksDep, _principal: ReaderDep) -> list[PackRegistryEntryView]:
     """Read-only catalogue of published pack versions in the wired registry (issue #57).
 
     Thin, keyless, PII-free and fail-closed: when no packs engine / registry is wired (no content
@@ -664,6 +790,7 @@ def run_module_endpoint(
     metrics: MetricsDep,
     tracer: TracerDep,
     audit: AuditDep,
+    _principal: OperatorDep,
 ) -> ModuleRunResult:
     """Run a single module by name (also how the ACA Job worker's compute is exercised in-process).
 
@@ -692,7 +819,7 @@ def run_module_endpoint(
     # Validate the derived run.executed subject (the module id) before any write, so a run whose
     # audit event would be dropped is never persisted (defense in depth; registered names are safe).
     _require_auditable_run_subject(name)
-    actor = resolve_actor(request.headers)
+    actor = _request_actor(request)
     started = perf_counter()
     ok = False
     run_audited = False
@@ -765,6 +892,7 @@ def submit_results(
     request: Request,
     store: StoreDep,
     audit: AuditDep,
+    _principal: OperatorDep,
 ) -> ResultsResponse:
     """Accept a validated ``ModuleRunResult`` and persist estate/graph/findings atomically.
 
@@ -777,7 +905,7 @@ def submit_results(
 
     Returns a bounded :class:`ResultsResponse` (issue #91) rather than a raw dict.
     """
-    actor = resolve_actor(request.headers)
+    actor = _request_actor(request)
     # Validate BOTH derived audit subjects (run.executed + finding.emitted) before any write, so a
     # non-audit-safe module id or workload id can never persist state whose audit event is dropped.
     _require_auditable_run_subject(result.module)
@@ -833,6 +961,7 @@ def put_estate(
     request: Request,
     store: StoreDep,
     audit: AuditDep,
+    _principal: OperatorDep,
 ) -> EstateWriteResult:
     """Replace the persisted estate for ``workload`` (audited, fail-closed — issue #99).
 
@@ -846,7 +975,7 @@ def put_estate(
     count = len(nodes)
     _emit_or_fail_closed(
         audit,
-        actor=resolve_actor(request.headers),
+        actor=_request_actor(request),
         action=AuditAction.run_executed,
         subject=_estate_replaced_subject(workload, count),
         result=AuditResult.success,
@@ -857,7 +986,12 @@ def put_estate(
 
 @app.post("/api/workloads/{workload}/graph")
 def put_graph(
-    workload: str, graph: WorkloadGraph, request: Request, store: StoreDep, audit: AuditDep
+    workload: str,
+    graph: WorkloadGraph,
+    request: Request,
+    store: StoreDep,
+    audit: AuditDep,
+    _principal: OperatorDep,
 ) -> GraphWriteResult:
     """Replace the persisted dependency graph for ``workload`` (audited, fail-closed — issue #99).
 
@@ -871,7 +1005,7 @@ def put_graph(
     edge_count = len(graph.edges)
     _emit_or_fail_closed(
         audit,
-        actor=resolve_actor(request.headers),
+        actor=_request_actor(request),
         action=AuditAction.run_executed,
         subject=_graph_replaced_subject(workload, node_count, edge_count),
         result=AuditResult.success,
@@ -887,6 +1021,7 @@ def add_findings(
     request: Request,
     store: StoreDep,
     audit: AuditDep,
+    _principal: OperatorDep,
 ) -> FindingsWriteResult:
     """Upsert findings into the current set for ``workload``.
 
@@ -931,7 +1066,7 @@ def add_findings(
     try:
         enforce_finding_provenance(findings)
         _emit_findings_persisted(
-            audit, actor=resolve_actor(request.headers), workload=workload, count=len(findings)
+            audit, actor=_request_actor(request), workload=workload, count=len(findings)
         )
         store.add_findings(workload, findings)
     except ProvenanceError as exc:
@@ -947,7 +1082,11 @@ class SnapshotResult(BaseModel):
 
 @app.post("/api/workloads/{workload}/snapshot")
 def snapshot(
-    workload: str, request: Request, store: StoreDep, audit: AuditDep
+    workload: str,
+    request: Request,
+    store: StoreDep,
+    audit: AuditDep,
+    _principal: OperatorDep,
 ) -> SnapshotResult:
     """Freeze current findings into a point-in-time snapshot; return its id (audited — issue #99).
 
@@ -960,7 +1099,7 @@ def snapshot(
     """
     _emit_or_fail_closed(
         audit,
-        actor=resolve_actor(request.headers),
+        actor=_request_actor(request),
         action=AuditAction.run_executed,
         subject=_snapshot_created_subject(workload),
         result=AuditResult.success,
@@ -973,13 +1112,13 @@ def snapshot(
 # Read endpoints — read models the web console/API query (estate, graph, findings, drift).
 # --------------------------------------------------------------------------------------
 @app.get("/api/workloads")
-def list_workloads(store: StoreDep) -> list[str]:
+def list_workloads(store: StoreDep, _principal: ReaderDep) -> list[str]:
     """List every workload the store knows about."""
     return store.list_workloads()
 
 
 @app.get("/api/workloads/{workload}/estate")
-def get_estate(workload: str, store: StoreDep) -> list[ResourceNode]:
+def get_estate(workload: str, store: StoreDep, _principal: ReaderDep) -> list[ResourceNode]:
     """Return the latest estate for ``workload`` (empty list if none).
 
     Customer-controlled ``ResourceNode.tags`` are DEFAULT-REDACTED at this egress projection via
@@ -1007,7 +1146,7 @@ class GraphResponse(WorkloadGraph):
 
 
 @app.get("/api/workloads/{workload}/graph")
-def get_graph(workload: str, store: StoreDep) -> GraphResponse:
+def get_graph(workload: str, store: StoreDep, _principal: ReaderDep) -> GraphResponse:
     """Return the latest dependency graph for ``workload`` + its revision (404 if none).
 
     Customer-controlled ``ResourceNode.tags`` on the graph nodes are DEFAULT-REDACTED at this egress
@@ -1047,7 +1186,9 @@ class ImpactResult(BaseModel):
 
 
 @app.get("/api/workloads/{workload}/impact")
-def get_impact(workload: str, node: str, store: StoreDep) -> ImpactResult:
+def get_impact(
+    workload: str, node: str, store: StoreDep, _principal: ReaderDep
+) -> ImpactResult:
     """Return the canonical blast-radius impact of failing ``node`` in ``workload``'s graph.
 
     Thin, read-only, fail-closed: 404 if no graph is persisted (mirrors :func:`get_graph`), and
@@ -1085,7 +1226,7 @@ def get_impact(workload: str, node: str, store: StoreDep) -> ImpactResult:
 
 @app.get("/api/workloads/{workload}/findings")
 def get_findings(
-    workload: str, store: StoreDep, module: str | None = None
+    workload: str, store: StoreDep, _principal: ReaderDep, module: str | None = None
 ) -> list[Finding]:
     """Return current findings for ``workload``, optionally filtered to one ``module``."""
     return store.get_findings(workload, module)
@@ -1095,19 +1236,23 @@ def get_findings(
 # implement the FULL `ReadableState` Protocol over HTTP — reassessments/aiops run in the worker
 # and must read prior state to compute drift/detections without ever holding a writable store.
 @app.get("/api/workloads/{workload}/previous-findings")
-def get_previous_findings(workload: str, store: StoreDep) -> list[Finding]:
+def get_previous_findings(
+    workload: str, store: StoreDep, _principal: ReaderDep
+) -> list[Finding]:
     """Return the findings captured by the most recent snapshot for ``workload`` (empty if none)."""
     return store.get_previous_findings(workload)
 
 
 @app.get("/api/workloads/{workload}/previous-node-ids")
-def get_previous_node_ids(workload: str, store: StoreDep) -> list[str]:
+def get_previous_node_ids(
+    workload: str, store: StoreDep, _principal: ReaderDep
+) -> list[str]:
     """Return the estate node ids captured by the most recent snapshot (empty if none)."""
     return store.get_previous_node_ids(workload)
 
 
 @app.get("/api/workloads/{workload}/drift")
-def get_drift(workload: str, store: StoreDep) -> DriftReport:
+def get_drift(workload: str, store: StoreDep, _principal: ReaderDep) -> DriftReport:
     """Return drift (findings + estate node deltas) between the last snapshot and now."""
     return compute_drift(
         store.get_previous_findings(workload),

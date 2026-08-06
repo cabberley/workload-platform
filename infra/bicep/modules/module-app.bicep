@@ -43,6 +43,15 @@ param keyVaultUri string = ''
 @description('Key Vault-backed secrets to inject by identity (issue #85). Each item: { secretRefName, secretName, envVar } — a container secret named secretRefName sourced from keyVaultUri/secrets/secretName, surfaced to the app as env var envVar via secretRef. Never a plaintext value here.')
 param keyVaultSecrets array = []
 
+@description('Entra auth mode for the API (issue #64): "required" (fail-closed default — the API refuses to serve unless authTenantId + authAudience are set), or "disabled" (deliberate no-auth). Empty => not injected (only the API core needs it). Non-secret.')
+param authMode string = ''
+
+@description('Entra tenant (directory) id the API validates tokens against (issue #64). Non-secret identifier. Empty => not injected.')
+param authTenantId string = ''
+
+@description('Expected token audience — the API app registration Application ID URI / client id (issue #64). Non-secret. Empty => not injected.')
+param authAudience string = ''
+
 // Assemble this module's KEDA scale rules from its declared triggers (keyless queue auth via MI).
 var queueRules = empty(queueName) ? [] : [
   {
@@ -101,6 +110,21 @@ var kvUriEnv = empty(keyVaultUri) ? [] : [
   { name: 'WP_KEY_VAULT_URI', value: keyVaultUri }
 ]
 
+// Entra auth config (issue #64), keyless — non-secret identifiers only, injected per-var when set.
+// The API core reads WP_AUTH_MODE (default fail-closed `required` in main.bicep) + tenant + audience
+// and enforces token validation on every state-mutating request; a missing var no longer means
+// "no auth" (the app's startup guard refuses to serve when required-but-unconfigured).
+var authModeEnv = empty(authMode) ? [] : [
+  { name: 'WP_AUTH_MODE', value: authMode }
+]
+var authTenantEnv = empty(authTenantId) ? [] : [
+  { name: 'WP_AUTH_TENANT_ID', value: authTenantId }
+]
+var authAudienceEnv = empty(authAudience) ? [] : [
+  { name: 'WP_AUTH_AUDIENCE', value: authAudience }
+]
+var authEnv = concat(authModeEnv, authTenantEnv, authAudienceEnv)
+
 resource app 'Microsoft.App/containerApps@2025-01-01' = {
   name: 'wp-${moduleName}'
   location: location
@@ -133,7 +157,7 @@ resource app 'Microsoft.App/containerApps@2025-01-01' = {
           env: concat([
             { name: 'AZURE_CLIENT_ID', value: identityClientId }
             { name: 'WP_MODULE', value: moduleName }
-          ], kvUriEnv, kvSecretEnv, envVars)
+          ], kvUriEnv, kvSecretEnv, authEnv, envVars)
         }
       ]
       scale: {
