@@ -5,6 +5,7 @@
     "name": "ACME Bespoke — generic multi-tier workload (synthetic)",
     "version": "1.0.0",
     "targets": ["multi-tier-demo"],
+    "sha256": "8f58accd718d14a79ba78473a8fdb37c39d8006701e7d61f04353cc339fa0473",
     "author": "microsoft"
   },
   "body": {

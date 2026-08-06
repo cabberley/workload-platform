@@ -52,10 +52,23 @@ def _sign(pack: dict) -> PackSignature:
     return sign_pack(pack, _SIGNER)
 
 
+def _hashed(pack: dict) -> dict:
+    """Attach the ``sha256`` content-hash integrity field a SHIPPED first-party pack must carry.
+
+    Issue #82 makes the content hash REQUIRED at the shipped-pack load boundary and (MEDIUM-2)
+    computes it over the pack's CANONICAL bytes (whole manifest + body), so these synthetic
+    fixtures carry the same canonical-digest hash a real shipped pack does. Harmless for the
+    imported path too: ``canonical_bytes`` strips the volatile integrity fields, so the registry
+    digest and detached signature are unchanged.
+    """
+    pack["manifest"]["sha256"] = canonical_digest(pack)
+    return pack
+
+
 def _rule_pack(
     pack_id: str = "imported-rule", version: str = "1.0.0", *, tag: str = "backup"
 ) -> dict:
-    return {
+    return _hashed({
         "manifest": {
             "id": pack_id,
             "type": "rule",
@@ -76,7 +89,7 @@ def _rule_pack(
                 }
             ]
         },
-    }
+    })
 
 
 class _SyntheticState:
@@ -228,7 +241,7 @@ def test_shipped_pack_not_double_loaded_from_store(tmp_path: Path) -> None:
 # digest ⇒ NOT digest-deduped) must NEVER shadow/override the shipped policy.
 # --------------------------------------------------------------------------------------
 def _ops_pack(*, critical_channel: str, default_channel: str, version: str = "1.0.0") -> dict:
-    return {
+    return _hashed({
         "manifest": {
             "id": "default-notify",
             "type": "ops",
@@ -241,7 +254,7 @@ def _ops_pack(*, critical_channel: str, default_channel: str, version: str = "1.
             "routes": {"critical": critical_channel},
             "default": default_channel,
         },
-    }
+    })
 
 
 def test_imported_pack_cannot_shadow_shipped_pack_same_ref(tmp_path: Path) -> None:
@@ -363,7 +376,7 @@ def _ops_pack_full(
     runbook: str,
     version: str = "1.0.0",
 ) -> dict:
-    return {
+    return _hashed({
         "manifest": {
             "id": pack_id,
             "type": "ops",
@@ -373,7 +386,7 @@ def _ops_pack_full(
             "author": "microsoft",
         },
         "body": {"routes": routes, "default": default, "runbook": runbook},
-    }
+    })
 
 
 def test_new_id_import_cannot_override_shipped_keys_but_can_add(tmp_path: Path) -> None:

@@ -123,10 +123,14 @@ yields a larger blast radius than a redundant one).
 
 Packs are the trust boundary, so they are signed before release:
 
-- The signer computes **SHA-256** over the pack body and an **HMAC signature** over that hash,
-  writing them into `manifest.sha256` / `manifest.signature`.
-- The signing secret comes from the **boundary (Key Vault) by managed identity** — never hard-code
-  a secret, key, or connection string in a pack, config, or test (guardrail #3, keyless).
+- The signer computes a **SHA‑256 content hash** over the pack body (`manifest.sha256`) and, at
+  release time, a **detached Ed25519 signature over the pack's canonical bytes**, written into
+  `manifest.pack_signature` — a self‑describing envelope naming the algorithm, a base64 signature,
+  a `key_id` hint, and the SHA‑256 `canonical_digest` it covers (see `src/shared/signing.py`).
+- Signing is done **offline** in Microsoft's own infrastructure; the platform holds **no private
+  key** and only **verifies** against pinned Ed25519 **public** keys (guardrail #3, keyless). A
+  legacy symmetric HMAC over `sha256` (`manifest.signature`) remains an independent, optional gate
+  — active only when a signing secret is configured — and is **not** the direction of record.
 - At runtime the **Packs Engine verifies the hash/signature before a pack is allowed to execute**.
   An invalid or missing signature ⇒ **fail closed** (refuse to run — guardrail #4).
 

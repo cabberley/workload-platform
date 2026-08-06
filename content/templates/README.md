@@ -43,11 +43,12 @@ every pack, whatever its type.
 | `name` | **yes** | string | `Example <Type> pack — REPLACE ME` | A short human-readable display name. |
 | `version` | **yes** | string (semver) | `0.1.0` | Semantic version `MAJOR.MINOR.PATCH`. Bump on every change; **never mutate a released version in place** (see the authoring guide's versioning section). |
 | `targets` | optional | string[] | `[]` | Workload kinds this pack applies to, e.g. `["epic"]`. **Empty = applies to all workloads.** |
-| `sha256` | optional | string \| null | absent | Content hash; **set by the signing step at release time**, not by hand. Verified before execute. |
-| `signature` | optional | string \| null | absent | HMAC signature over `sha256`; **set by signing**. The Packs Engine verifies it before a pack executes (fail-closed). |
+| `sha256` | **required (shipped)** | string \| null | absent | Content hash over the pack's **canonical bytes** (whole manifest + body, volatile integrity fields excluded — same canonicalization `signing.py` signs over). **Required fail-closed on shipped/first-party packs** at load (issue #82); set from `canonical_digest`, not by hand. Verified before execute. |
+| `signature` | optional | string \| null | absent | Legacy symmetric HMAC over `sha256` (independent, optional gate). Prefer `pack_signature`. |
+| `pack_signature` | optional | object \| null | absent | Detached **Ed25519** signature over the pack's canonical bytes (self-describing envelope: `algorithm`, base64 `signature`, `key_id`, covered `canonical_digest`); **set by the offline release signer**. The Packs Engine verifies it before a pack executes (fail-closed). |
 | `author` | optional | string | `your-org` (templates) / `microsoft` (shipped) | Your org/team identifier. |
 
-Leave `sha256`/`signature` out while authoring — the release-time signer adds them.
+Leave `sha256`/`signature`/`pack_signature` out while authoring — the release-time signer adds them.
 
 ---
 

@@ -141,15 +141,33 @@ sequenceDiagram
 | **Dependency** | "What depends on what?" | Dependency Graph |
 | **Ops** | "Who gets told, how, and what's the runbook?" | Alerts |
 
-Packs are **signed** (SHA‑256 + HMAC) and **verified before execution** by the Packs Engine.
-Both Microsoft and the customer can see and **pin which pack version runs against which workload**.
+Packs carry a **SHA‑256 content hash over their canonical bytes** and are **verified before
+execution** by the Packs Engine (fail‑closed). Today the two provenance classes are held to
+different bars, honestly:
+
+- **First‑party / shipped packs** currently receive **hash‑only integrity** — the canonical content
+  hash is **required** at the load boundary (a bundled pack that omits it is refused), giving
+  **tamper‑evidence in transit, NOT authenticity**. First‑party **signature enforcement is
+  deferred** until the offline signing‑key / pinned trust‑root decision lands (issues #37/#44).
+  A first‑party pack that nonetheless carries a detached signature is **not** silently trusted: a
+  present signature must cryptographically verify, so a present‑but‑unverifiable signature is
+  rejected fail‑closed.
+- **Imported / third‑party packs** are held to the stricter bar: a detached **Ed25519 signature
+  over their canonical bytes** must verify against pinned Ed25519 **public** keys before the pack is
+  admitted or run. Signing is done **offline** by Microsoft; the platform is **keyless** and only
+  **verifies**.
+
+(A legacy symmetric HMAC check remains as an independent, optional gate.) Both Microsoft and the
+customer can see and **pin which pack version runs against which workload**.
 
 ## Trust boundary & multi‑tenant delivery
 
 - **Customer‑owned** deployment is the default; an MSP can manage many via **Azure Lighthouse**.
 - **MSP‑hosted multi‑tenant**: one instance, strict per‑client data isolation (row/partition +
   RBAC scoping); a client never sees another client's data.
-- Microsoft ships **signed packs only** into either model; no customer data returns by default.
+- Microsoft ships **first‑party packs** into either model — hash‑verified at load today, with
+  signature enforcement deferred to #37/#44; imported third‑party packs must be Ed25519‑verified.
+  No customer data returns by default.
 
 ## Technology choices (summary)
 
@@ -163,7 +181,7 @@ Both Microsoft and the customer can see and **pin which pack version runs agains
 | Compute | **Azure Container Apps** (+ Jobs) | native KEDA scale, scale‑to‑zero |
 | Identity | **Managed Identity** everywhere | keyless |
 | IaC | **Bicep** via **azd** | per‑module templates |
-| Packs registry | signed artifacts | SHA‑256 + HMAC verified |
+| Packs registry | integrity‑checked artifacts | Canonical SHA‑256 content hash required + verified before execute (all packs); detached Ed25519 signature verified for imported/third‑party packs, first‑party signing deferred to #37/#44 |
 
 ### Web experience (responsive‑first)
 
