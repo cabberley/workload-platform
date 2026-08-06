@@ -79,6 +79,7 @@ class TokenFactory:
         *,
         oid: str | None = FAKE_OID,
         roles: list[str] | None = None,
+        tid: str | None = None,
         audience: str | list[str] = FAKE_AUDIENCE,
         issuer: str = FAKE_ISSUER,
         expires_in: float = 3600.0,
@@ -89,7 +90,11 @@ class TokenFactory:
         sign: bool = True,
         header_overrides: dict[str, Any] | None = None,
     ) -> str:
-        """Build a compact JWS. Knobs let a test forge a specifically-invalid token."""
+        """Build a compact JWS. Knobs let a test forge a specifically-invalid token.
+
+        ``tid`` mints the Entra tenant-id claim (issue #65); omitted (``None``) ⇒ no ``tid`` claim,
+        exercising the tenant-absent path.
+        """
         issued = now if now is not None else time.time()
         header: dict[str, Any] = {"alg": alg, "typ": "JWT", "kid": kid or self._kid}
         if header_overrides:
@@ -106,6 +111,8 @@ class TokenFactory:
             claims["oid"] = oid
         if roles is not None:
             claims["roles"] = roles
+        if tid is not None:
+            claims["tid"] = tid
         header_seg = _b64url(json.dumps(header).encode("utf-8"))
         payload_seg = _b64url(json.dumps(claims).encode("utf-8"))
         signing_input = f"{header_seg}.{payload_seg}".encode("ascii")

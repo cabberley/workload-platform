@@ -1287,7 +1287,9 @@ def test_findings_endpoint_accepts_valid_reference(audit_client) -> None:
         json=[_finding_with_ref("resource", "node-1").model_dump(mode="json")],
     )
     assert resp.status_code == 200
-    assert len(store.get_findings("epic")) == 1
+    # Read back through the API (state is tenant-namespaced under the hood — issue #65 — so a raw
+    # store.get_findings("epic") would miss the composite key; the API read applies the same scope).
+    assert len(client.get("/api/workloads/epic/findings").json()) == 1
 
 
 # --------------------------------------------------------------------------------------

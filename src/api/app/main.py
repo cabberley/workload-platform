@@ -18,6 +18,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from api.app.tenancy import (
+    TenancyConfig,
+    TenantResolutionError,
+    build_tenancy_config,
+    resolve_tenant,
+)
+from api.app.tenant_state import TenantScopedState
 from packs_engine.engine import PacksEngine
 from shared.audit import AuditEmitter, resolve_actor
 from shared.auth import (
@@ -39,6 +46,7 @@ from shared.contracts import (
     ModuleRunResult,
     ReadinessReport,
     ResourceNode,
+    TenantContext,
     WorkloadGraph,
     is_audit_safe,
     redact_node_tags,
@@ -240,36 +248,54 @@ def _extract_bearer_token(headers: Mapping[str, str]) -> str:
     return token.strip()
 
 
+def get_request_principal(request: Request, validator: AuthValidatorDep) -> Principal | None:
+    """Resolve + stash the VALIDATED principal for a request (auth seam, shared by all consumers).
+
+    This is the single place a bearer token is validated per request (FastAPI caches it, so the
+    role gate AND the tenant-context resolution share ONE validation):
+
+    * Auth explicitly DISABLED (validator ``None`` — only under ``WP_AUTH_MODE=disabled``) → the
+      deliberate local-dev / CI / test path: no token is required, ``None`` is returned, and audit
+      falls back to the header/``system`` actor. (A misconfigured deployment can never reach this
+      branch — the startup guard refuses to serve first.)
+    * Auth enabled → the bearer token is REQUIRED and cryptographically validated against the
+      tenant's public keys (401 on ANY validation failure — missing/expired/wrong-audience/wrong-
+      issuer/bad-signature/unknown-kid). The validated principal is stashed on ``request.state`` so
+      the audit actor derives from the validated ``oid`` (:func:`_request_actor`), never a spoofable
+      header, and the tenant context resolves from its validated ``tid`` (issue #65).
+
+    Error bodies are fixed, non-sensitive strings — the token, claims, and PII are never leaked.
+    """
+    if validator is None:
+        return None
+    token = _extract_bearer_token(request.headers)
+    try:
+        principal = validator.validate(token)
+    except AuthError as exc:
+        # Reason/class only — never echo the token, claims, or PII into the response body.
+        raise HTTPException(status_code=401, detail="authentication failed") from exc
+    setattr(request.state, AUTH_PRINCIPAL_STATE_ATTR, principal)
+    return principal
+
+
+PrincipalDep = Annotated[Principal | None, Depends(get_request_principal)]
+
+
 def require_role(required: Role) -> Callable[..., Principal | None]:
     """Build a FastAPI dependency enforcing ``required`` (deny-by-default) when auth is enabled.
 
-    * Auth explicitly DISABLED (validator ``None`` — only under ``WP_AUTH_MODE=disabled``) → the
-      deliberate local-dev / CI / test path: the request is permitted and NO validated principal is
-      attached, so audit falls back to the header/``system`` actor. (A misconfigured deployment can
-      never reach this branch — the startup guard refuses to serve first.)
-    * Auth enabled → the bearer token is REQUIRED and cryptographically validated against the
-      tenant's public keys (401 on any validation failure — missing/expired/wrong-audience/wrong-
-      issuer/bad-signature/unknown-kid), and the principal must satisfy ``required`` (403 if not).
-      The validated principal is stashed on ``request.state`` so the endpoint's audit actor derives
-      from the validated ``oid`` (:func:`_request_actor`), never a spoofable header.
-
-    Fail-closed throughout: no valid token ⇒ 401; valid token but insufficient role ⇒ 403; a
-    mutating request can NEVER fall open to the ``system`` actor while auth is enabled. Error bodies
-    are fixed, non-sensitive strings — the token, claims, and PII are never leaked.
+    Delegates token validation to :func:`get_request_principal` (so the token is validated once per
+    request) and only authorizes: auth disabled ⇒ permit (``None`` principal); auth enabled ⇒ the
+    validated principal must satisfy ``required`` (403 otherwise). Fail-closed throughout: no valid
+    token ⇒ 401 (raised by :func:`get_request_principal`); valid token but insufficient role ⇒ 403;
+    a mutating request can NEVER fall open to the ``system`` actor while auth is enabled.
     """
 
-    def dependency(request: Request, validator: AuthValidatorDep) -> Principal | None:
-        if validator is None:
+    def dependency(principal: PrincipalDep) -> Principal | None:
+        if principal is None:
             return None
-        token = _extract_bearer_token(request.headers)
-        try:
-            principal = validator.validate(token)
-        except AuthError as exc:
-            # Reason/class only — never echo the token, claims, or PII into the response body.
-            raise HTTPException(status_code=401, detail="authentication failed") from exc
         if not principal.grants(required):
             raise HTTPException(status_code=403, detail="insufficient role")
-        setattr(request.state, AUTH_PRINCIPAL_STATE_ATTR, principal)
         return principal
 
     return dependency
@@ -278,6 +304,70 @@ def require_role(required: Role) -> Callable[..., Principal | None]:
 # Pre-built dependency handles (one per required role) so endpoints declare intent table-driven.
 ReaderDep = Annotated[Principal | None, Depends(require_role(Role.reader))]
 OperatorDep = Annotated[Principal | None, Depends(require_role(Role.operator))]
+
+
+# --------------------------------------------------------------------------------------
+# Tenant isolation (issue #65) — resolve ONE tenant per request and hand endpoints a
+# TENANT-SCOPED store. Customer-owned single-tenant is the DEFAULT (exactly one configured tenant);
+# an opt-in MSP overlay (Azure Lighthouse, ADR 0011) serves several client tenants from one
+# instance. Deny-by-default + fail-closed: a missing/ambiguous tenant is rejected (403), and every
+# state write/read is namespaced by the resolved tenant so no cross-tenant data can leak.
+# --------------------------------------------------------------------------------------
+_tenancy_config: TenancyConfig | None = None
+
+
+def get_tenancy_config() -> TenancyConfig:
+    """Return the process-wide tenancy config (keyless, from env). Cached after first build."""
+    global _tenancy_config
+    if _tenancy_config is None:
+        _tenancy_config = build_tenancy_config()
+    return _tenancy_config
+
+
+TenancyConfigDep = Annotated[TenancyConfig, Depends(get_tenancy_config)]
+
+
+def get_tenant_context(
+    principal: PrincipalDep, tenancy: TenancyConfigDep
+) -> TenantContext:
+    """Resolve the one tenant a request may act within — fail closed (issue #65).
+
+    The caller's tenant is taken from the VALIDATED principal's ``tid`` (``None`` on the no-auth
+    local/dev path, where the single-tenant default resolves it). Ambiguity — a token minted for a
+    different tenant (single mode), or a missing/off-allowlist tenant (multi overlay) — is denied
+    with a fail-closed 403 whose body is a fixed, PII-free reason (never the tenant id/claims).
+
+    NOTE (multi-overlay worker path — tracked follow-up #122, see ADR 0017 "Known limitation"): the
+    worker runs as the SHARED platform identity, so its validated ``tid`` is the DEPLOYMENT/host
+    tenant, not the client tenant whose workload it processed. Per-customer worker tenant context is
+    NOT yet propagated (needs ``src/cli/**`` + ``infra/**``, out of #65 scope). The current
+    guarantee is FAIL-CLOSED: because the host tenant is not on ``WP_ALLOWED_TENANTS`` by default, a
+    worker/host token resolving here in ``multi`` mode is rejected (``tenant_not_allowed`` /
+    ``tenant_required`` → 403) — it can NEVER silently write into a client tenant's partition.
+    """
+    claim_tenant_id = principal.tenant_id if principal is not None else None
+    try:
+        return resolve_tenant(claim_tenant_id=claim_tenant_id, config=tenancy)
+    except TenantResolutionError as exc:
+        raise HTTPException(
+            status_code=403, detail="tenant resolution failed (fail closed)"
+        ) from exc
+
+
+TenantContextDep = Annotated[TenantContext, Depends(get_tenant_context)]
+
+
+def get_scoped_store(store: StoreDep, tenant: TenantContextDep) -> StateStore:
+    """Return the single-writer store CONFINED to the request's resolved tenant (issue #65).
+
+    Wraps the process-wide store in a :class:`~api.app.tenant_state.TenantScopedState` that
+    namespaces every write and filters every read by the tenant partition key, so an endpoint using
+    this dependency can only ever touch its own tenant's state and read models — on either backend.
+    """
+    return TenantScopedState(store, tenant)
+
+
+ScopedStoreDep = Annotated[StateStore, Depends(get_scoped_store)]
 
 
 def _request_actor(request: Request) -> str:
@@ -809,7 +899,7 @@ def run_module_endpoint(
     name: str,
     req: RunRequest,
     request: Request,
-    store: StoreDep,
+    store: ScopedStoreDep,
     packs: PacksDep,
     clients: ClientsDep,
     metrics: MetricsDep,
@@ -921,7 +1011,7 @@ def submit_results(
     workload: str,
     result: ModuleRunResult,
     request: Request,
-    store: StoreDep,
+    store: ScopedStoreDep,
     audit: AuditDep,
     _principal: OperatorDep,
 ) -> ResultsResponse:
@@ -933,6 +1023,13 @@ def submit_results(
     central provenance gate (an un-provenanced finding fails closed with a 422 and NOTHING is
     written); on success a PII-free ``finding.emitted`` event is also recorded. Auditing never
     blocks the write.
+
+    Tenant attribution (issue #65): this endpoint uses the tenant-scoped store, so the write lands
+    in the resolved tenant's partition. The worker shares the platform identity, so under the
+    ``multi`` overlay its ``tid`` is the HOST tenant — worker-submitted state is not yet correctly
+    per-customer attributed (tracked follow-up #122; see ADR 0017 "Known limitation"). It stays
+    FAIL-CLOSED: a host/non-allowlisted worker token is rejected at ``get_tenant_context`` (403)
+    before reaching here, so it can never silently write into a client tenant's partition.
 
     Returns a bounded :class:`ResultsResponse` (issue #91) rather than a raw dict.
     """
@@ -994,7 +1091,7 @@ def put_estate(
     workload: str,
     nodes: list[ResourceNode],
     request: Request,
-    store: StoreDep,
+    store: ScopedStoreDep,
     audit: AuditDep,
     _principal: OperatorDep,
 ) -> EstateWriteResult:
@@ -1024,7 +1121,7 @@ def put_graph(
     workload: str,
     graph: WorkloadGraph,
     request: Request,
-    store: StoreDep,
+    store: ScopedStoreDep,
     audit: AuditDep,
     _principal: OperatorDep,
 ) -> GraphWriteResult:
@@ -1054,7 +1151,7 @@ def add_findings(
     workload: str,
     findings: list[Finding],
     request: Request,
-    store: StoreDep,
+    store: ScopedStoreDep,
     audit: AuditDep,
     _principal: OperatorDep,
 ) -> FindingsWriteResult:
@@ -1123,7 +1220,7 @@ class SnapshotResult(BaseModel):
 def snapshot(
     workload: str,
     request: Request,
-    store: StoreDep,
+    store: ScopedStoreDep,
     audit: AuditDep,
     _principal: OperatorDep,
 ) -> SnapshotResult:
@@ -1151,13 +1248,13 @@ def snapshot(
 # Read endpoints — read models the web console/API query (estate, graph, findings, drift).
 # --------------------------------------------------------------------------------------
 @app.get("/api/workloads")
-def list_workloads(store: StoreDep, _principal: ReaderDep) -> list[str]:
+def list_workloads(store: ScopedStoreDep, _principal: ReaderDep) -> list[str]:
     """List every workload the store knows about."""
     return store.list_workloads()
 
 
 @app.get("/api/workloads/{workload}/estate")
-def get_estate(workload: str, store: StoreDep, _principal: ReaderDep) -> list[ResourceNode]:
+def get_estate(workload: str, store: ScopedStoreDep, _principal: ReaderDep) -> list[ResourceNode]:
     """Return the latest estate for ``workload`` (empty list if none).
 
     Customer-controlled ``ResourceNode.tags`` are DEFAULT-REDACTED at this egress projection via
@@ -1185,7 +1282,7 @@ class GraphResponse(WorkloadGraph):
 
 
 @app.get("/api/workloads/{workload}/graph")
-def get_graph(workload: str, store: StoreDep, _principal: ReaderDep) -> GraphResponse:
+def get_graph(workload: str, store: ScopedStoreDep, _principal: ReaderDep) -> GraphResponse:
     """Return the latest dependency graph for ``workload`` + its revision (404 if none).
 
     Customer-controlled ``ResourceNode.tags`` on the graph nodes are DEFAULT-REDACTED at this egress
@@ -1228,7 +1325,7 @@ class ImpactResult(BaseModel):
 
 @app.get("/api/workloads/{workload}/impact")
 def get_impact(
-    workload: str, node: str, store: StoreDep, _principal: ReaderDep
+    workload: str, node: str, store: ScopedStoreDep, _principal: ReaderDep
 ) -> ImpactResult:
     """Return the canonical blast-radius impact of failing ``node`` in ``workload``'s graph.
 
@@ -1268,7 +1365,7 @@ def get_impact(
 
 @app.get("/api/workloads/{workload}/findings")
 def get_findings(
-    workload: str, store: StoreDep, _principal: ReaderDep, module: str | None = None
+    workload: str, store: ScopedStoreDep, _principal: ReaderDep, module: str | None = None
 ) -> list[Finding]:
     """Return current findings for ``workload``, optionally filtered to one ``module``."""
     return store.get_findings(workload, module)
@@ -1279,7 +1376,7 @@ def get_findings(
 # and must read prior state to compute drift/detections without ever holding a writable store.
 @app.get("/api/workloads/{workload}/previous-findings")
 def get_previous_findings(
-    workload: str, store: StoreDep, _principal: ReaderDep
+    workload: str, store: ScopedStoreDep, _principal: ReaderDep
 ) -> list[Finding]:
     """Return the findings captured by the most recent snapshot for ``workload`` (empty if none)."""
     return store.get_previous_findings(workload)
@@ -1287,14 +1384,14 @@ def get_previous_findings(
 
 @app.get("/api/workloads/{workload}/previous-node-ids")
 def get_previous_node_ids(
-    workload: str, store: StoreDep, _principal: ReaderDep
+    workload: str, store: ScopedStoreDep, _principal: ReaderDep
 ) -> list[str]:
     """Return the estate node ids captured by the most recent snapshot (empty if none)."""
     return store.get_previous_node_ids(workload)
 
 
 @app.get("/api/workloads/{workload}/drift")
-def get_drift(workload: str, store: StoreDep, _principal: ReaderDep) -> DriftReport:
+def get_drift(workload: str, store: ScopedStoreDep, _principal: ReaderDep) -> DriftReport:
     """Return drift (findings + estate node deltas) between the last snapshot and now."""
     return compute_drift(
         store.get_previous_findings(workload),

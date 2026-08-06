@@ -29,8 +29,11 @@ def test_valid_token_is_accepted_and_yields_non_pii_principal(factory: TokenFact
     principal = validator.validate(token)
     assert principal.oid == FAKE_OID
     assert principal.roles == frozenset({Role.operator})
-    # Non-PII by construction: the model only carries oid + roles (no name/email/upn field).
-    assert set(principal.model_dump().keys()) == {"oid", "roles"}
+    # A token without a `tid` claim yields a None tenant_id (resolved downstream — issue #65).
+    assert principal.tenant_id is None
+    # Non-PII by construction: the model only carries oid + roles + the non-PII tenant id
+    # (no name/email/upn field).
+    assert set(principal.model_dump().keys()) == {"oid", "roles", "tenant_id"}
 
 
 def test_expired_token_is_rejected(factory: TokenFactory) -> None:

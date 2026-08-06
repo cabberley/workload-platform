@@ -34,6 +34,9 @@ def _reset_auth_validator_cache() -> Iterator[None]:
         if module is not None:
             module._auth_validator = None
             module._auth_validator_built = False
+            # The tenancy config is memoised the same way (issue #65); reset it so a test that sets
+            # WP_TENANCY_MODE / WP_ALLOWED_TENANTS can never leak a built config into another test.
+            module._tenancy_config = None
 
     _clear()
     yield
