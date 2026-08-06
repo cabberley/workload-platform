@@ -11,10 +11,19 @@ Design properties (all guardrail-driven):
   * **PII-free by construction.** Events are built through :class:`~shared.contracts.AuditEvent`,
     whose validators reject emails/names/log-bodies/resource-paths — a PII-bearing event simply
     cannot be constructed, so nothing sensitive is ever persisted.
-  * **Never breaks the audited action.** :meth:`AuditEmitter.emit` never raises: a rejected event
-    (PII/validation) or a persistence error is logged with a **class-name-only** message and
-    dropped, so recording an action can never crash the action itself. The append-only store is
-    the durable guarantee; the emitter is the best-effort writer in front of it.
+  * **Fail-CLOSED for security-material actions (issue #99, ADR 0014).** For the consequential
+    state-mutating actions in :data:`FAIL_CLOSED_ACTIONS` (``run.executed`` / ``finding.emitted`` —
+    which also carry the estate/graph/snapshot replacements), a durable-append failure PROPAGATES
+    as :class:`AuditPersistenceError` so the audited mutation FAILS (the API returns 5xx) rather
+    than silently succeeding with no tamper-evident record — the ACCEPTED, compliance-first policy.
+    A **narrow, documented allowance** keeps genuinely non-material events (the ``pack.verify``
+    FAILURE breadcrumb, module toggles) best-effort/fail-OPEN: a lost breadcrumb there does not
+    correspond to an unrecorded successful mutation (the pack is already rejected fail-closed
+    regardless, and it is emitted mid-pack-load where raising would convert a safe rejection into a
+    crash). A rejected event (PII/validation) is still logged class-name-only and dropped.
+  * **Failure is observable.** Any durable-append failure (fail-open or fail-closed) increments the
+    PII-free :data:`METRIC_AUDIT_EMIT_FAILURES` counter on the injected process metrics registry, so
+    an audit-store outage is visible on ``/api/metrics`` and can drive health/alerting.
   * **Actor is a non-PII principal id.** :func:`resolve_actor` reads ONLY the object/principal id
     header and falls back to the ``system`` principal — it never reads a name/email header.
 """
@@ -39,6 +48,53 @@ SYSTEM_ACTOR = "system"
 # injected by Azure Easy Auth / the managed-identity front door. We deliberately never read the
 # ``*-principal-name`` header (an email/UPN — PII).
 PRINCIPAL_ID_HEADER = "x-ms-client-principal-id"
+
+# --------------------------------------------------------------------------------------
+# Fail-closed audit policy (issue #99, ADR 0014).
+# --------------------------------------------------------------------------------------
+# Metric name for a durable audit-append failure, surfaced on the process metrics registry so an
+# audit-store outage is visible on ``/api/metrics`` and can drive health/alerting. Low-cardinality:
+# the only label (:data:`AUDIT_ACTION_LABEL`) is the PII-free ``AuditAction`` value.
+METRIC_AUDIT_EMIT_FAILURES = "audit_emit_failures_total"
+AUDIT_ACTION_LABEL = "action"
+
+# Security-material actions whose durable audit record is REQUIRED: losing the record would mean a
+# consequential state mutation succeeded with NO durable, tamper-evident account of it. For these,
+# emission is FAIL-CLOSED — a durable-append failure propagates (as :class:`AuditPersistenceError`)
+# so the audited mutation fails/rolls back (the API returns 5xx) instead of silently succeeding
+# unrecorded. The state-mutating ``put_estate``/``put_graph``/``snapshot`` writes and the run/
+# findings writes are ALL recorded with these two actions (see ``api.app.main``), so they are all
+# fail-closed. Everything else (the ``pack.verify`` FAILURE breadcrumb, module toggles) is the
+# NARROW, documented allowance and stays best-effort/fail-open. This is the ACCEPTED, compliance-
+# first decision — see ``docs/adr/0014-fail-closed-audit-emission.md``.
+FAIL_CLOSED_ACTIONS: frozenset[AuditAction] = frozenset(
+    {AuditAction.run_executed, AuditAction.finding_emitted}
+)
+
+
+class AuditPersistenceError(RuntimeError):
+    """Raised when a FAIL-CLOSED audit event could not be durably persisted (issue #99).
+
+    Propagated out of :meth:`AuditEmitter.emit` for a security-material action (see
+    :data:`FAIL_CLOSED_ACTIONS`) so the audited mutation fails (the API surfaces 5xx) instead of
+    silently succeeding with no durable, tamper-evident record.
+    """
+
+
+@runtime_checkable
+class MetricsCounter(Protocol):
+    """The minimal counter surface the emitter needs to surface a failure signal.
+
+    Satisfied structurally by :class:`shared.observability.MetricsRegistry`, so the emitter never
+    imports the concrete registry (keeps ``shared.audit`` free of an observability dependency).
+    """
+
+    def increment(
+        self, name: str, *, labels: Mapping[str, str] | None = ..., amount: int = ...
+    ) -> None:
+        """Add to the counter identified by ``name`` + ``labels``."""
+        ...
+
 
 # --------------------------------------------------------------------------------------
 # Tamper-evident hash chaining (issue #59, MED-3).
@@ -134,14 +190,24 @@ def resolve_actor(headers: Mapping[str, str] | None) -> str:
 
 
 class AuditEmitter:
-    """Builds and persists :class:`~shared.contracts.AuditEvent` records. Never raises.
+    """Builds and persists :class:`~shared.contracts.AuditEvent` records.
 
     Construct with a durable ``sink`` (the API's single-writer ``StateStore``) or ``None`` (a
-    no-op emitter — used where no store is wired, so callers need no null checks).
+    no-op emitter — used where no store is wired, so callers need no null checks). Optionally pass a
+    ``metrics`` counter (the process :class:`shared.observability.MetricsRegistry`) so a durable-
+    append failure is surfaced as a health signal.
+
+    Emission is **fail-closed for security-material actions** (see :data:`FAIL_CLOSED_ACTIONS`): a
+    persistence failure on those actions raises :class:`AuditPersistenceError` so the audited
+    mutation fails rather than proceeding unrecorded. Non-material actions stay best-effort. A
+    rejected (PII/invalid) event is always logged class-name-only and dropped (never persisted).
     """
 
-    def __init__(self, sink: AuditSink | None) -> None:
+    def __init__(
+        self, sink: AuditSink | None, *, metrics: MetricsCounter | None = None
+    ) -> None:
         self._sink = sink
+        self._metrics = metrics
 
     def emit(
         self,
@@ -155,9 +221,12 @@ class AuditEmitter:
     ) -> AuditEvent | None:
         """Build a PII-free event and append it to the log. Returns the event, or ``None``.
 
-        Never raises: if the event is rejected by its validators (PII/invalid) or the append fails,
-        the emitter logs a class-name-only message and returns ``None``/the event respectively, so
-        the audited action is never disrupted by an audit failure.
+        Rejects (returns ``None``, persists nothing) an event whose fields fail the PII/validity
+        validators. On a durable-append failure the outcome depends on the action's materiality
+        (issue #99): for an action in :data:`FAIL_CLOSED_ACTIONS` the failure is surfaced as a
+        metric and re-raised as :class:`AuditPersistenceError` (fail-closed — the audited mutation
+        must fail); for any other action it is surfaced as a metric, logged, and swallowed (the
+        narrow best-effort allowance). Success returns the persisted event.
         """
         try:
             event = AuditEvent(
@@ -175,11 +244,31 @@ class AuditEmitter:
         if self._sink is not None:
             try:
                 self._sink.append_audit(event)
-            except Exception as exc:  # noqa: BLE001 - audit must never break the audited action
-                logger.error(
-                    "audit persistence failed action=%s result=%s error=%s",
-                    event.action.value,
-                    event.result.value,
-                    type(exc).__name__,
-                )
+            except Exception as exc:  # noqa: BLE001 - policy decided per action materiality below
+                self._on_persist_failure(event, exc)
         return event
+
+    def _on_persist_failure(self, event: AuditEvent, exc: Exception) -> None:
+        """Surface a durable-append failure as a metric, then fail-closed or swallow (issue #99).
+
+        Always increments :data:`METRIC_AUDIT_EMIT_FAILURES` (PII-free, action-labelled) on the
+        injected metrics registry so the outage is observable. For a security-material action
+        (:data:`FAIL_CLOSED_ACTIONS`) it then raises :class:`AuditPersistenceError` so the audited
+        mutation fails closed; otherwise it logs and returns (the audited action proceeds).
+        """
+        fail_closed = event.action in FAIL_CLOSED_ACTIONS
+        if self._metrics is not None:
+            self._metrics.increment(
+                METRIC_AUDIT_EMIT_FAILURES, labels={AUDIT_ACTION_LABEL: event.action.value}
+            )
+        logger.error(
+            "audit persistence failed action=%s result=%s error=%s fail_closed=%s",
+            event.action.value,
+            event.result.value,
+            type(exc).__name__,
+            fail_closed,
+        )
+        if fail_closed:
+            raise AuditPersistenceError(
+                f"durable audit append failed for security-material action {event.action.value}"
+            ) from exc

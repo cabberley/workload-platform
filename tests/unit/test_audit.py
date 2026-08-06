@@ -18,13 +18,18 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from api.app.main import app, get_store, registry
+from api.app.main import _workload_token as workload_token
+from api.app.main import app, get_metrics, get_store, registry
 from packs_engine.engine import PacksEngine, PackVerificationError, compute_sha256
 from shared.audit import (
+    AUDIT_ACTION_LABEL,
+    FAIL_CLOSED_ACTIONS,
     GENESIS_HASH,
+    METRIC_AUDIT_EMIT_FAILURES,
     PRINCIPAL_ID_HEADER,
     SYSTEM_ACTOR,
     AuditEmitter,
+    AuditPersistenceError,
     AuditSink,
     chain_event,
     compute_entry_hash,
@@ -35,16 +40,20 @@ from shared.contracts import (
     AuditAction,
     AuditEvent,
     AuditResult,
+    DependencyEdge,
     Finding,
     ModuleKind,
     ModuleManifest,
     ModuleRunResult,
+    ResourceNode,
     ScaleProfile,
     Severity,
     SourceReference,
+    WorkloadGraph,
     is_audit_safe,
 )
 from shared.module_base import Module, ModuleContext, run_module
+from shared.observability import MetricsRegistry
 from shared.provenance import (
     ProvenanceError,
     enforce_finding_provenance,
@@ -184,16 +193,54 @@ def test_emitter_none_sink_is_noop() -> None:
                         subject="discovery", result=AuditResult.success) is not None
 
 
-def test_emitter_never_breaks_the_action_on_persistence_error() -> None:
+def test_emitter_best_effort_for_non_material_action_on_persistence_error() -> None:
+    # A NON-material action (the pack.verify FAILURE breadcrumb) stays best-effort/fail-open: a
+    # persistence error is swallowed and the event is returned, so the audited action is not broken.
     class _BoomSink:
         def append_audit(self, event: AuditEvent) -> None:
             raise RuntimeError("storage down")
 
     emitter = AuditEmitter(_BoomSink())
-    # Must return the event (not raise), so the audited action is never disrupted.
-    event = emitter.emit(actor="p1", action=AuditAction.run_executed,
-                         subject="discovery", result=AuditResult.success)
-    assert event is not None
+    event = emitter.emit(actor="p1", action=AuditAction.pack_verify,
+                         subject="epic-rules", result=AuditResult.failure)
+    assert event is not None  # returned (not raised) — best-effort allowance
+
+
+@pytest.mark.parametrize("action", sorted(FAIL_CLOSED_ACTIONS, key=lambda a: a.value))
+def test_emitter_fails_closed_for_material_action_on_persistence_error(
+    action: AuditAction,
+) -> None:
+    # A security-material action (issue #99): a persistence failure PROPAGATES as
+    # AuditPersistenceError so the audited mutation fails closed instead of silently succeeding.
+    class _BoomSink:
+        def append_audit(self, event: AuditEvent) -> None:
+            raise RuntimeError("storage down")
+
+    emitter = AuditEmitter(_BoomSink())
+    with pytest.raises(AuditPersistenceError):
+        emitter.emit(actor="p1", action=action, subject="discovery", result=AuditResult.success)
+
+
+def test_emitter_surfaces_persistence_failure_metric() -> None:
+    # Both fail-open and fail-closed failures increment the PII-free audit_emit_failures counter on
+    # the injected metrics registry, so an audit-store outage is observable on /api/metrics (#99).
+    class _BoomSink:
+        def append_audit(self, event: AuditEvent) -> None:
+            raise RuntimeError("storage down")
+
+    reg = MetricsRegistry()
+    emitter = AuditEmitter(_BoomSink(), metrics=reg)
+    # Fail-open (non-material) still records the metric.
+    emitter.emit(actor="p1", action=AuditAction.pack_verify,
+                 subject="epic-rules", result=AuditResult.failure)
+    # Fail-closed (material) records the metric before raising.
+    with pytest.raises(AuditPersistenceError):
+        emitter.emit(actor="p1", action=AuditAction.run_executed,
+                     subject="discovery", result=AuditResult.success)
+    failures = [s for s in reg.snapshot().counters if s.name == METRIC_AUDIT_EMIT_FAILURES]
+    assert sum(s.value for s in failures) == 2
+    labels = {v for s in failures for k, v in s.labels.items() if k == AUDIT_ACTION_LABEL}
+    assert labels == {AuditAction.pack_verify.value, AuditAction.run_executed.value}
 
 
 def test_emitter_fails_closed_on_pii_input(store: LocalStateStore) -> None:
@@ -1369,4 +1416,206 @@ def test_results_endpoint_normal_module_still_emits_run_executed(audit_client) -
     assert len(executed) == 1
     assert executed[0].subject == "discovery"
     assert executed[0].result is AuditResult.success
+
+
+# --------------------------------------------------------------------------------------
+# #99 Part 1 — the state-mutating estate/graph/snapshot endpoints now emit a PII-free audit event
+# with a bounded, DERIVED subject built from the OPAQUE workload token (never the raw workload name
+# — PII-free by construction) plus a count / intent marker (never estate content).
+# --------------------------------------------------------------------------------------
+def _resource_nodes() -> list[ResourceNode]:
+    return [
+        ResourceNode(id="n1", name="web", type="Microsoft.Web/sites"),
+        ResourceNode(id="n2", name="db", type="Microsoft.Sql/servers"),
+    ]
+
+
+def _workload_graph() -> WorkloadGraph:
+    return WorkloadGraph(nodes=_resource_nodes(), edges=[DependencyEdge(source="n1", target="n2")])
+
+
+def test_estate_endpoint_emits_audit(audit_client) -> None:
+    client, store = audit_client
+    payload = [n.model_dump(mode="json") for n in _resource_nodes()]
+    resp = client.post(
+        "/api/workloads/epic/estate", json=payload, headers={PRINCIPAL_ID_HEADER: "obj-7"}
+    )
+    assert resp.status_code == 200
+    expected = f"{workload_token('epic')}#estate=2"
+    events = [e for e in store.list_audit() if e.subject == expected]
+    assert len(events) == 1
+    assert events[0].result is AuditResult.success
+    assert events[0].actor == "obj-7"
+    blob = events[0].model_dump_json().lower()
+    assert "/subscriptions/" not in blob and "@" not in blob  # PII-free
+    # The estate event is hash-chained into the append-only trail like every other event.
+    assert verify_audit_chain(store.list_audit(), head=store.audit_head()) is None
+
+
+def test_graph_endpoint_emits_audit(audit_client) -> None:
+    client, store = audit_client
+    resp = client.post("/api/workloads/epic/graph", json=_workload_graph().model_dump(mode="json"))
+    assert resp.status_code == 200
+    expected = f"{workload_token('epic')}#graph=nodes=2,edges=1"
+    events = [e for e in store.list_audit() if e.subject == expected]
+    assert len(events) == 1
+    assert events[0].result is AuditResult.success
+
+
+def test_snapshot_endpoint_emits_audit(audit_client) -> None:
+    client, store = audit_client
+    resp = client.post("/api/workloads/epic/snapshot")
+    assert resp.status_code == 200
+    # The durable subject is the bounded, PII-free INTENT marker (opaque token + ``#snapshot``):
+    # the store-generated id (which embeds the raw workload name) is NOT put in the subject.
+    expected = f"{workload_token('epic')}#snapshot"
+    events = [e for e in store.list_audit() if e.subject == expected]
+    assert len(events) == 1
+    assert events[0].result is AuditResult.success
+    assert resp.json()["snapshotId"].startswith("snap::epic::")  # id still returned to the caller
+
+
+def test_empty_findings_submission_emits_count_zero_before_write(audit_client) -> None:
+    # MEDIUM-1 (#99 R2): even an EMPTY findings submission is audited (audit-before-write), because
+    # add_findings([]) still mutates durable state (manifest/version). Exactly one finding.emitted
+    # with `#count=0` is recorded, and it precedes the (successful) write.
+    client, store = audit_client
+    resp = client.post("/api/workloads/epic/findings", json=[])
+    assert resp.status_code == 200
+    expected = "epic#count=0"
+    events = [e for e in store.list_audit() if e.subject == expected]
+    assert len(events) == 1
+    assert events[0].result is AuditResult.success
+
+
+def test_state_mutation_subject_is_pii_free_by_construction(audit_client) -> None:
+    # A PII-looking workload name (is_audit_safe admits it — see the reviewer's John.Doe case) is
+    # accepted, but its raw value NEVER reaches the durable audit subject: the subject is the opaque
+    # one-way workload token, so no PII (or unbounded text) can be persisted regardless of the name.
+    client, store = audit_client
+    pii = "John.Doe"
+    resp = client.post("/api/workloads/John.Doe/estate", json=[])
+    assert resp.status_code == 200
+    subjects = [e.subject for e in store.list_audit()]
+    assert subjects == [f"{workload_token(pii)}#estate=0"]
+    assert pii not in subjects[0]  # the raw PII-looking name is not embedded
+    assert subjects[0].startswith("wl:")  # opaque digest token
+
+
+# --------------------------------------------------------------------------------------
+# #99 Part 2 — fail-CLOSED, audit-BEFORE-write at the API boundary: when the durable audit append
+# fails, the state-mutating request FAILS (5xx) and the mutation is NEVER performed (no committed-
+# but-unaudited state), and the failure is surfaced on the process metrics registry.
+# --------------------------------------------------------------------------------------
+class _AuditFailingStore(LocalStateStore):
+    """A store whose audit append always fails, and which records any state mutation invoked (#99).
+
+    ``mutations`` proves audit-BEFORE-write: because the endpoints emit the audit record as a
+    precondition, a durable-append failure must raise BEFORE any ``put_estate``/``put_graph``/
+    ``add_findings``/``snapshot``/``commit_run`` is invoked, so ``mutations`` stays empty and the
+    underlying state is unchanged.
+    """
+
+    def __init__(self, root: str) -> None:
+        super().__init__(root)
+        self.mutations: list[str] = []
+
+    def append_audit(self, event: AuditEvent) -> None:
+        raise RuntimeError("audit store down")
+
+    def put_estate(self, workload: str, nodes: list[ResourceNode]) -> None:
+        self.mutations.append("put_estate")
+        super().put_estate(workload, nodes)
+
+    def put_graph(self, workload: str, graph: WorkloadGraph) -> None:
+        self.mutations.append("put_graph")
+        super().put_graph(workload, graph)
+
+    def add_findings(self, workload: str, findings: list[Finding]) -> None:
+        self.mutations.append("add_findings")
+        super().add_findings(workload, findings)
+
+    def snapshot(self, workload: str) -> str:
+        self.mutations.append("snapshot")
+        return super().snapshot(workload)
+
+    def commit_run(self, workload: str, result: ModuleRunResult) -> dict[str, int]:
+        self.mutations.append("commit_run")
+        return super().commit_run(workload, result)
+
+
+@pytest.fixture()
+def failclosed_client(tmp_path):
+    isolated = _AuditFailingStore(str(tmp_path))
+    reg = MetricsRegistry()
+    app.dependency_overrides[get_store] = lambda: isolated
+    app.dependency_overrides[get_metrics] = lambda: reg
+    # raise_server_exceptions=False so the propagated AuditPersistenceError surfaces as a 500
+    # response (the real ASGI behaviour) rather than being re-raised into the test.
+    with TestClient(app, raise_server_exceptions=False) as client:
+        yield client, isolated, reg
+    app.dependency_overrides.clear()
+
+
+def test_estate_endpoint_fails_closed_when_audit_append_fails(failclosed_client) -> None:
+    client, store, reg = failclosed_client
+    payload = [n.model_dump(mode="json") for n in _resource_nodes()]
+    resp = client.post("/api/workloads/epic/estate", json=payload)
+    assert resp.status_code == 500  # fail-closed: a durable audit append failure surfaces as 5xx
+    # audit-BEFORE-write: the mutation was NEVER invoked, so no committed-but-unaudited estate.
+    assert store.mutations == []
+    assert store.get_estate("epic") == []
+    failures = [s for s in reg.snapshot().counters if s.name == METRIC_AUDIT_EMIT_FAILURES]
+    assert sum(s.value for s in failures) == 1  # the outage is observable on /api/metrics
+
+
+def test_graph_endpoint_fails_closed_when_audit_append_fails(failclosed_client) -> None:
+    client, store, _reg = failclosed_client
+    resp = client.post("/api/workloads/epic/graph", json=_workload_graph().model_dump(mode="json"))
+    assert resp.status_code == 500
+    assert store.mutations == []  # graph never replaced
+    assert store.get_graph("epic") is None
+
+
+def test_snapshot_endpoint_fails_closed_when_audit_append_fails(failclosed_client) -> None:
+    client, store, _reg = failclosed_client
+    resp = client.post("/api/workloads/epic/snapshot")
+    assert resp.status_code == 500
+    assert store.mutations == []  # no snapshot frozen
+
+
+def test_findings_endpoint_fails_closed_when_audit_append_fails(failclosed_client) -> None:
+    # The finding.emitted path is fail-closed AND audit-before-write (#99): a durable audit outage
+    # blocks the findings write entirely (no committed-but-unaudited findings).
+    client, store, _reg = failclosed_client
+    resp = client.post(
+        "/api/workloads/epic/findings",
+        json=[_finding_with_evidence("f1").model_dump(mode="json")],
+    )
+    assert resp.status_code == 500
+    assert store.mutations == []  # the write was never invoked
+    assert store.get_findings("epic") == []
+
+
+def test_empty_findings_submission_fails_closed_when_audit_append_fails(failclosed_client) -> None:
+    # MEDIUM-1 (#99 R2): store.add_findings(workload, []) is NOT a durable no-op — the Azure store
+    # creates the workload manifest and advances its version even for an empty list. So the EMPTY
+    # case must be audit-before-write too: under a failing audit sink an empty submission must 5xx
+    # and NEVER invoke the (manifest/version-advancing) write.
+    client, store, _reg = failclosed_client
+    resp = client.post("/api/workloads/epic/findings", json=[])
+    assert resp.status_code == 500
+    assert store.mutations == []  # add_findings([]) was never invoked — no manifest / version bump
+    assert store.get_findings("epic") == []
+
+
+def test_results_endpoint_fails_closed_when_audit_append_fails(failclosed_client) -> None:
+    # The /results commit path (run.executed + finding.emitted) is likewise audit-before-write: an
+    # audit outage blocks the commit (nothing persisted).
+    client, store, _reg = failclosed_client
+    result = ModuleRunResult(module="discovery", ok=True, findings=[_finding_with_evidence("f1")])
+    resp = client.post("/api/workloads/epic/results", json=result.model_dump(mode="json"))
+    assert resp.status_code == 500
+    assert store.mutations == []
+    assert store.get_findings("epic") == []
 
