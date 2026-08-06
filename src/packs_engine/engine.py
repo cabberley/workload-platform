@@ -59,11 +59,30 @@ def verify(manifest: PackManifest, content: bytes, secret: bytes | None) -> None
 
 
 class Pack:
-    """A loaded, parsed pack: manifest + body."""
+    """A loaded, parsed pack: manifest + body.
 
-    def __init__(self, manifest: PackManifest, body: dict[str, Any]) -> None:
+    ``source`` is the raw pack dict the pack was parsed from (``{"manifest": ..., "body": ...}``),
+    retained so a consumer can recompute the pack's *version-identity* digest with
+    :func:`packs_engine.canonical.canonical_digest` — the SAME canonicalizer the registry hashes
+    with at import. Issue #37's assigned-pack resolution uses it to bind an assignment to the
+    registry's VERIFIED digest (run a content-root pack under an assigned ref ONLY if its canonical
+    digest matches the registry entry). It defaults to a manifest+body reconstruction so callers
+    that build a ``Pack`` directly still expose a canonical source.
+    """
+
+    def __init__(
+        self,
+        manifest: PackManifest,
+        body: dict[str, Any],
+        *,
+        source: dict[str, Any] | None = None,
+    ) -> None:
         self.manifest = manifest
         self.body = body
+        self.source = source if source is not None else {
+            "manifest": manifest.model_dump(mode="json"),
+            "body": body,
+        }
 
 
 class PacksEngine:
@@ -111,7 +130,7 @@ class PacksEngine:
             # injected, so no-verifier callers keep today's behavior unchanged. Fail closed.
             if self._verifier is not None:
                 self._verify_detached(manifest, raw, self._verifier)
-            packs.append(Pack(manifest=manifest, body=raw.get("body", {})))
+            packs.append(Pack(manifest=manifest, body=raw.get("body", {}), source=raw))
         return packs
 
     @staticmethod

@@ -160,3 +160,133 @@ def test_reassessment_reports_recovery_only_on_genuinely_empty_current():
 def test_state_unavailable_error_is_not_swallowed_as_readable_state():
     # Sanity: the fake satisfies the read Protocol (all six methods present).
     assert isinstance(_PrevFailingState(current=[]), ReadableState)
+
+
+# --------------------------------------------------------------------------------------
+# FIX 3 (issue #37) — the worker's pack-assignment fetch is FAIL-CLOSED. A SUCCESSFUL read
+# (200 + a well-formed JSON list) is authoritative — an empty list means "genuinely unassigned"
+# and the run proceeds (resolver falls back to latest per id). A FAILURE (transport error,
+# non-2xx, or a malformed/wrong-shape body) must NOT be read as "unassigned": the worker fails
+# closed (exits non-zero) rather than silently running fallback packs of an unintended version.
+# --------------------------------------------------------------------------------------
+def _wire_worker(monkeypatch, get_handler):
+    """Patch the worker's boundary deps and its HTTP GET/POST, recording whether a module ran."""
+    import cli.worker as worker
+
+    calls: dict[str, object] = {"run": 0, "post": 0}
+
+    class _FakeReader:
+        def __init__(self, *, base_url: str | None = None, **_kw: object) -> None:
+            pass
+
+    def _fake_run_module(module, *, scope=None, state=None, packs=None, clients=None):
+        from shared.contracts import ModuleRunResult
+
+        calls["run"] = int(calls["run"]) + 1  # type: ignore[arg-type]
+        return ModuleRunResult(module=module.name, ok=True)
+
+    def _fake_post(url, *, json=None, timeout=None):
+        calls["post"] = int(calls["post"]) + 1  # type: ignore[arg-type]
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setenv("WP_API_BASE_URL", "http://api")
+    monkeypatch.setattr(worker, "ApiStateReader", _FakeReader)
+    monkeypatch.setattr(worker, "build_packs_engine", lambda: object())
+    monkeypatch.setattr(worker, "build_client_registry", lambda: {})
+    monkeypatch.setattr(worker, "run_module", _fake_run_module)
+    monkeypatch.setattr(httpx, "get", get_handler)
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    return worker, calls
+
+
+def test_worker_proceeds_when_assignments_200_empty(monkeypatch):
+    # 200 + [] ⇒ genuinely unassigned ⇒ the run proceeds (resolver falls back to latest per id).
+    worker, calls = _wire_worker(
+        monkeypatch,
+        lambda url, timeout=None: httpx.Response(200, json=[], request=httpx.Request("GET", url)),
+    )
+    rc = worker.main(["--module", "quality_checks", "--scope", "workload=epic"])
+    assert rc == 0
+    assert calls["run"] == 1  # the module ran normally
+    assert calls["post"] == 1  # and its result was posted back
+
+
+def test_worker_fails_closed_on_connection_error(monkeypatch):
+    def _boom(url, timeout=None):
+        raise httpx.ConnectError("connection refused")
+
+    worker, calls = _wire_worker(monkeypatch, _boom)
+    rc = worker.main(["--module", "quality_checks", "--scope", "workload=epic"])
+    assert rc != 0  # non-zero ⇒ the ACA Job surfaces the failure for retry
+    assert calls["run"] == 0  # fail closed: NO fallback packs ran
+    assert calls["post"] == 0
+
+
+def test_worker_fails_closed_on_non_2xx(monkeypatch):
+    worker, calls = _wire_worker(
+        monkeypatch,
+        lambda url, timeout=None: httpx.Response(503, request=httpx.Request("GET", url)),
+    )
+    rc = worker.main(["--module", "quality_checks", "--scope", "workload=epic"])
+    assert rc != 0
+    assert calls["run"] == 0
+    assert calls["post"] == 0
+
+
+def test_worker_fails_closed_on_malformed_body(monkeypatch):
+    # 200 but the body is not a list of assignment rows ⇒ malformed ⇒ fail closed.
+    worker, calls = _wire_worker(
+        monkeypatch,
+        lambda url, timeout=None: httpx.Response(
+            200, json={"not": "a list"}, request=httpx.Request("GET", url)
+        ),
+    )
+    rc = worker.main(["--module", "quality_checks", "--scope", "workload=epic"])
+    assert rc != 0
+    assert calls["run"] == 0
+    assert calls["post"] == 0
+
+
+def test_worker_proceeds_on_valid_assignment_list(monkeypatch):
+    # A well-formed 200 list of valid rows ⇒ the run proceeds (resolution happens, module runs).
+    rows = [{"packId": "waf-reliability-baseline", "version": "1.0.0"}]
+    worker, calls = _wire_worker(
+        monkeypatch,
+        lambda url, timeout=None: httpx.Response(200, json=rows, request=httpx.Request("GET", url)),
+    )
+    rc = worker.main(["--module", "quality_checks", "--scope", "workload=epic"])
+    assert rc == 0
+    assert calls["run"] == 1
+    assert calls["post"] == 1
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param([{"packId": None, "version": "1.0.0"}], id="null-packId"),
+        pytest.param([{"packId": "waf", "version": None}], id="null-version"),
+        pytest.param([{"packId": ["a"], "version": "1.0.0"}], id="list-valued-packId"),
+        pytest.param([{"packId": "waf", "version": {"v": 1}}], id="dict-valued-version"),
+        pytest.param([{"packId": "", "version": "1.0.0"}], id="empty-packId"),
+        pytest.param([{"packId": "waf", "version": ""}], id="empty-version"),
+        pytest.param([{"packId": "waf", "version": "banana"}], id="non-semver-version"),
+        pytest.param(
+            [
+                {"packId": "waf", "version": "1.0.0"},
+                {"packId": "waf", "version": "2.0.0"},
+            ],
+            id="duplicate-packId",
+        ),
+    ],
+)
+def test_worker_fails_closed_on_invalid_assignment_rows(monkeypatch, rows):
+    # Strict row-value validation: null/empty/container/non-semver/duplicate values must FAIL the
+    # worker closed (non-zero) and NEVER coerce into a silently-pinned reference — no module runs.
+    worker, calls = _wire_worker(
+        monkeypatch,
+        lambda url, timeout=None: httpx.Response(200, json=rows, request=httpx.Request("GET", url)),
+    )
+    rc = worker.main(["--module", "quality_checks", "--scope", "workload=epic"])
+    assert rc != 0
+    assert calls["run"] == 0
+    assert calls["post"] == 0

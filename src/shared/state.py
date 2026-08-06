@@ -35,6 +35,7 @@ from shared.contracts import (
     DriftReport,
     Finding,
     ModuleRunResult,
+    PackAssignment,
     ResourceNode,
     WorkloadGraph,
 )
@@ -138,6 +139,22 @@ class StateStore(ReadableState, Protocol):
         """Freeze the current findings into a point-in-time snapshot; return its id."""
         ...
 
+    def put_pack_assignment(self, assignment: PackAssignment) -> None:
+        """Put/replace the pack-version assignment for ``(workload, packId)`` (single writer).
+
+        One active version per ``packId`` per ``workload``: re-assigning replaces the prior
+        version. ``assignedBy``/``assignedAt`` are persisted verbatim for provenance.
+        """
+        ...
+
+    def get_pack_assignments(self, workload: str) -> list[PackAssignment]:
+        """Return every pack-version assignment for ``workload`` (empty if none)."""
+        ...
+
+    def list_pack_assignments(self) -> list[PackAssignment]:
+        """Return every pack-version assignment across all workloads (MS + customer visibility)."""
+        ...
+
 
 # --------------------------------------------------------------------------------------
 # Read-only view — the object handed to modules.
@@ -238,6 +255,10 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS snapshots ("
     " seq INTEGER PRIMARY KEY AUTOINCREMENT, workload TEXT NOT NULL,"
     " data TEXT NOT NULL, created_at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS pack_assignments ("
+    " workload TEXT NOT NULL, pack_id TEXT NOT NULL, version TEXT NOT NULL,"
+    " assigned_by TEXT NOT NULL, assigned_at TEXT NOT NULL,"
+    " PRIMARY KEY (workload, pack_id))",
 )
 
 
@@ -459,6 +480,53 @@ class LocalStateStore:
             seq = int(cursor.lastrowid or 0)
         return f"snap::{workload}::{seq:06d}"
 
+    # -- pack assignments (issue #37): single-writer put/replace + read models --------------
+    @staticmethod
+    def _row_to_assignment(row: sqlite3.Row) -> PackAssignment:
+        return PackAssignment(
+            workload=row["workload"],
+            packId=row["pack_id"],
+            version=row["version"],
+            assignedBy=row["assigned_by"],
+            assignedAt=datetime.fromisoformat(row["assigned_at"]),
+        )
+
+    def put_pack_assignment(self, assignment: PackAssignment) -> None:
+        """Replace the ``(workload, packId)`` assignment in one transaction (single writer)."""
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO pack_assignments"
+                " (workload, pack_id, version, assigned_by, assigned_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(workload, pack_id) DO UPDATE SET"
+                " version = excluded.version, assigned_by = excluded.assigned_by,"
+                " assigned_at = excluded.assigned_at",
+                (
+                    assignment.workload,
+                    assignment.packId,
+                    assignment.version,
+                    assignment.assignedBy,
+                    assignment.assignedAt.isoformat(),
+                ),
+            )
+
+    def get_pack_assignments(self, workload: str) -> list[PackAssignment]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT workload, pack_id, version, assigned_by, assigned_at"
+                " FROM pack_assignments WHERE workload = ? ORDER BY pack_id",
+                (workload,),
+            ).fetchall()
+        return [self._row_to_assignment(row) for row in rows]
+
+    def list_pack_assignments(self) -> list[PackAssignment]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT workload, pack_id, version, assigned_by, assigned_at"
+                " FROM pack_assignments ORDER BY workload, pack_id"
+            ).fetchall()
+        return [self._row_to_assignment(row) for row in rows]
+
 
 # --------------------------------------------------------------------------------------
 # Azure backend — same Protocol, azure SDK imports guarded (so ``import shared.state`` never needs
@@ -469,6 +537,7 @@ class LocalStateStore:
 # --------------------------------------------------------------------------------------
 _AZ_SNAPSHOTS_TABLE = "snapshots"
 _AZ_INDEX_TABLE = "workloads"
+_AZ_ASSIGNMENTS_TABLE = "packassignments"
 _AZ_INDEX_PARTITION = "_index"
 _MAX_COMMIT_RETRIES = 8
 
@@ -520,7 +589,7 @@ class AzureStateStore:
         container_name = os.environ.get("WORKLOADS_STATE_CONTAINER", "state")
 
         table_service = TableServiceClient(endpoint=table_endpoint, credential=credential)
-        for table in (_AZ_SNAPSHOTS_TABLE, _AZ_INDEX_TABLE):
+        for table in (_AZ_SNAPSHOTS_TABLE, _AZ_INDEX_TABLE, _AZ_ASSIGNMENTS_TABLE):
             table_service.create_table_if_not_exists(table)
 
         blob_service = BlobServiceClient(account_url=blob_endpoint, credential=credential)
@@ -816,6 +885,46 @@ class AzureStateStore:
                 mode="merge",
             )
             return snapshot_id
+
+    # -- pack assignments (issue #37): single-writer put/replace + read models --------------
+    @staticmethod
+    def _entity_to_assignment(entity: dict[str, Any]) -> PackAssignment:
+        return PackAssignment(
+            workload=str(entity["workload"]),
+            packId=str(entity["pack_id"]),
+            version=str(entity["version"]),
+            assignedBy=str(entity["assigned_by"]),
+            assignedAt=datetime.fromisoformat(str(entity["assigned_at"])),
+        )
+
+    def put_pack_assignment(self, assignment: PackAssignment) -> None:
+        """Upsert the assignment as ONE entity keyed by ``(workload, packId)`` (single writer).
+
+        The entity write is atomic, so the assignment either fully replaces the prior version or
+        leaves it untouched; there is no partial state. Keys are hex-encoded (injection-proof).
+        """
+        entity = {
+            "PartitionKey": encode_storage_key(assignment.workload),
+            "RowKey": encode_storage_key(assignment.packId),
+            "workload": assignment.workload,
+            "pack_id": assignment.packId,
+            "version": assignment.version,
+            "assigned_by": assignment.assignedBy,
+            "assigned_at": assignment.assignedAt.isoformat(),
+        }
+        self._table(_AZ_ASSIGNMENTS_TABLE).upsert_entity(entity, mode="replace")
+
+    def get_pack_assignments(self, workload: str) -> list[PackAssignment]:
+        entities = self._table(_AZ_ASSIGNMENTS_TABLE).query_entities(
+            "PartitionKey eq @pk", parameters={"pk": encode_storage_key(workload)}
+        )
+        assignments = [self._entity_to_assignment(dict(entity)) for entity in entities]
+        return sorted(assignments, key=lambda a: a.packId)
+
+    def list_pack_assignments(self) -> list[PackAssignment]:
+        entities = self._table(_AZ_ASSIGNMENTS_TABLE).list_entities()
+        assignments = [self._entity_to_assignment(dict(entity)) for entity in entities]
+        return sorted(assignments, key=lambda a: (a.workload, a.packId))
 
 
 # --------------------------------------------------------------------------------------

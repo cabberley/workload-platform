@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
-import { fetchModules, fetchWorkloads } from "./api/client";
-import type { ModuleManifest } from "./api/types";
+import { fetchModules, fetchPackAssignments, fetchWorkloads } from "./api/client";
+import type { ModuleManifest, PackAssignment } from "./api/types";
 import { useAsync } from "./hooks/useAsync";
 import { WorkloadSelector } from "./panels/WorkloadSelector";
 import { WorkloadView } from "./panels/WorkloadView";
 import { ModulesTable } from "./panels/ModulesTable";
+import { PackAssignmentsTable } from "./panels/PackAssignmentsTable";
 import { GrafanaPanel } from "./panels/GrafanaPanel";
-import { card } from "./styles";
+import { card, muted } from "./styles";
 
 /**
  * In-boundary console. Reads the API read models only (no state writes from the SPA):
@@ -21,10 +22,19 @@ export function App() {
   const [modules, setModules] = useState<ModuleManifest[]>([]);
   const [modulesError, setModulesError] = useState<string | null>(null);
 
+  const [assignments, setAssignments] = useState<PackAssignment[]>([]);
+  const [assignmentsError, setAssignmentsError] = useState<string | null>(null);
+
   useEffect(() => {
     fetchModules()
       .then(setModules)
       .catch((e: unknown) => setModulesError(e instanceof Error ? e.message : String(e)));
+  }, []);
+
+  useEffect(() => {
+    fetchPackAssignments()
+      .then(setAssignments)
+      .catch((e: unknown) => setAssignmentsError(e instanceof Error ? e.message : String(e)));
   }, []);
 
   // Default to the first workload once the list arrives.
@@ -68,6 +78,18 @@ export function App() {
           <h2 style={{ marginTop: 0, fontSize: 18 }}>Platform modules</h2>
           {modulesError && <p style={{ color: "crimson" }}>API unavailable: {modulesError}</p>}
           <ModulesTable modules={modules} />
+        </section>
+
+        <section style={card}>
+          <h2 style={{ marginTop: 0, fontSize: 18 }}>Pack assignments</h2>
+          <p style={{ ...muted, marginTop: 0 }}>
+            Which pack version each workload is pinned to. Read-only — assignments are made via the
+            API.
+          </p>
+          {assignmentsError && (
+            <p style={{ color: "crimson" }}>API unavailable: {assignmentsError}</p>
+          )}
+          <PackAssignmentsTable assignments={assignments} />
         </section>
       </div>
     </main>

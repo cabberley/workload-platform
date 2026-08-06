@@ -7,20 +7,35 @@ low replica counts while the compute-heavy modules scale freely.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
+from packs_engine.registry import (
+    DEFAULT_INDEX_PATH,
+    ImmutableVersionError,
+    InvalidVersionError,
+    PackRef,
+    PackRegistry,
+    RegistryError,
+)
 from shared.contracts import (
     DriftReport,
     Finding,
     ModuleRunResult,
+    PackAssignment,
+    PackSignature,
     ResourceNode,
     WorkloadGraph,
 )
 from shared.module_base import build_default_registry, run_module
+from shared.signing import Ed25519Verifier, Verifier, verify_pack
 from shared.state import (
     ReadOnlyState,
     StateStore,
@@ -86,6 +101,55 @@ PacksDep = Annotated[object | None, Depends(get_packs)]
 ClientsDep = Annotated[Mapping[str, object], Depends(get_clients)]
 
 
+# The pack registry (issue #34) is the immutable, content-addressed index that `import` publishes
+# verified versions into. Built once per process from the on-disk index path (overridable via
+# `WP_REGISTRY_INDEX` so a deployment can relocate it); tests override `get_pack_registry` with an
+# isolated tmp-path registry via `app.dependency_overrides`.
+_pack_registry: PackRegistry | None = None
+
+# Env var *name* only — the value (a base64 raw Ed25519 public key) is supplied at runtime by
+# identity / Key Vault, never embedded here (keyless).
+ENV_PACK_PUBLIC_KEY = "WP_PACK_PUBLIC_KEY"
+ENV_REGISTRY_INDEX = "WP_REGISTRY_INDEX"
+
+
+def get_pack_registry() -> PackRegistry:
+    """Return the process-wide pack registry (import's publish target). Cached after first build."""
+    global _pack_registry
+    if _pack_registry is None:
+        index_path = os.environ.get(ENV_REGISTRY_INDEX)
+        _pack_registry = PackRegistry(Path(index_path) if index_path else DEFAULT_INDEX_PATH)
+    return _pack_registry
+
+
+def get_pack_verifier() -> Verifier | None:
+    """Build the detached-signature trust root from ``WP_PACK_PUBLIC_KEY`` (base64 raw Ed25519).
+
+    Mirrors ``scripts/validate_packs.py``'s trust-root pattern: no private key is ever read — only
+    a public trust root, and only when explicitly configured. Returns ``None`` when unconfigured;
+    the ``import`` endpoint then fails **closed** (a present signature that cannot be verified is
+    rejected), never open. Tests inject an ``Ed25519Verifier`` via ``app.dependency_overrides``.
+
+    TODO(human): point ``WP_PACK_PUBLIC_KEY`` at the real Azure Key Vault public trust root (export
+    the KV signing key's public bytes to the API by identity — same follow-up as issue #35), so the
+    core verifies imports against the same key the release pipeline signs with. Until then a signed
+    bundle cannot be verified and — per fail-closed — imports are rejected.
+    """
+    b64 = os.environ.get(ENV_PACK_PUBLIC_KEY)
+    if not b64:
+        return None
+    try:
+        return Ed25519Verifier.from_public_bytes(base64.b64decode(b64, validate=True))
+    except (binascii.Error, ValueError):
+        # A malformed trust root is treated as *no* trust root (fail closed): a present signature
+        # can then never be verified, so imports are rejected rather than silently trusted.
+        return None
+
+
+PackRegistryDep = Annotated[PackRegistry, Depends(get_pack_registry)]
+VerifierDep = Annotated[Verifier | None, Depends(get_pack_verifier)]
+
+
 @app.get("/api/health")
 def health() -> dict[str, object]:
     """Liveness + per-module health. Used by CI smoke and platform probes."""
@@ -108,7 +172,8 @@ class RunRequest(BaseModel):
 
 @app.post("/api/modules/{name}/run")
 def run_module_endpoint(
-    name: str, req: RunRequest, store: StoreDep, packs: PacksDep, clients: ClientsDep
+    name: str, req: RunRequest, store: StoreDep, packs: PacksDep, clients: ClientsDep,
+    packs_registry: PackRegistryDep,
 ) -> ModuleRunResult:
     """Run a single module by name (also how the ACA Job worker's compute is exercised in-process).
 
@@ -124,10 +189,23 @@ def run_module_endpoint(
         module = registry.get(name)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    result = run_module(
-        module, scope=req.scope, state=ReadOnlyState(store), packs=packs, clients=clients
-    )
     workload = req.scope.get("workload")
+    # Resolve the packs view the module sees to a SINGLE deterministic version per pack id (#37).
+    # The resolver is applied to EVERY run — workload-scoped or not — so no run can execute multiple
+    # versions of one id. With a workload, each id carrying an assignment runs EXACTLY that version
+    # and only if the content pack's canonical digest matches the registry's VERIFIED digest (bytes
+    # bound to signature-verified content); an id with no assignment (or a workload-less run)
+    # resolves to the highest valid semver — a single version, never every one. So a run never
+    # fails merely because nothing is assigned (documented fallback in `cli.wiring`).
+    from cli.wiring import resolve_packs_for_workload
+
+    assigned_versions = (
+        {a.packId: a.version for a in store.get_pack_assignments(workload)} if workload else {}
+    )
+    resolved_packs = resolve_packs_for_workload(packs, assigned_versions, packs_registry)
+    result = run_module(
+        module, scope=req.scope, state=ReadOnlyState(store), packs=resolved_packs, clients=clients
+    )
     if workload:
         store.commit_run(workload, result)  # API is the single writer
     return result
@@ -171,6 +249,128 @@ def add_findings(workload: str, findings: list[Finding], store: StoreDep) -> dic
 def snapshot(workload: str, store: StoreDep) -> dict[str, str]:
     """Freeze the current findings into a point-in-time snapshot; return its id."""
     return {"snapshotId": store.snapshot(workload)}
+
+
+# --------------------------------------------------------------------------------------
+# Pack lifecycle (issue #37) — the CUSTOMER side. Import a signed bundle (verify fail-closed,
+# then register the version) and assign a pack version per workload. Writes go ONLY through the
+# API core (single writer); the SPA never mutates. Assignment reads give MS + customer visibility.
+# --------------------------------------------------------------------------------------
+class PackImportRequest(BaseModel):
+    """A signed pack bundle to import: the pack itself plus its detached signature envelope.
+
+    ``signature`` is optional in the wire shape ONLY so an unsigned bundle is rejected with an
+    explicit fail-closed 400 (rather than a 422 schema error) — it is never optional in effect.
+    """
+
+    pack: dict[str, object]
+    signature: PackSignature | None = None
+
+
+@app.post("/api/packs/import")
+def import_pack(
+    req: PackImportRequest, packs_registry: PackRegistryDep, verifier: VerifierDep
+) -> dict[str, object]:
+    """Verify a signed bundle's detached signature (fail-closed), then publish the version.
+
+    Fail-closed at every step — a bundle is registered ONLY if its signature cryptographically
+    verifies against the injected trust root:
+
+    * no ``signature`` (unsigned)            → 400 (never trusted);
+    * no trust root configured (``None``)    → 400 (a present signature cannot be verified);
+    * signature invalid / tampered / wrong   → 400 (:func:`shared.signing.verify_pack` is False);
+    * malformed manifest / non-semver version→ 400 (registry ``publish`` rejects it);
+    * immutable-version conflict             → 409 (same ``id@version``, different content).
+
+    Only after verification does it call :meth:`PackRegistry.publish` (the immutability gate) and
+    return the resulting :class:`~packs_engine.registry.RegistryEntry`.
+
+    TODO(human): materialize the verified imported pack's BYTES into a digest-addressed content
+    store (ADR pending — local disk vs Azure Blob/Files/Table, with statefulness/billing/MSP-
+    tenancy implications) so import->assign->run resolves a BRAND-NEW pack. Today the registry is a
+    pure metadata index (id@version -> verified digest); assigned resolution runs a pack only when
+    a content-root pack's canonical digest matches that verified digest, so a just-imported pack
+    whose bytes are not yet in the content root safely runs nothing under its assignment.
+    """
+    signature = req.signature
+    if signature is None:
+        raise HTTPException(
+            status_code=400, detail="import rejected: bundle is unsigned (fail closed)"
+        )
+    if verifier is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "import rejected: no pack trust root is configured, so a present signature cannot "
+                "be verified (set WP_PACK_PUBLIC_KEY); failing closed"
+            ),
+        )
+    if not verify_pack(req.pack, signature, verifier):
+        raise HTTPException(
+            status_code=400,
+            detail="import rejected: detached signature is invalid or the bundle was tampered",
+        )
+    try:
+        entry = packs_registry.publish(req.pack)
+    except ImmutableVersionError as exc:
+        raise HTTPException(status_code=409, detail=f"import rejected: {exc}") from exc
+    except (InvalidVersionError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"import rejected: {exc}") from exc
+    except RegistryError as exc:
+        raise HTTPException(status_code=400, detail=f"import rejected: {exc}") from exc
+    return entry.to_dict()
+
+
+class PackAssignmentRequest(BaseModel):
+    """Assign a pack version to the path workload. ``assignedAt`` is set by the core (provenance).
+    """
+
+    packId: str
+    version: str
+    assignedBy: str
+
+
+@app.put("/api/workloads/{workload}/pack-assignments")
+def put_pack_assignment(
+    workload: str, req: PackAssignmentRequest, store: StoreDep, packs_registry: PackRegistryDep
+) -> PackAssignment:
+    """Pin ``workload`` to ``packId@version`` (single writer; records assignedBy/assignedAt).
+
+    Fail-closed binding to VERIFIED content: an assignment may only point at an EXACT immutable
+    registry entry for ``packId@version``. The registry holds *only* signature-verified imported
+    packs (``POST /api/packs/import`` publishes into it after :func:`shared.signing.verify_pack`),
+    so requiring ``registry.get(packId@version)`` before persisting guarantees a workload can never
+    be pinned to an un-imported / unverified version. If no such entry exists we persist NOTHING
+    and reject 422 — a run can then never resolve unverified content under an assigned id.
+    """
+    if packs_registry.get(PackRef(id=req.packId, version=req.version)) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"assignment rejected: {req.packId}@{req.version} is not a verified, imported pack "
+                "in the registry (import it via POST /api/packs/import first); failing closed"
+            ),
+        )
+    assignment = PackAssignment(
+        workload=workload,
+        packId=req.packId,
+        version=req.version,
+        assignedBy=req.assignedBy,
+    )
+    store.put_pack_assignment(assignment)  # API is the single writer
+    return assignment
+
+
+@app.get("/api/workloads/{workload}/pack-assignments")
+def get_pack_assignments(workload: str, store: StoreDep) -> list[PackAssignment]:
+    """Return the pack-version assignments for ``workload`` (MS + customer visibility)."""
+    return store.get_pack_assignments(workload)
+
+
+@app.get("/api/pack-assignments")
+def list_pack_assignments(store: StoreDep) -> list[PackAssignment]:
+    """Return every pack-version assignment across all workloads (MS + customer visibility)."""
+    return store.list_pack_assignments()
 
 
 # --------------------------------------------------------------------------------------

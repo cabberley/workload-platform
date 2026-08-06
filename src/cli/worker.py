@@ -19,11 +19,67 @@ import sys
 import httpx
 
 from cli.state_client import DEFAULT_API_BASE_URL, ApiStateReader
-from cli.wiring import build_client_registry, build_packs_engine
+from cli.wiring import (
+    build_client_registry,
+    build_pack_registry,
+    build_packs_engine,
+    resolve_packs_for_workload,
+)
+from packs_engine.registry import InvalidVersionError, SemVer
 from shared.module_base import build_default_registry, run_module
 
 # `DEFAULT_API_BASE_URL` is defined in `cli.state_client` (the read client) and re-exported here so
 # the worker's compute (read via HTTP) and write-back (POST results) agree on the API base URL.
+
+
+def _fetch_assigned_versions(base_url: str, workload: str) -> dict[str, str]:
+    """Read the workload's pack-version assignments over HTTP (read-only). **Fail-closed.**
+
+    Returns a ``packId -> version`` map so the worker's compute resolves the ASSIGNED pack version
+    (issue #37), mirroring the API ``/run`` endpoint.
+
+    A *successful* read (HTTP 200 with a well-formed JSON list) is authoritative: an empty list
+    means the workload is genuinely unassigned and returns ``{}`` — the resolver then falls back to
+    the latest version per id (documented fallback), which is normal and proceeds. A *failure* —
+    transport error, non-2xx status, or a malformed / wrong-shape / invalid-value body — is NOT the
+    same as "no assignments": treating it as ``{}`` would silently run an unintended version. So on
+    failure we fail closed and PROPAGATE (``httpx.HTTPError`` for transport/non-2xx, ``ValueError``
+    for a bad body); ``main`` turns that into a non-zero exit so the ACA Job surfaces it for retry
+    rather than running fallback packs.
+
+    Row values are strictly validated (fail closed): each row's ``packId`` must be a NON-EMPTY
+    string and ``version`` a NON-EMPTY string that parses as valid :class:`SemVer`; a non-string,
+    empty, non-semver, or DUPLICATE ``packId`` is rejected (raises ``ValueError``). We never coerce
+    ``null``/lists/dicts into strings — a malformed value must fail the worker, not silently pin an
+    unintended reference.
+    """
+    response = httpx.get(
+        f"{base_url}/api/workloads/{workload}/pack-assignments", timeout=30.0
+    )
+    response.raise_for_status()  # non-2xx ⇒ httpx.HTTPStatusError (fail closed)
+    rows = response.json()  # malformed JSON ⇒ ValueError (fail closed)
+    if not isinstance(rows, list):
+        raise ValueError(f"expected a JSON list of assignments, got {type(rows).__name__}")
+    out: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"malformed pack-assignment row (not an object): {row!r}")
+        pack_id = row.get("packId")
+        version = row.get("version")
+        if not isinstance(pack_id, str) or not pack_id:
+            raise ValueError(f"pack-assignment row has a non-string/empty packId: {row!r}")
+        if not isinstance(version, str) or not version:
+            raise ValueError(f"pack-assignment row has a non-string/empty version: {row!r}")
+        try:
+            SemVer.parse(version)
+        except InvalidVersionError as exc:
+            raise ValueError(
+                f"pack-assignment row has a non-semver version: {version!r}"
+            ) from exc
+        if pack_id in out:
+            raise ValueError(f"duplicate packId in pack assignments: {pack_id!r}")
+        out[pack_id] = version
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -62,11 +118,35 @@ def main(argv: list[str] | None = None) -> int:
     # API is the ONLY code path that commits it.
     base_url = os.environ.get("WP_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/")
     packs = build_packs_engine()
+    pack_registry = build_pack_registry()
     clients = build_client_registry()
     state = ApiStateReader(base_url=base_url)
-    result = run_module(module, scope=scope, state=state, packs=packs, clients=clients)
-
     workload = scope.get("workload")
+    # Resolve the packs the module sees to a SINGLE deterministic version per id (issue #37). The
+    # resolver is ALWAYS applied — with or without a workload — so no run ever executes multiple
+    # versions of one id. With a workload, a SUCCESSFUL read with no assignments yields `{}` and
+    # each id falls back to its highest valid semver; an assigned id runs its exact version only if
+    # a content pack's digest matches the registry's verified digest. If the assignments could not
+    # be read (transport error, non-2xx, malformed/invalid body) we must NOT run fallback packs —
+    # that could execute an unintended version. Fail closed: surface the error and exit non-zero so
+    # the ACA Job retries, before any module code runs.
+    assigned_versions: dict[str, str] = {}
+    if workload:
+        try:
+            assigned_versions = _fetch_assigned_versions(base_url, workload)
+        except (httpx.HTTPError, ValueError) as exc:
+            print(
+                f"error: could not read pack assignments for {workload!r}: {exc}",
+                file=sys.stderr,
+            )
+            print(
+                "failing closed: refusing to run with an unverified/unknown pack version",
+                file=sys.stderr,
+            )
+            return 1
+    resolved_packs = resolve_packs_for_workload(packs, assigned_versions, pack_registry)
+    result = run_module(module, scope=scope, state=state, packs=resolved_packs, clients=clients)
+
     if workload:
         # TODO(human): authenticate worker->API (Entra/mTLS) — M4. Keyless/internal for MVP.
         response = httpx.post(

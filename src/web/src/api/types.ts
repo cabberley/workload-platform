@@ -110,3 +110,16 @@ export type DriftReport = {
   addedNodes: string[];
   removedNodes: string[];
 };
+
+/**
+ * Mirrors `contracts.PackAssignment` (issue #37). Which pack version a workload is pinned to.
+ * `assignedAt` is an ISO-8601 datetime string. The SPA only ever *reads* this shape — all
+ * assignment writes go through the API (single writer).
+ */
+export type PackAssignment = {
+  workload: string;
+  packId: string;
+  version: string;
+  assignedBy: string;
+  assignedAt: string;
+};
