@@ -5,25 +5,29 @@ plus the per-module ACA apps/jobs and Managed Grafana). Every component authenti
 **own per-component user-assigned Managed Identity** created in `core.bicep` (issue #79); there are
 no keys, connection strings, or admin credentials anywhere in the templates or their outputs.
 
-## Per-component identities & the API-only-writer boundary (issue #79)
+## Per-component identities & the API-only-writer boundary (issues #79/#97)
 
 A single shared identity used to be assigned to every ACA app/job, so granting the state-store
 write data roles to it let **every** component write state — the "the API is the only writer"
 boundary was not actually enforced by RBAC. It is now: each component runs as its **own**
-user-assigned identity, and the **state-store WRITE** data roles are granted to the **writers only**.
+user-assigned identity, and the **state-store WRITE** data roles are granted to the **api identity
+only** (issue #97 — the worker is compute-only and holds no Blob/Table write role).
 
 | Identity | Runs as | State-store write? | Roles held |
 |----------|---------|--------------------|------------|
 | `wp-id-api-*` | `wp-api` (single-writer API core) | ✅ **writer** | AcrPull · Storage Queue Data Contributor · Key Vault Secrets User · **Storage Blob Data Contributor** · **Storage Table Data Contributor** |
-| `wp-id-worker-*` | all module apps/jobs (`wp-aiops`, `wp-alerts`, `wp-discovery`, `wp-quality_checks`, `wp-reassessments`, `wp-dependency_graph`) | ✅ **writer** | AcrPull · Storage Queue Data Contributor · Key Vault Secrets User · **Storage Blob Data Contributor** · **Storage Table Data Contributor** · Reader (RG) · Monitoring Reader (RG) · Log Analytics Reader (workspace) |
+| `wp-id-worker-*` | all module apps/jobs (`wp-aiops`, `wp-alerts`, `wp-discovery`, `wp-quality_checks`, `wp-reassessments`, `wp-dependency_graph`) | ❌ **compute-only** (reads + writes via the API) | AcrPull · Storage Queue Data Contributor · Key Vault Secrets User · Reader (RG) · Monitoring Reader (RG) · Log Analytics Reader (workspace) |
 | `wp-id-web-*` | `wp-web` (read-only front-end) | ❌ **reader** | AcrPull |
 | `wp-id-grafana-*` | Managed Grafana data source | ❌ **reader** | Monitoring Reader (RG) · Log Analytics Reader (workspace) |
 
-**Only** `wp-id-api-*` and `wp-id-worker-*` hold `Storage Blob Data Contributor`
+**Only** `wp-id-api-*` holds `Storage Blob Data Contributor`
 (`ba92f5b4-2d11-453d-a403-e96b0029c9fe`) and `Storage Table Data Contributor`
-(`0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`) at the storage-account scope. `wp-id-web-*` is deliberately
-absent from those assignments, so the **web front-end cannot write blobs or tables** — it talks only
-to the API. It also holds **no Key Vault access**: the web component is a static nginx SPA with no
+(`0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3`) at the storage-account scope (issue #97). The **worker** is
+**compute-only** — it reads prior state via the API (a read-only `ApiStateReader`) and POSTs its
+module result to the API, the single code path that commits state — so it is deliberately absent from
+those assignments and **cannot write blobs or tables**. `wp-id-web-*` is likewise absent, so the
+**web front-end cannot write blobs or tables** — it talks only to the API. The web identity also holds
+**no Key Vault access**: the web component is a static nginx SPA with no
 runtime `secrets`/Key Vault `secretRef` in `module-app.bicep`, so granting the public,
 internet-facing frontend vault-wide secret read would needlessly widen its blast radius
 (least-privilege, guardrail #7). Per the issue's "one for the worker/job" guidance, the module workers and jobs share a
@@ -47,8 +51,8 @@ templates are idempotent. Every GUID is verified with
 | Storage Queue Data Contributor | `974c5e8b-45b9-4653-ba55-5f855dd0fb88` | Storage account | `core.bicep` | api · worker | KEDA queue scalers + enqueue/dequeue | read+write | ✅ |
 | Key Vault Secrets User | `4633458b-17de-408a-b874-0445c86b69e6` | Key Vault | `core.bicep` | api · worker | runtime secret reads by identity | read | ✅ |
 | **Reader** | `acdd72a7-3385-48ef-bd42-f606fba81ae7` | **Resource group** | `core.bicep` | worker | ARG discovery (`modules/discovery/arg.py`); network topology (`modules/dependency_graph/topology.py`) | read | ARG ✅ · topology ⏳ |
-| **Storage Table Data Contributor** | `0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3` | Storage account | `core.bicep` | **api · worker** | Azure state backend tables (`shared/state.py` `AzureStateStore`) | read+write | ⏳ |
-| **Storage Blob Data Contributor** | `ba92f5b4-2d11-453d-a403-e96b0029c9fe` | Storage account | `core.bicep` | **api · worker** | Azure state backend snapshot/estate/graph/findings blobs (`shared/state.py`) | read+write | ⏳ |
+| **Storage Table Data Contributor** | `0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3` | Storage account | `core.bicep` | **api** | Azure state backend tables (`shared/state.py` `AzureStateStore`) | read+write | ⏳ |
+| **Storage Blob Data Contributor** | `ba92f5b4-2d11-453d-a403-e96b0029c9fe` | Storage account | `core.bicep` | **api** | Azure state backend snapshot/estate/graph/findings blobs (`shared/state.py`) | read+write | ⏳ |
 | Monitoring Reader | `43d0d8ad-25c7-4714-9337-8ba259a9fe05` | Resource group | `core.bicep` (worker) · `grafana.bicep` (grafana) | worker · grafana | Azure Monitor connector metrics edge (`modules/aiops/connectors/azure_monitor.py`) **and** the Grafana data source | read | ✅ |
 | Log Analytics Reader | `73c42c96-874c-492b-b04d-ab87d138a893` | **Log Analytics workspace** | `core.bicep` (worker) · `grafana.bicep` (grafana) | worker · grafana | Azure Monitor connector logs edge (`azure_monitor.py`, `LogsQueryClient.query_workspace`) **and** the Grafana data source | read | ✅ |
 
@@ -65,10 +69,10 @@ and the state container, writes the manifest entity that is its sole commit poin
 blobs (`upload_blob`) as well as reading them back. Because it writes, it needs the **Contributor**
 data roles (`Storage Table Data Contributor`, `Storage Blob Data Contributor`), not the read-only
 `*Data Reader` variants. `Contributor ⊇ Reader`, so the same grant also covers any read-only
-pack-content blob access under the api/worker identities. The roles are scoped to the **storage
-account** (the narrowest inline scope), granted to the **api and worker identities only**, and
+pack-content blob access under the api identity. The roles are scoped to the **storage
+account** (the narrowest inline scope), granted to the **api identity only** (issue #97), and
 account-level `allowSharedKeyAccess` is `false`, so this data-plane access is keyless (Managed
-Identity only). The **web** reader identity never receives them.
+Identity only). The **worker** (compute-only) and the **web** reader identity never receive them.
 
 ### Monitoring Reader + Log Analytics Reader across two principals
 
@@ -99,7 +103,7 @@ covers the connector's in-RG reads (`*/read` includes `Microsoft.Insights/*/read
 >
 > 1. **Cleanup (idempotent):** at the storage-account scope it deletes every state-store WRITE
 >    assignment — Storage **Blob Data Owner** (`b7e6dc6d-f1e8-4753-8033-0f276bb0955b`), Blob Data
->    Contributor, or Table Data Contributor — whose principal is **not** the api or worker identity,
+>    Contributor, or Table Data Contributor — whose principal is **not** the api identity,
 >    then deletes the leftover legacy shared identity resource **only when there is positive evidence
 >    it was a state-writer**: its `principalId` must be one of the stray writers just removed at this
 >    storage account **and** its name must match the legacy convention `wp-id-<token>` (never the
@@ -111,7 +115,7 @@ covers the connector's in-RG reads (`*/read` includes `Microsoft.Insights/*/read
 >    (non-zero) rather than silently reporting success, so every stray removed at the account is
 >    accounted for. Principal ids are compared with a **single strict UUID normalizer** (stripped +
 >    lower-cased) everywhere — allowlist, stray classification and identity correlation — so a
->    whitespace/case variant of an allowed api/worker principal can never be mis-classified stray and
+>    whitespace/case variant of an allowed api principal can never be mis-classified stray and
 >    have its role deleted. Deletion is also **scope-bound**: a role assignment is only ever deleted
 >    when its resource id is a canonical `…/storageAccounts/<sa>/providers/Microsoft.Authorization/`
 >    `roleAssignments/<guid>` id under **this** account, and the legacy identity is only deleted when
@@ -123,18 +127,19 @@ covers the connector's in-RG reads (`*/read` includes `Microsoft.Insights/*/read
 > 2. **Verify (fail-closed gate):** it re-lists the assignments **effective** at the storage-account
 >    scope (`az role assignment list --scope <SA> --include-inherited`, so a write role inherited
 >    from the resource group or subscription is also seen) and **fails the release** if any principal
->    other than the api/worker identities holds a state-write role (Blob Data Owner / Blob Data
->    Contributor / Table Data Contributor) effective there — catching the legacy identity, the web
->    reader identity, or any future regression. For an **inherited** stray it cannot delete, the gate
+>    other than the api identity holds a state-write role (Blob Data Owner / Blob Data
+>    Contributor / Table Data Contributor) effective there — catching the legacy identity, the worker
+>    identity, the web reader identity, or any future regression. For an **inherited** stray it cannot delete, the gate
 >    fails with a manual-remediation message naming the principal, role and ancestor scope. Read-only
 >    roles (Storage Blob Data Reader `2a2b9908-…`, Storage Table Data Reader `76199698-…`) are
 >    deliberately **not** treated as writers. The pure decision logic is unit-tested in
 >    `tests/unit/test_state_writer_cleanup.py`; run the gate offline with
 >    `--assignments-file <json>` to dry-run it without Azure.
 >
-> The api/worker principal ids and the storage-account id the gate needs are surfaced as
-> `main.bicep` outputs (`apiIdentityPrincipalId`, `workerIdentityPrincipalId`, `storageAccountId`) —
-> object ids are not credentials, so this stays keyless and in-boundary.
+> The api principal id and the storage-account id the gate needs are surfaced as
+> `main.bicep` outputs (`apiIdentityPrincipalId`, `storageAccountId`) — object ids are not
+> credentials, so this stays keyless and in-boundary. (`workerIdentityPrincipalId` is still output for
+> telemetry-export's publisher role, not the writer gate — the worker is no longer a state writer.)
 
 ## ⚠️ Reader scope: RG-scoped deployment vs subscription-wide discovery
 
