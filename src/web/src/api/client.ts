@@ -7,6 +7,7 @@ import type {
   Finding,
   ImpactResult,
   ModuleManifest,
+  PackAssignment,
   PackRegistryEntry,
   WorkloadGraph,
 } from "./types";
@@ -90,6 +91,14 @@ export function fetchFindings(workload: string, module?: string): Promise<Findin
 
 export function fetchDrift(workload: string): Promise<DriftReport> {
   return getJson<DriftReport>(`/api/workloads/${encodeURIComponent(workload)}/drift`);
+}
+
+/**
+ * Every pack-version assignment across all workloads (issue #37) — read-only visibility for both
+ * Microsoft and the customer. The SPA never assigns; assignment writes go through the API (PUT).
+ */
+export function fetchPackAssignments(): Promise<PackAssignment[]> {
+  return getJson<PackAssignment[]>("/api/pack-assignments");
 }
 
 /**

@@ -137,6 +137,14 @@ def verify(manifest: PackManifest, content: bytes, secret: bytes | None) -> None
 class Pack:
     """A loaded, parsed pack: manifest + body.
 
+    ``source`` is the raw pack dict the pack was parsed from (``{"manifest": ..., "body": ...}``),
+    retained so a consumer can recompute the pack's *version-identity* digest with
+    :func:`packs_engine.canonical.canonical_digest` — the SAME canonicalizer the registry hashes
+    with at import. Issue #37's assigned-pack resolution uses it to bind an assignment to the
+    registry's VERIFIED digest (run a content-root pack under an assigned ref ONLY if its canonical
+    digest matches the registry entry). It defaults to a manifest+body reconstruction so callers
+    that build a ``Pack`` directly still expose a canonical source.
+
     ``imported`` marks provenance: ``False`` for platform-shipped packs loaded from the content-root
     filesystem, ``True`` for signed packs resolved from the digest-addressed content store (issue
     #44). Consumers that merge pack bodies last-wins (e.g. alerts ``load_ops_routing``) rely on this
@@ -145,10 +153,19 @@ class Pack:
     """
 
     def __init__(
-        self, manifest: PackManifest, body: dict[str, Any], *, imported: bool = False
+        self,
+        manifest: PackManifest,
+        body: dict[str, Any],
+        *,
+        source: dict[str, Any] | None = None,
+        imported: bool = False,
     ) -> None:
         self.manifest = manifest
         self.body = body
+        self.source = source if source is not None else {
+            "manifest": manifest.model_dump(mode="json"),
+            "body": body,
+        }
         self.imported = imported
 
 
@@ -340,7 +357,7 @@ class PacksEngine:
                 # re-raise so verification still fails closed exactly as before.
                 self._emit_verify_failure(manifest)
                 raise
-            packs.append(Pack(manifest=manifest, body=raw.get("body", {})))
+            packs.append(Pack(manifest=manifest, body=raw.get("body", {}), source=raw))
             shipped_refs.add((manifest.id, manifest.version))
             shipped_ids.add(manifest.id)
             with contextlib.suppress(TypeError, ValueError):
@@ -480,7 +497,9 @@ class PacksEngine:
                 continue  # legacy/untrusted entry (no verifiable detached signature) -> fail closed
             if not self._import_verifier.verify_pack(raw, signature):
                 continue  # signature does not verify against the pinned bundle -> fail closed
-            resolved.append(Pack(manifest=manifest, body=raw.get("body", {}), imported=True))
+            resolved.append(
+                Pack(manifest=manifest, body=raw.get("body", {}), source=raw, imported=True)
+            )
         return resolved
 
     def _emit_verify_failure(self, manifest: PackManifest) -> None:

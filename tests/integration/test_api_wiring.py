@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from api.app.main import app, get_clients, get_packs, get_store, registry
 from cli.state_client import ApiStateReader
+from cli.wiring import WorkloadPinnedPacks
 from packs_engine.engine import Pack
 from shared.contracts import (
     REDACTED,
@@ -155,7 +156,11 @@ def test_run_endpoint_truly_injects_packs_and_clients_not_none(wired):
         registry._modules.pop(probe.name, None)
 
     assert probe.seen is not None
-    assert probe.seen.packs is packs, "ctx.packs must be the injected engine, not None"
+    # The resolver is now ALWAYS applied (issue #37) so no run can execute multiple versions of an
+    # id — even a workload-less run. ctx.packs is therefore the resolver view WRAPPING the injected
+    # engine (not None, and not a different engine).
+    assert isinstance(probe.seen.packs, WorkloadPinnedPacks)
+    assert probe.seen.packs._engine is packs, "resolver must wrap the injected engine, not None"
     assert probe.seen.clients is clients, "ctx.clients must be the injected registry"
 
 

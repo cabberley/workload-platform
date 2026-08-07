@@ -44,19 +44,30 @@ class _FailingCredential:
 
 
 class _CapturingResponse:
+    def __init__(self, payload: object = None) -> None:
+        self._payload = payload
+
     def raise_for_status(self) -> None:  # pragma: no cover - trivial
         return None
+
+    def json(self) -> object:
+        return self._payload
 
 
 class _CapturingClient:
     """Injected httpx-like client capturing the outgoing request without any network."""
 
-    def __init__(self) -> None:
+    def __init__(self, get_payload: object = None) -> None:
         self.calls: list[dict[str, object]] = []
+        self._get_payload = get_payload if get_payload is not None else []
 
     def post(self, url, *, json, headers, timeout) -> _CapturingResponse:  # noqa: A002
         self.calls.append({"url": url, "json": json, "headers": dict(headers), "timeout": timeout})
         return _CapturingResponse()
+
+    def get(self, url, *, headers, timeout) -> _CapturingResponse:
+        self.calls.append({"url": url, "headers": dict(headers), "timeout": timeout})
+        return _CapturingResponse(self._get_payload)
 
 
 # --------------------------------------------------------------------------------------
@@ -143,5 +154,37 @@ def test_submit_sends_no_auth_header_when_disabled() -> None:
         token_provider=None,
         client=client,
     )
+    assert len(client.calls) == 1
+    assert "Authorization" not in client.calls[0]["headers"]
+
+
+# --------------------------------------------------------------------------------------
+# worker._fetch_assigned_versions — the reader-protected assignment read is authenticated
+# with the SAME keyless bearer (issue #64 FIX 2), so it is not denied under WP_AUTH_MODE=required.
+# --------------------------------------------------------------------------------------
+def test_fetch_attaches_bearer_when_provider_present() -> None:
+    client = _CapturingClient(get_payload=[])
+    result = worker._fetch_assigned_versions(
+        "http://api",
+        "epic",
+        token_provider=lambda: "minted-token",
+        client=client,
+    )
+    assert result == {}
+    assert len(client.calls) == 1
+    headers = client.calls[0]["headers"]
+    assert headers["Authorization"] == "Bearer minted-token"
+    assert client.calls[0]["url"] == "http://api/api/workloads/epic/pack-assignments"
+
+
+def test_fetch_sends_no_auth_header_when_disabled() -> None:
+    client = _CapturingClient(get_payload=[])
+    result = worker._fetch_assigned_versions(
+        "http://api",
+        "epic",
+        token_provider=None,
+        client=client,
+    )
+    assert result == {}
     assert len(client.calls) == 1
     assert "Authorization" not in client.calls[0]["headers"]

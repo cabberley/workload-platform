@@ -29,6 +29,7 @@ from shared.contracts import (
     AuditEvent,
     Finding,
     ModuleRunResult,
+    PackAssignment,
     ResourceNode,
     TenantContext,
     WorkloadGraph,
@@ -106,6 +107,41 @@ class TenantScopedState:
         """
         physical = self._key(workload)
         return self._inner.snapshot(physical).replace(physical, workload, 1)
+
+    # -- pack assignments (issue #37, tenant-scoped) -------------------------------------
+    def put_pack_assignment(self, assignment: PackAssignment) -> None:
+        """Persist the assignment under the tenant's composite key (single writer, tenant-scoped).
+
+        The assignment's ``workload`` is namespaced with the tenant partition key before it reaches
+        the inner store, so two tenants pinning the SAME logical workload write to DISJOINT physical
+        keys — a tenant can never overwrite another tenant's pack assignment. The persisted-model
+        ``workload`` therefore holds the composite key; :meth:`get_pack_assignments`/
+        :meth:`list_pack_assignments` translate it back to the logical workload on read.
+        """
+        scoped = assignment.model_copy(update={"workload": self._key(assignment.workload)})
+        self._inner.put_pack_assignment(scoped)
+
+    def get_pack_assignments(self, workload: str) -> list[PackAssignment]:
+        """Return THIS tenant's assignments for ``workload`` (logical workload restored)."""
+        scoped = self._inner.get_pack_assignments(self._key(workload))
+        return [a.model_copy(update={"workload": workload}) for a in scoped]
+
+    def list_pack_assignments(self) -> list[PackAssignment]:
+        """Return only THIS tenant's assignments across its workloads (others filtered out).
+
+        Every persisted assignment is namespaced by a composite tenant key; we keep only those that
+        belong to this tenant (:func:`~api.app.tenancy.workload_of` returns ``None`` for another
+        tenant's key and is dropped) and restore the logical workload so the tenant prefix never
+        surfaces to the caller — deny-by-default, matching :meth:`list_workloads`.
+        """
+        tenant_id = self._tenant.tenant_id
+        out: list[PackAssignment] = []
+        for assignment in self._inner.list_pack_assignments():
+            logical = workload_of(assignment.workload, tenant_id)
+            if logical is None:
+                continue
+            out.append(assignment.model_copy(update={"workload": logical}))
+        return out
 
     # -- audit trail (instance-wide infrastructure — delegated UNCHANGED) ----------------
     def append_audit(self, event: AuditEvent) -> None:

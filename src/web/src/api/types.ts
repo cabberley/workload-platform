@@ -140,6 +140,20 @@ export type DriftReport = {
 };
 
 /**
+/**
+ * Mirrors `contracts.PackAssignment` (issue #37). Which pack version a workload is pinned to.
+ * `assignedAt` is an ISO-8601 datetime string. The SPA only ever *reads* this shape — all
+ * assignment writes go through the API (single writer).
+ */
+export type PackAssignment = {
+  workload: string;
+  packId: string;
+  version: string;
+  assignedBy: string;
+  assignedAt: string;
+};
+
+/**
  * Mirrors the API app's `ImpactResult` read model (issue #56) — the projection of the CANONICAL
  * server-side `shared.blast_radius.compute_impact`. `states` maps every node id to its simulated
  * `HealthState` when `failedNode` is down; `blastRadius === down.length`. This is a *read* shape

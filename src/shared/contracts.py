@@ -503,6 +503,30 @@ class DriftReport(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
+# Pack assignments — which pack version a workload is pinned to (issue #37).
+# --------------------------------------------------------------------------------------
+class PackAssignment(BaseModel):
+    """Binds a workload to a specific pack version (issue #37) — a read-model + write path.
+
+    The customer/Microsoft assign an imported, signed pack version per workload; the assignment
+    then drives which version each module run resolves for that workload (see ``cli.wiring``). One
+    active version per ``packId`` per ``workload`` (keyed by ``(workload, packId)``): re-assigning
+    replaces the prior version. ``assignedBy``/``assignedAt`` carry provenance so both Microsoft
+    and the customer can audit who pinned which version and when (guardrail: provenance).
+    """
+
+    workload: str = Field(
+        description="Workload the assignment applies to (epic, sap, bespoke, ...)"
+    )
+    packId: str = Field(description="Pack id being pinned (matches a registry entry id)")
+    version: str = Field(description="Semantic version of the assigned pack, e.g. 1.2.0")
+    assignedBy: str = Field(description="Principal that made the assignment (provenance)")
+    assignedAt: datetime = Field(
+        default_factory=_utcnow, description="When the assignment was recorded (provenance)"
+    )
+
+
+# --------------------------------------------------------------------------------------
 # Audit trail — tamper-evident, append-only record of consequential actions (issue #59).
 #
 # An ``AuditEvent`` records WHO (a non-PII principal id), did WHAT (``action``), to WHICH subject,

@@ -31,9 +31,16 @@ from typing import Any, cast
 
 from pydantic import ValidationError
 
+from packs_engine.canonical import canonical_digest
 from packs_engine.content_store import PackContentStore, build_pack_content_store
-from packs_engine.engine import PacksEngine
-from packs_engine.registry import PackRegistry
+from packs_engine.engine import Pack, PacksEngine
+from packs_engine.registry import (
+    DEFAULT_INDEX_PATH,
+    InvalidVersionError,
+    PackRef,
+    PackRegistry,
+    SemVer,
+)
 from shared.connectors import SecretProvider
 from shared.contracts import TrustBundle
 from shared.observability import connector_fail_closed_observer
@@ -43,6 +50,7 @@ from shared.signing import TrustBundleVerifier
 # Env var *names* the composition root reads. Values are supplied at runtime by identity / Key
 # Vault — only the names live in code (keyless).
 ENV_CONTENT_ROOT = "WP_CONTENT_ROOT"
+ENV_REGISTRY_INDEX = "WP_REGISTRY_INDEX"
 ENV_SUBSCRIPTION_ID = "WP_SUBSCRIPTION_ID"
 ENV_ALERT_WEBHOOK_URL = "WP_ALERT_WEBHOOK_URL"
 # Documented opt-out gating a loopback-ONLY cleartext webhook (a local test sink). Truthy permits
@@ -177,6 +185,159 @@ def build_packs_engine() -> PacksEngine | None:
         )
     except OSError:
         return None
+
+
+def build_pack_registry() -> PackRegistry:
+    """Construct the immutable pack registry the worker binds assigned resolution to (issue #37).
+
+    Mirrors the API's ``get_pack_registry``: the on-disk index path is ``$WP_REGISTRY_INDEX`` (so a
+    deployment can relocate it), falling back to :data:`DEFAULT_INDEX_PATH`. The registry is a pure
+    metadata index (id@version -> verified digest); the worker reads it to confirm an assigned
+    content pack's digest matches the verified import before running it.
+    """
+    index_path = os.environ.get(ENV_REGISTRY_INDEX)
+    return PackRegistry(Path(index_path) if index_path else DEFAULT_INDEX_PATH)
+
+
+class WorkloadPinnedPacks:
+    """A packs view that resolves each pack id to a SINGLE, deterministic version for a workload.
+
+    Wraps any packs engine (the real :class:`PacksEngine` or a test fake) and, per pack id:
+
+    * **assigned** — keeps ONLY the assigned version AND only a content pack whose canonical
+      *version-identity* digest equals the registry's VERIFIED digest for ``id@version`` (the
+      digest recorded when the signed bundle was imported). This binds runtime execution to
+      verified bytes: tampered/unrelated content-root bytes carrying the same ``id@version`` can
+      NOT run under an assignment, and if no content pack matches the verified digest the assigned
+      pack simply does not run (fail closed — an unverified substitute is NEVER executed). Exactly
+      one pack survives per assigned ref (identical-digest duplicates dedupe to one).
+    * **unassigned** — collapses to the HIGHEST *valid semver* among the id's available versions (a
+      single deterministic pack), NEVER every version and NEVER a non-semver pack. Silently running
+      multiple versions of one id — or a pack with an unparseable version — would be
+      non-deterministic/unsafe.
+
+    It never bypasses the underlying trust gate — the wrapped engine still verifies each pack's
+    signature/hash before returning it, so this can only ever *narrow* an already-verified set
+    (fail-closed content trust is preserved). ``_engine`` is intentionally ``Any``: modules already
+    treat ``ctx.packs`` opaquely and cast to their own narrow Protocol, and this wrapper delegates
+    any method it does not override.
+
+    TODO(human): materialize verified imported pack bytes into a digest-addressed content store
+    (ADR pending) so import->assign->run resolves NEW packs; today resolution fails closed if the
+    assigned digest is not present in the content root (a just-imported pack whose bytes are not
+    yet in the content root safely runs nothing under its assignment).
+    """
+
+    def __init__(
+        self, engine: Any, assigned_versions: Mapping[str, str], registry: PackRegistry
+    ) -> None:
+        self._engine = engine
+        self._assigned = dict(assigned_versions)
+        self._registry = registry
+
+    @staticmethod
+    def _latest(group: list[Pack]) -> Pack | None:
+        """Return the highest-*valid-semver* pack in ``group``, or ``None`` — fail closed.
+
+        Considers ONLY packs whose version parses as a valid :class:`SemVer`. If none parse we
+        return ``None`` (the id runs nothing) — we NEVER fall back to a lexicographic pick, so a
+        pack with an unparseable version (``not-semver``) can never be selected/run.
+        """
+        best: Pack | None = None
+        best_key: SemVer | None = None
+        for pack in group:
+            try:
+                key = SemVer.parse(pack.manifest.version)
+            except InvalidVersionError:
+                continue
+            if best_key is None or key > best_key:
+                best, best_key = pack, key
+        return best
+
+    def _pin_assigned(self, pack_id: str, assigned: str, group: list[Pack]) -> Pack | None:
+        """Return the ONE content pack for ``pack_id@assigned`` whose digest is registry-verified.
+
+        Binds execution to the registry's VERIFIED digest: look up the immutable registry entry for
+        ``id@version`` and keep a content pack ONLY if its canonical digest equals that entry's
+        digest. Fail closed on every miss — absent entry, wrong version, digest mismatch, or an
+        unhashable pack — so unverified/tampered bytes never run under an assignment. Identical-
+        digest duplicates dedupe to exactly one.
+        """
+        entry = self._registry.get(PackRef(id=pack_id, version=assigned))
+        if entry is None:
+            return None  # not a verified registry entry ⇒ nothing runs (API blocks this at write)
+        for pack in group:
+            if pack.manifest.version != assigned:
+                continue
+            try:
+                if canonical_digest(pack.source) == entry.digest:
+                    return pack  # exactly one — verified bytes; ignore identical-digest duplicates
+            except (TypeError, ValueError):
+                continue  # unhashable/malformed pack ⇒ cannot verify ⇒ fail closed
+        return None  # no content pack matches the verified digest ⇒ fail closed (run nothing)
+
+    def _pin(self, packs: list[Pack]) -> list[Pack]:
+        by_id: dict[str, list[Pack]] = {}
+        for pack in packs:
+            by_id.setdefault(pack.manifest.id, []).append(pack)
+        out: list[Pack] = []
+        for pack_id, group in by_id.items():
+            assigned = self._assigned.get(pack_id)
+            if assigned is not None:
+                pinned = self._pin_assigned(pack_id, assigned, group)
+                if pinned is not None:
+                    out.append(pinned)
+            else:
+                # Unassigned: a single deterministic version — the highest valid semver.
+                latest = self._latest(group)
+                if latest is not None:
+                    out.append(latest)
+        return out
+
+    def load_for_workload(self, workload: str, pack_type: Any) -> list[Pack]:
+        return self._pin(self._engine.load_for_workload(workload, pack_type))
+
+    def load_all(self, *, pack_type: Any = None, verify_sig: bool = True) -> list[Pack]:
+        return self._pin(self._engine.load_all(pack_type=pack_type, verify_sig=verify_sig))
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate anything not overridden (e.g. future engine methods) to the wrapped engine.
+        return getattr(self._engine, name)
+
+
+def resolve_packs_for_workload(
+    packs: object | None, assigned_versions: Mapping[str, str], registry: PackRegistry
+) -> object | None:
+    """Return a packs view that resolves each pack id to a SINGLE version for a workload (#37).
+
+    Resolution is always deterministic — the returned view NEVER runs multiple versions of one
+    pack id, and it is applied to EVERY run (workload-scoped or not; pass an empty
+    ``assigned_versions`` when there is no workload) so no run can execute several versions of an
+    id:
+
+    * an id WITH an assignment runs EXACTLY the assigned version AND only a content pack whose
+      canonical digest matches the registry's VERIFIED digest for that ``id@version`` (bytes-level
+      binding to signature-verified content); if nothing matches, that id runs nothing (fail
+      closed) — an unverified substitute is never run;
+    * an id with NO assignment (the DOCUMENTED fallback) resolves to the HIGHEST *valid semver*
+      among its available versions — a single deterministic pack, not every version, and never a
+      non-semver pack.
+
+    A run therefore never fails merely because nothing is assigned (a workload with zero
+    assignments still runs the latest of each id), and it never silently runs several versions of
+    one id. Content trust stays fail-closed in the underlying engine (each pack is signature-
+    verified before it is returned; pinning can only narrow that verified set).
+
+    ``packs`` is ``object | None`` (modules receive it opaquely and cast to their own Protocol);
+    ``None`` (no content root) is returned as-is.
+
+    TODO(human): materialize verified imported pack bytes into a digest-addressed content store
+    (ADR pending) so import->assign->run resolves NEW packs; today resolution fails closed if the
+    assigned digest is not present in the content root.
+    """
+    if packs is None:
+        return packs
+    return WorkloadPinnedPacks(packs, assigned_versions, registry)
 
 
 def _build_pack_content_store_or_none() -> PackContentStore | None:
