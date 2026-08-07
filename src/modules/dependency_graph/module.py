@@ -13,7 +13,7 @@ than invented as a node.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from modules.dependency_graph.connectors.citrix import (
     CitrixConnector,
@@ -22,6 +22,16 @@ from modules.dependency_graph.connectors.citrix import (
 )
 from modules.dependency_graph.topology import NetworkTopologyClient
 from shared.blast_radius import blast_radius, rank_spofs
+from shared.connectors.base import FetchResult
+from shared.connectors.lb import (
+    aggregate_health as lb_aggregate_health,
+)
+from shared.connectors.lb import (
+    apply_health as lb_apply_health,
+)
+from shared.connectors.lb import (
+    signals_from_result as lb_signals_from_result,
+)
 from shared.contracts import (
     AgentResponse,
     DependencyEdge,
@@ -49,6 +59,34 @@ from shared.module_base import Module, ModuleContext
 # graph is UPSERT-REPLACED — a naive merge would wipe authoritative edges; deferred, see the
 # connector's ``dependency_edges`` TODO(human) + ADR 0015). Keyless, read-only, fail-closed.
 CITRIX_CONNECTOR = "citrix"
+
+# Well-known name the worker/API uses to (optionally) inject a load-balancer connector — a Citrix
+# NetScaler (NITRO) or F5 BIG-IP (iControl) client (issue #49) — into ``ctx.clients``. Absent ⇒ the
+# module runs EXACTLY as before (estate/auto/pack only). Present ⇒ aggregate LB HEALTH signals
+# ANNOTATE existing estate nodes (bounded, closed-vocabulary, non-authoritative supplemental tags);
+# LB dependency EDGES are deliberately NOT merged (the graph is UPSERT-REPLACED — a naive merge
+# would wipe authoritative edges; deferred, see the shared ``dependency_edges`` mapping + ADR 0015).
+# Keyless, read-only, fail-closed.
+LB_CONNECTOR = "load_balancer"
+
+# The supplemental provenance source stamped on LB-annotated nodes — vendor-neutral ("lb"), since
+# the module consumes the pure, vendor-neutral aggregate-health signal via the ``fetch_raw`` seam
+# and does not know (or need) the specific NetScaler/F5 vendor behind it.
+LB_SUPPLEMENTAL_SOURCE = "lb"
+
+
+@runtime_checkable
+class _LbConnector(Protocol):
+    """Narrow read-only seam the module casts an injected LB (NetScaler/F5) client to.
+
+    Both concrete LB clients expose the same ``fetch_raw`` seam; unit tests inject a fake returning
+    a synthetic :class:`~shared.connectors.FetchResult`. Keeping the surface this small lets the
+    module treat "no connector" and "a connector that failed closed" identically and stay SDK-free.
+    """
+
+    def fetch_raw(self) -> FetchResult:
+        """Return validated LB signals, or a fail-closed ``available=False`` result."""
+        ...
 
 
 class _PackManifestLike(Protocol):
@@ -175,6 +213,11 @@ class DependencyGraphModule(Module):
         # and never merges dependency edges (graph-replace hazard — deferred).
         nodes, citrix_note = self._citrix_assist(ctx, nodes)
 
+        # Optional load-balancer (NetScaler/F5) assist (issue #49): identical additive + default-off
+        # + fail-closed contract as the Citrix assist. Absent ⇒ nodes unchanged. Present ⇒ aggregate
+        # LB HEALTH annotates existing nodes only; LB dependency EDGES are NOT merged (deferred).
+        nodes, lb_note = self._lb_assist(ctx, nodes)
+
         auto_edges, unresolved = self._auto_edges(ctx, scope, nodes)
         pack_edges = self._pack_edges(ctx, workloads, estate_by_workload)
         edges = _dedupe_edges(auto_edges + pack_edges)
@@ -189,6 +232,8 @@ class DependencyGraphModule(Module):
         agent_findings = [f"{len(findings)} SPOF(s) identified"]
         if citrix_note:
             agent_findings.append(citrix_note)
+        if lb_note:
+            agent_findings.append(lb_note)
         response = AgentResponse(
             agentName="dependency_graph",
             taskType="build-graph-and-blast-radius",
@@ -243,6 +288,45 @@ class DependencyGraphModule(Module):
             return nodes, "Citrix assist returned no usable supplemental health signals"
         note = (
             f"Citrix assist annotated {len(applied.annotated_ids)} estate node(s) with "
+            "supplemental health signals (non-authoritative; dependency edges deferred)"
+        )
+        return applied.nodes, note
+
+    def _lb_assist(
+        self, ctx: ModuleContext, nodes: list[ResourceNode]
+    ) -> tuple[list[ResourceNode], str | None]:
+        """Optionally annotate estate nodes with load-balancer aggregate HEALTH — fail closed.
+
+        Strictly additive and default-off, mirroring :meth:`_citrix_assist` exactly: when no LB
+        connector is injected into ``ctx.clients["load_balancer"]`` this returns ``(nodes, None)``
+        unchanged, so the built/persisted graph is byte-for-byte identical to today. When one IS
+        injected it fetches (read-only, fail-closed), reduces per-member health to a single
+        aggregate :class:`~shared.contracts.HealthState` per LB, and applies a bounded,
+        closed-vocabulary supplemental HEALTH tag to nodes whose id EXACTLY matches an existing
+        estate node — never adding, removing, or overriding a node.
+
+        LB DEPENDENCY edges are intentionally NOT merged here: the module UPSERT-REPLACES the
+        workload graph, so a naive edge merge would wipe the authoritative auto/pack edges (see the
+        shared ``dependency_edges`` mapping + ADR 0015). This never raises across the boundary and
+        never lets an LB connector failure break the module.
+        """
+        connector = ctx.clients.get(LB_CONNECTOR)
+        if connector is None:
+            return nodes, None
+        lb = cast(_LbConnector, connector)
+        try:
+            result = lb.fetch_raw()
+            signals = lb_signals_from_result(result)
+            aggregate = lb_aggregate_health(signals.members)
+            applied = lb_apply_health(nodes, aggregate, source=LB_SUPPLEMENTAL_SOURCE)
+        except Exception as exc:  # noqa: BLE001 - LB is optional assist; never break the module
+            return nodes, f"LB assist unavailable ({type(exc).__name__}); estate-only graph"
+        if not result.available:
+            return nodes, "LB assist unavailable (fail-closed); graph from estate only"
+        if not applied.annotated_ids:
+            return nodes, "LB assist returned no usable supplemental health signals"
+        note = (
+            f"LB assist annotated {len(applied.annotated_ids)} estate node(s) with "
             "supplemental health signals (non-authoritative; dependency edges deferred)"
         )
         return applied.nodes, note
@@ -484,6 +568,7 @@ def _dedupe_edges(edges: list[DependencyEdge]) -> list[DependencyEdge]:
 __all__ = [
     "CITRIX_CONNECTOR",
     "DependencyGraphModule",
+    "LB_CONNECTOR",
     "NetworkTopologyClient",
     "blast_radius",
     "edges_from_backend_pool",

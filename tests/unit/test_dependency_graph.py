@@ -509,3 +509,129 @@ def test_run_survives_citrix_connector_that_raises():
     assert any("Citrix assist unavailable (RuntimeError)" in f for f in result.response.findings)
     assert all("super-secret" not in f for f in result.response.findings)
 
+
+# --- Load-balancer (NetScaler/F5) assist (issue #49): optional, default-off, supplement-only -----
+class _FakeLbConnector:
+    """A synthetic LB connector returning a canned FetchResult — no network, no real vendor."""
+
+    def __init__(self, result):
+        self._result = result
+
+    def fetch_raw(self):
+        return self._result
+
+
+def _lb_member(lb_id: str, member_id: str = "web1", health: str = "down") -> dict:
+    # A raw record in the shared LB wire shape (see shared.connectors.lb.signals_to_raw): the LB
+    # aggregate health is reduced per lb_id, so this annotates the node whose id == lb_id.
+    return {"kind": "backend-member", "lb_id": lb_id, "member_id": member_id, "health": health}
+
+
+def test_run_is_identical_when_lb_absent():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    baseline = _run(state=state, scope={"workload": "fake-epic"})
+    # A run with an unavailable LB client leaves the graph nodes byte-for-byte identical to a run
+    # with no LB client at all (no supplemental tags) — proving default-off + fail-closed.
+    unavailable = _FakeLbConnector(FetchResult(available=False, error="InvalidEndpoint"))
+    with_failclosed = _run(
+        state=state, clients={"load_balancer": unavailable}, scope={"workload": "fake-epic"}
+    )
+    assert baseline.graph is not None and with_failclosed.graph is not None
+    assert [n.model_dump() for n in baseline.graph.nodes] == [
+        n.model_dump() for n in with_failclosed.graph.nodes
+    ]
+    assert all("aegis:source" not in n.tags for n in with_failclosed.graph.nodes)
+    findings = with_failclosed.response.findings
+    assert any("LB assist unavailable (fail-closed)" in f for f in findings)
+
+
+def test_run_annotates_existing_node_with_lb_health():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    # up + down members for the "lb" node ⇒ aggregate degraded health tag.
+    lb = _FakeLbConnector(
+        FetchResult(
+            available=True,
+            raw=[_lb_member("lb", "web1", "up"), _lb_member("lb", "web2", "down")],
+        )
+    )
+    result = _run(state=state, clients={"load_balancer": lb}, scope={"workload": "fake-epic"})
+    assert result.graph is not None
+    lb_node = next(n for n in result.graph.nodes if n.id == "lb")
+    assert lb_node.tags["aegis:source"] == "lb"
+    assert lb_node.tags["aegis:lb-health"] == "degraded"
+    # No node created/removed; only the matched node annotated.
+    assert {n.id for n in result.graph.nodes} == {"lb", "web1", "web2", "ecp1", "odb"}
+    other = next(n for n in result.graph.nodes if n.id == "web1")
+    assert "aegis:source" not in other.tags
+    assert any("LB assist annotated" in f for f in result.response.findings)
+
+
+def test_run_lb_signal_for_unknown_node_is_dropped():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    lb = _FakeLbConnector(
+        FetchResult(available=True, raw=[_lb_member("/does/not/exist", "web1", "down")])
+    )
+    result = _run(state=state, clients={"load_balancer": lb}, scope={"workload": "fake-epic"})
+    assert result.graph is not None
+    assert all("aegis:source" not in n.tags for n in result.graph.nodes)
+    assert any("no usable supplemental" in f for f in result.response.findings)
+
+
+def test_run_does_not_persist_lb_dependency_edges():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    lb = _FakeLbConnector(
+        FetchResult(available=True, raw=[_lb_member("lb", "web1", "down")])
+    )
+    result = _run(state=state, clients={"load_balancer": lb}, scope={"workload": "fake-epic"})
+    assert result.graph is not None
+    # No LB dependency edges are ever merged into the persisted graph (deferred, ADR 0015). With no
+    # network client injected, the only possible edges would be LB-derived — there are none.
+    assert all(e.origin not in ("connector:netscaler", "connector:f5") for e in result.graph.edges)
+    # The health annotation IS applied (supplement-only contribution).
+    lb_node = next(n for n in result.graph.nodes if n.id == "lb")
+    assert lb_node.tags["aegis:lb-health"] == "down"
+
+
+def test_run_survives_lb_connector_that_raises():
+    class _Boom:
+        def fetch_raw(self):
+            raise RuntimeError("super-secret-lb")
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    result = _run(
+        state=state, clients={"load_balancer": _Boom()}, scope={"workload": "fake-epic"}
+    )
+    assert result.ok is True
+    assert result.graph is not None
+    assert all("aegis:source" not in n.tags for n in result.graph.nodes)
+    assert any("LB assist unavailable (RuntimeError)" in f for f in result.response.findings)
+    assert all("super-secret-lb" not in f for f in result.response.findings)
+
+
+def test_run_lb_and_citrix_assist_coexist_additively():
+    from shared.connectors import FetchResult
+
+    state = FakeReadableState({"fake-epic": _estate()})
+    citrix = _FakeCitrixConnector(
+        FetchResult(available=True, raw=[_citrix_health("odb", "degraded")])
+    )
+    lb = _FakeLbConnector(FetchResult(available=True, raw=[_lb_member("lb", "web1", "down")]))
+    result = _run(
+        state=state,
+        clients={"citrix": citrix, "load_balancer": lb},
+        scope={"workload": "fake-epic"},
+    )
+    assert result.graph is not None
+    lb_node = next(n for n in result.graph.nodes if n.id == "lb")
+    odb = next(n for n in result.graph.nodes if n.id == "odb")
+    assert lb_node.tags["aegis:lb-health"] == "down"
+    assert odb.tags["aegis:citrix-health"] == "degraded"
+
