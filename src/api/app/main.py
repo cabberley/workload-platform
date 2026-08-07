@@ -7,8 +7,6 @@ low replica counts while the compute-heavy modules scale freely.
 """
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import os
 from collections.abc import Awaitable, Callable, Mapping
@@ -20,7 +18,7 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from api.app.tenancy import (
     TenancyConfig,
@@ -57,7 +55,7 @@ from shared.contracts import (
     ModuleManifest,
     ModuleRunResult,
     PackAssignment,
-    PackSignature,
+    PackManifest,
     ReadinessReport,
     ResourceNode,
     TenantContext,
@@ -79,7 +77,7 @@ from shared.observability import (
     store_reachable_probe,
 )
 from shared.provenance import ProvenanceError, enforce_finding_provenance
-from shared.signing import Ed25519Verifier, Verifier, verify_pack
+from shared.signing import TrustBundleVerifier
 from shared.state import (
     ReadOnlyState,
     StateStore,
@@ -429,6 +427,37 @@ def _emit_or_fail_closed(
         raise HTTPException(status_code=500, detail="audit precondition failed (fail closed)")
 
 
+def _emit_pack_audit_or_fail_closed(
+    audit: AuditEmitter,
+    *,
+    actor: str,
+    action: AuditAction,
+    subject: str,
+    result: AuditResult,
+    pack_id: str,
+    pack_version: str,
+) -> None:
+    """Emit a pack-lifecycle audit record, failing closed if it cannot even be CONSTRUCTED (#59).
+
+    Pack import/assign are not in :data:`~shared.audit.FAIL_CLOSED_ACTIONS`, so a durable-append
+    OUTAGE is the deliberate best-effort allowance (issue #99). This guards the OTHER drop path: an
+    event the emitter cannot construct (a non-audit-safe field) returns ``None`` and would be
+    silently lost — which, if it happened after the mutation, would leave committed-but-unaudited
+    state. Callers validate the subject's auditability and route the emit through here BEFORE the
+    mutation, so a droppable event becomes a fail-closed 5xx precondition instead.
+    """
+    event = audit.emit(
+        actor=actor,
+        action=action,
+        subject=subject,
+        result=result,
+        pack_id=pack_id,
+        pack_version=pack_version,
+    )
+    if event is None:
+        raise HTTPException(status_code=500, detail="audit precondition failed (fail closed)")
+
+
 def _workload_token(workload: str) -> str:
     """Return an opaque, bounded, PII-free token for the caller-controlled ``workload`` id.
 
@@ -628,9 +657,6 @@ ClientsDep = Annotated[Mapping[str, object], Depends(get_clients)]
 # isolated tmp-path registry via `app.dependency_overrides`.
 _pack_registry: PackRegistry | None = None
 
-# Env var *name* only — the value (a base64 raw Ed25519 public key) is supplied at runtime by
-# identity / Key Vault, never embedded here (keyless).
-ENV_PACK_PUBLIC_KEY = "WP_PACK_PUBLIC_KEY"
 ENV_REGISTRY_INDEX = "WP_REGISTRY_INDEX"
 
 
@@ -643,32 +669,29 @@ def get_pack_registry() -> PackRegistry:
     return _pack_registry
 
 
-def get_pack_verifier() -> Verifier | None:
-    """Build the detached-signature trust root from ``WP_PACK_PUBLIC_KEY`` (base64 raw Ed25519).
+def get_pack_import_verifier() -> TrustBundleVerifier:
+    """Return the SHARED, keyless pack-import trust root (issue #89, R2) — the SAME verifier the
+    runtime resolver uses.
 
-    Mirrors ``scripts/validate_packs.py``'s trust-root pattern: no private key is ever read — only
-    a public trust root, and only when explicitly configured. Returns ``None`` when unconfigured;
-    the ``import`` endpoint then fails **closed** (a present signature that cannot be verified is
-    rejected), never open. Tests inject an ``Ed25519Verifier`` via ``app.dependency_overrides``.
+    Import admission and runtime resolution MUST agree on trust, or a pack admitted as ``signed``
+    could still be refused at run time (unknown/unpinned ``key_id``), silently breaking the feature.
+    Both sides therefore build the trust root from the ONE pinned bundle
+    (:func:`cli.wiring.build_pack_import_verifier`, ``$WP_TRUST_BUNDLE_PATH``): the engine wires it
+    as ``PacksEngine(import_verifier=...)`` and the import endpoint verifies through this dep — the
+    identical :class:`~shared.signing.TrustBundleVerifier`.
 
-    TODO(human): point ``WP_PACK_PUBLIC_KEY`` at the real Azure Key Vault public trust root (export
-    the KV signing key's public bytes to the API by identity — same follow-up as issue #35), so the
-    core verifies imports against the same key the release pipeline signs with. Until then a signed
-    bundle cannot be verified and — per fail-closed — imports are rejected.
+    **Always returns a verifier — never ``None``** (reject-all when the bundle is absent/corrupt),
+    so import is fail-closed by construction. Tests inject a bundle-backed verifier pinning the test
+    key via ``app.dependency_overrides``. ``build_pack_import_verifier`` is imported lazily to keep
+    the API↔CLI wiring import acyclic, matching ``get_packs``/``get_clients``.
     """
-    b64 = os.environ.get(ENV_PACK_PUBLIC_KEY)
-    if not b64:
-        return None
-    try:
-        return Ed25519Verifier.from_public_bytes(base64.b64decode(b64, validate=True))
-    except (binascii.Error, ValueError):
-        # A malformed trust root is treated as *no* trust root (fail closed): a present signature
-        # can then never be verified, so imports are rejected rather than silently trusted.
-        return None
+    from cli.wiring import build_pack_import_verifier
+
+    return build_pack_import_verifier()
 
 
 PackRegistryDep = Annotated[PackRegistry, Depends(get_pack_registry)]
-VerifierDep = Annotated[Verifier | None, Depends(get_pack_verifier)]
+PackImportVerifierDep = Annotated[TrustBundleVerifier, Depends(get_pack_import_verifier)]
 
 
 class ModuleHealth(BaseModel):
@@ -1334,14 +1357,16 @@ def snapshot(
 # API core (single writer); the SPA never mutates. Assignment reads give MS + customer visibility.
 # --------------------------------------------------------------------------------------
 class PackImportRequest(BaseModel):
-    """A signed pack bundle to import: the pack itself plus its detached signature envelope.
+    """A signed pack bundle to import: the signed pack itself (nothing more).
 
-    ``signature`` is optional in the wire shape ONLY so an unsigned bundle is rejected with an
-    explicit fail-closed 400 (rather than a 422 schema error) — it is never optional in effect.
+    The detached signature is the SINGLE source of truth carried INSIDE the pack, at
+    ``manifest.pack_signature`` — exactly where the runtime resolver reads it (issue #89, R2), so
+    import and runtime verify the identical signature. There is deliberately NO separate top-level
+    ``signature`` field: a client submits the signed pack, and an unsigned pack (no
+    ``manifest.pack_signature``) is rejected fail-closed by :func:`import_pack`.
     """
 
     pack: dict[str, object]
-    signature: PackSignature | None = None
 
 
 @app.post("/api/packs/import")
@@ -1349,20 +1374,32 @@ def import_pack(
     req: PackImportRequest,
     request: Request,
     packs_registry: PackRegistryDep,
-    verifier: VerifierDep,
+    import_verifier: PackImportVerifierDep,
     audit: AuditDep,
     _principal: OperatorDep,
-) -> dict[str, object]:
-    """Verify a signed bundle's detached signature (fail-closed), then publish the version.
+) -> PackRegistryEntryView:
+    """Verify a signed pack against the SHARED trust root (fail-closed), then publish the version.
 
-    Fail-closed at every step — a bundle is registered ONLY if its signature cryptographically
-    verifies against the injected trust root:
+    Admission verifies the SAME detached signature, from the SAME source, against the SAME trust
+    root as the runtime resolver (issue #89, R2) — mirroring
+    :meth:`packs_engine.engine.PacksEngine.verify_pack_for_import` exactly — so a pack admitted as
+    ``signed`` is guaranteed to also verify at run time (no import↔runtime trust divergence):
 
-    * no ``signature`` (unsigned)            → 400 (never trusted);
-    * no trust root configured (``None``)    → 400 (a present signature cannot be verified);
-    * signature invalid / tampered / wrong   → 400 (:func:`shared.signing.verify_pack` is False);
-    * malformed manifest / non-semver version→ 400 (registry ``publish`` rejects it);
-    * immutable-version conflict             → 409 (same ``id@version``, different content).
+    * the signature is read from ``manifest.pack_signature`` (the pack-embedded envelope the runtime
+      re-verifies), NOT a separate request field;
+    * the pinned :class:`~shared.signing.TrustBundleVerifier` (``$WP_TRUST_BUNDLE_PATH``) selects
+      the PUBLIC key by ``key_id`` and checks the detached signature over the pack's canonical
+      bytes.
+
+    Fail-closed at every step — a pack is registered ONLY if its signature verifies against the
+    pinned bundle:
+
+    * malformed/missing manifest              → 400 (cannot even locate a signature);
+    * no ``manifest.pack_signature`` (unsigned)→ 400 (never trusted);
+    * unpinned ``key_id`` / invalid / tampered → 400 (``TrustBundleVerifier.verify_pack`` is False);
+    * non-audit-safe id:version               → 400 (the admission cannot be audited, issue #59);
+    * malformed manifest / non-semver version → 400 (registry ``publish`` rejects it);
+    * immutable-version conflict              → 409 (same ``id@version``, different content).
 
     Only after verification does it call :meth:`PackRegistry.publish` (the immutability gate) and
     return the resulting :class:`~packs_engine.registry.RegistryEntry`. The imported registry is
@@ -1379,21 +1416,30 @@ def import_pack(
     whose bytes are not yet in the content root safely runs nothing under its assignment.
     """
     actor = _request_actor(request)
-    signature = req.signature
+    # Read the detached signature from the SAME place the runtime does — the pack-embedded
+    # ``manifest.pack_signature`` — so import and runtime verify the identical envelope (issue #89,
+    # R2). A malformed/missing manifest or an unsigned pack is rejected fail-closed (bounded
+    # detail).
+    manifest_raw = req.pack.get("manifest") if isinstance(req.pack, dict) else None
+    if not isinstance(manifest_raw, dict):
+        raise HTTPException(
+            status_code=400, detail="import rejected: missing or malformed manifest (fail closed)"
+        )
+    try:
+        manifest = PackManifest(**manifest_raw)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400, detail="import rejected: malformed manifest (fail closed)"
+        ) from exc
+    signature = manifest.pack_signature
     if signature is None:
         raise HTTPException(
-            status_code=400, detail="import rejected: bundle is unsigned (fail closed)"
+            status_code=400, detail="import rejected: pack is unsigned (fail closed)"
         )
-    if verifier is None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "import rejected: no pack trust root is configured, so a present signature cannot "
-                "be verified (set WP_PACK_PUBLIC_KEY); failing closed"
-            ),
-        )
-    if not verify_pack(req.pack, signature, verifier):
-        # Audit the fail-closed rejection of a tampered/invalid bundle (issue #59), then reject.
+    # Verify against the SHARED pinned trust bundle (the SAME verifier the runtime resolver uses):
+    # an unpinned key_id, an empty/corrupt bundle, or a tampered signature all fail closed here.
+    if not import_verifier.verify_pack(req.pack, signature):
+        # Audit the fail-closed rejection of an untrusted/tampered pack (issue #59), then reject.
         audit.emit(
             actor=actor,
             action=AuditAction.pack_verify,
@@ -1402,50 +1448,87 @@ def import_pack(
         )
         raise HTTPException(
             status_code=400,
-            detail="import rejected: detached signature is invalid or the bundle was tampered",
+            detail=(
+                "import rejected: signature is unsigned by a trusted key or the pack was tampered "
+                "(fail closed)"
+            ),
         )
+    # Audit-safe subject BEFORE any mutation (issue #59, FIX 5): the pack id:version derived subject
+    # must be recordable, else a later emit could be silently dropped and leave a committed-but-
+    # unaudited publish. Use the validated manifest's id/version and reject up front if it is not
+    # audit-safe (e.g. a crafted id bearing ``@``/whitespace) — the registry is never mutated.
+    pack_id = str(manifest.id)
+    pack_version = str(manifest.version)
+    subject = f"{pack_id}:{pack_version}"
+    if not is_audit_safe(subject):
+        raise HTTPException(
+            status_code=400,
+            detail="import rejected: pack identifiers are not auditable (fail closed)",
+        )
+    # Audit-BEFORE-mutate: the verification succeeded above, so record ``pack.verify`` success FIRST
+    # (fail closed if it cannot be constructed) — before the registry is mutated by ``publish``.
+    _emit_pack_audit_or_fail_closed(
+        audit,
+        actor=actor,
+        action=AuditAction.pack_verify,
+        subject=subject,
+        result=AuditResult.success,
+        pack_id=pack_id,
+        pack_version=pack_version,
+    )
     try:
-        entry = packs_registry.publish(req.pack)
+        # FIX 1 (issue #37/#89): persist the SAME verified detached signature (from
+        # ``manifest.pack_signature``) on the entry so the runtime resolver can INDEPENDENTLY
+        # re-verify it against the same pinned bundle. Omitting it would record a legacy-untrusted
+        # entry that the resolver fails closed — every imported pack would then never execute.
+        entry = packs_registry.publish(req.pack, signature=signature)
     except ImmutableVersionError as exc:
         raise HTTPException(
             status_code=409, detail="import rejected: immutable version conflict (fail closed)"
         ) from exc
     except (InvalidVersionError, ValueError) as exc:
         raise HTTPException(
-            status_code=400, detail="import rejected: invalid pack manifest or version (fail closed)"
+            status_code=400,
+            detail="import rejected: invalid pack manifest or version (fail closed)",
         ) from exc
     except RegistryError as exc:
         raise HTTPException(
             status_code=400, detail="import rejected: registry rejected the pack (fail closed)"
         ) from exc
-    # Record the verified admission (best-effort, PII-free): the pack id:version identity only.
-    pack_ref = f"{entry.ref.id}:{entry.ref.version}"
-    audit.emit(
-        actor=actor,
-        action=AuditAction.pack_verify,
-        subject=pack_ref,
-        result=AuditResult.success,
-        pack_id=entry.ref.id,
-        pack_version=entry.ref.version,
-    )
-    audit.emit(
+    # Record the completed admission (``pack.import`` success). The subject was pre-validated
+    # audit-safe, so this cannot be dropped for a bad subject; a durable-append outage remains the
+    # accepted best-effort allowance for this non-security-material action (issue #99).
+    _emit_pack_audit_or_fail_closed(
+        audit,
         actor=actor,
         action=AuditAction.pack_import,
-        subject=pack_ref,
+        subject=f"{entry.ref.id}:{entry.ref.version}",
         result=AuditResult.success,
         pack_id=entry.ref.id,
         pack_version=entry.ref.version,
     )
-    return entry.to_dict()
+    # Egress the keyless, PII-free registry view (id/version/type/digest/createdAt/signed) — the
+    # same bounded projection the catalogue uses; the raw key id / signature bytes never egress.
+    return PackRegistryEntryView(
+        id=entry.ref.id,
+        version=entry.ref.version,
+        type=entry.type.value,
+        digest=entry.digest,
+        createdAt=entry.createdAt.isoformat(),
+        signed=entry.detached_signature() is not None,
+    )
 
 
 class PackAssignmentRequest(BaseModel):
-    """Assign a pack version to the path workload. ``assignedAt`` is set by the core (provenance).
+    """Assign a pack version to the path workload.
+
+    ``assignedBy`` is NOT accepted from the caller (issue #37, FIX 4): it is derived server-side
+    from the AUTHENTICATED principal so it cannot be spoofed and can never carry a client-supplied
+    email/PII into stored + egressed provenance. ``assignedAt`` is set by the core.
     """
 
     packId: str
     version: str
-    assignedBy: str
 
 
 @app.put("/api/workloads/{workload}/pack-assignments")
@@ -1455,24 +1538,49 @@ def put_pack_assignment(
     request: Request,
     store: ScopedStoreDep,
     packs_registry: PackRegistryDep,
+    import_verifier: PackImportVerifierDep,
     audit: AuditDep,
     _principal: OperatorDep,
 ) -> PackAssignment:
     """Pin ``workload`` to ``packId@version`` (single writer; records assignedBy/assignedAt).
 
-    Fail-closed binding to VERIFIED content: an assignment may only point at an EXACT immutable
-    registry entry for ``packId@version``. The registry holds *only* signature-verified imported
-    packs (``POST /api/packs/import`` publishes into it after :func:`shared.signing.verify_pack`),
-    so requiring ``registry.get(packId@version)`` before persisting guarantees a workload can never
-    be pinned to an un-imported / unverified version. If no such entry exists we persist NOTHING
-    and reject 422 — a run can then never resolve unverified content under an assigned id.
+    Fail-closed binding to VERIFIED, TRUSTED content: an assignment may only point at a registry
+    entry that the RUNTIME resolver would actually run (issue #89, R2). The runtime
+    (:meth:`packs_engine.engine.PacksEngine._resolve_imported_packs`) fails closed on an entry that
+    is unsigned, or whose persisted signature's key is not pinned in the shared trust bundle — so
+    merely EXISTING in the registry is not enough. This endpoint mirrors that same trust gate before
+    persisting, so you can only ever assign a version the runtime will run; otherwise it persists
+    NOTHING and rejects (fail closed).
 
     Tenant isolation (issue #65): the assignment is persisted through the TENANT-SCOPED store, so
     it lands in the resolved tenant's partition and a tenant can never see or overwrite another
     tenant's pack assignments. Requires the ``operator`` role (deny-by-default, issue #64) and
     records a PII-free ``pack.assign`` audit event (subject = ``packId:version``, issue #59).
+
+    Fail-closed guards, ALL before any write (nothing is persisted unless every guard passes):
+      * the derived audit subject (``packId:version``) MUST be audit-safe, else 422 — so a dropped
+        audit can never leave an unaudited assignment (FIX 5);
+      * the pack ``id@version`` MUST be an imported registry entry, else 422 (binding to verified
+        content);
+      * the entry MUST be SIGNED and its signing ``key_id`` MUST be pinned in the SHARED trust
+        bundle (the same verifier the runtime uses), else 422 — an unsigned/legacy or untrusted-key
+        entry is one the runtime would refuse to run, so it can never be assigned (FINDING B, R2);
+      * the ``workload`` MUST already exist in THIS tenant's catalogue, else 404 — assigning a pack
+        to a phantom workload is an unknown-resource error, never a silent create (FIX 3);
+      * ``assignedBy`` is DERIVED from the authenticated principal (never the caller), so provenance
+        cannot be spoofed and no client-supplied email/PII is stored or egressed (FIX 4).
     """
-    if packs_registry.get(PackRef(id=req.packId, version=req.version)) is None:
+    # FIX 5: the derived audit subject must be recordable BEFORE anything is mutated. Reject a
+    # non-audit-safe id/version up front (constant, PII-free detail) so no un-auditable assignment
+    # can ever be written.
+    subject = f"{req.packId}:{req.version}"
+    if not is_audit_safe(subject):
+        raise HTTPException(
+            status_code=422,
+            detail="assignment rejected: identifiers are not auditable (fail closed)",
+        )
+    entry = packs_registry.get(PackRef(id=req.packId, version=req.version))
+    if entry is None:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -1480,22 +1588,68 @@ def put_pack_assignment(
                 "(import it via POST /api/packs/import first); failing closed"
             ),
         )
-    assignment = PackAssignment(
-        workload=workload,
-        packId=req.packId,
-        version=req.version,
-        assignedBy=req.assignedBy,
-    )
-    store.put_pack_assignment(assignment)  # API is the single writer (tenant-scoped)
-    # Record the assignment (best-effort, PII-free): the pack id@version identity only.
-    audit.emit(
-        actor=_request_actor(request),
+    # FINDING B (issue #89, R2): existence is not trust — an assignment may only bind a version the
+    # runtime will actually run. This gate is a METADATA/STRUCTURAL pre-filter over the persisted
+    # entry: it requires the entry to be (1) SIGNED (a re-verifiable detached signature), (2) signed
+    # by a key PINNED in the shared trust bundle, and (3) digest-bound (the signature's
+    # canonical_digest equals the entry digest, so the signature covers this exact content).
+    # It is deliberately NOT the cryptographic trust boundary. The CRYPTOGRAPHIC boundary is
+    # enforced twice against the SAME shared TrustBundleVerifier, over the pack's canonical BYTES:
+    # once at IMPORT admission (import_pack fully verifies the detached signature before publish),
+    # and again INDEPENDENTLY by the runtime resolver
+    # (:meth:`packs_engine.engine.PacksEngine._resolve_imported_packs` re-verifies the persisted
+    # signature over the stored bytes and fails closed/skips on any mismatch). A full cryptographic
+    # re-verify HERE would need the pack's canonical bytes, which the metadata-only registry does
+    # not persist until the deferred content-store byte materialization (the TODO(human) above)
+    # lands; that residual — an on-disk-forged entry that passes this pre-filter yet can never
+    # execute (the runtime rejects it) — is tracked as follow-up issue #125. Reject the identical
+    # cases the runtime rejects here (bounded, constant detail) so the two stay in lockstep.
+    stored_signature = entry.detached_signature()
+    if stored_signature is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "assignment rejected: pack version is unsigned or legacy-untrusted (fail closed)"
+            ),
+        )
+    if stored_signature.key_id not in import_verifier.key_ids():
+        raise HTTPException(
+            status_code=422,
+            detail="assignment rejected: pack version's signing key is not trusted (fail closed)",
+        )
+    if stored_signature.canonical_digest != entry.digest:
+        raise HTTPException(
+            status_code=422,
+            detail="assignment rejected: pack signature does not bind its content (fail closed)",
+        )
+    # FIX 3: never assign to an unknown workload. The tenant-scoped catalogue is authoritative; an
+    # unrecognised workload is surfaced (404), not silently created. Constant detail — the caller-
+    # controlled workload name is never echoed back (issue #96).
+    if workload not in set(store.list_workloads()):
+        raise HTTPException(
+            status_code=404, detail="assignment rejected: unknown workload (fail closed)"
+        )
+    # FIX 4: derive the actor from the authenticated principal (the audit-safe oid, never a caller-
+    # supplied string / email). This is the same identity the audit record carries.
+    actor = _request_actor(request)
+    # Audit-BEFORE-write (FIX 5): record ``pack.assign`` FIRST (fail closed if it cannot be
+    # constructed) so a committed assignment can never be unaudited.
+    _emit_pack_audit_or_fail_closed(
+        audit,
+        actor=actor,
         action=AuditAction.pack_assign,
-        subject=f"{req.packId}:{req.version}",
+        subject=subject,
         result=AuditResult.success,
         pack_id=req.packId,
         pack_version=req.version,
     )
+    assignment = PackAssignment(
+        workload=workload,
+        packId=req.packId,
+        version=req.version,
+        assignedBy=actor,
+    )
+    store.put_pack_assignment(assignment)  # API is the single writer (tenant-scoped)
     return assignment
 
 

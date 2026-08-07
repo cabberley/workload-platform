@@ -94,7 +94,6 @@ export function fetchDrift(workload: string): Promise<DriftReport> {
 }
 
 /**
-/**
  * Every pack-version assignment across all workloads (issue #37) — read-only visibility for both
  * Microsoft and the customer. The SPA never assigns; assignment writes go through the API (PUT).
  */

@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { useEffect, useState } from "react";
 import { fetchModules, fetchPackAssignments, fetchWorkloads } from "./api/client";
 import type { ModuleManifest, PackAssignment } from "./api/types";
 import { useAsync, type AsyncState } from "./hooks/useAsync";

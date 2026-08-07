@@ -33,11 +33,37 @@ from shared.module_base import build_default_registry, run_module
 # the worker's compute (read via HTTP) and write-back (POST results) agree on the API base URL.
 
 
-def _fetch_assigned_versions(base_url: str, workload: str) -> dict[str, str]:
+def _auth_headers(token_provider: ApiTokenProvider | None) -> dict[str, str]:
+    """Build request headers for a worker→API call, keylessly authenticated when enabled.
+
+    When ``token_provider`` is set (auth enabled) a fresh bearer for the API audience is minted via
+    the worker's Managed Identity (issue #64/#79) and attached as ``Authorization: Bearer`` — no
+    shared key; inability to mint fails closed inside the provider (raises). When ``None``
+    (``WP_AUTH_MODE=disabled``) no header is sent, matching a server that is not enforcing.
+    """
+    headers: dict[str, str] = {}
+    if token_provider is not None:
+        headers["Authorization"] = f"Bearer {token_provider()}"
+    return headers
+
+
+def _fetch_assigned_versions(
+    base_url: str,
+    workload: str,
+    *,
+    token_provider: ApiTokenProvider | None,
+    client: httpx.Client | None = None,
+) -> dict[str, str]:
     """Read the workload's pack-version assignments over HTTP (read-only). **Fail-closed.**
 
     Returns a ``packId -> version`` map so the worker's compute resolves the ASSIGNED pack version
     (issue #37), mirroring the API ``/run`` endpoint.
+
+    The read is KEYLESSLY authenticated (issue #64, FIX 2): the ``/pack-assignments`` route is
+    ``reader``-protected, so under ``WP_AUTH_MODE=required`` a bearer minted via the worker's
+    Managed Identity is attached — otherwise every workload-scoped worker would be denied (401/403)
+    before it could run. The SAME ``token_provider`` is reused for the result write-back; under
+    ``disabled`` it is ``None`` and no header is sent. ``client`` is injectable for tests.
 
     A *successful* read (HTTP 200 with a well-formed JSON list) is authoritative: an empty list
     means the workload is genuinely unassigned and returns ``{}`` — the resolver then falls back to
@@ -54,9 +80,12 @@ def _fetch_assigned_versions(base_url: str, workload: str) -> dict[str, str]:
     ``null``/lists/dicts into strings — a malformed value must fail the worker, not silently pin an
     unintended reference.
     """
-    response = httpx.get(
-        f"{base_url}/api/workloads/{workload}/pack-assignments", timeout=30.0
-    )
+    url = f"{base_url}/api/workloads/{workload}/pack-assignments"
+    headers = _auth_headers(token_provider)
+    if client is not None:
+        response = client.get(url, headers=headers, timeout=30.0)
+    else:
+        response = httpx.get(url, headers=headers, timeout=30.0)
     response.raise_for_status()  # non-2xx ⇒ httpx.HTTPStatusError (fail closed)
     rows = response.json()  # malformed JSON ⇒ ValueError (fail closed)
     if not isinstance(rows, list):
@@ -100,9 +129,7 @@ def _submit_result(
     disabled``) no header is sent, matching a server that is not enforcing. ``client`` is injectable
     so tests assert header attachment without any network or real Entra.
     """
-    headers: dict[str, str] = {}
-    if token_provider is not None:
-        headers["Authorization"] = f"Bearer {token_provider()}"
+    headers = _auth_headers(token_provider)
     url = f"{base_url}/api/workloads/{workload}/results"
     if client is not None:
         response = client.post(url, json=payload, headers=headers, timeout=30.0)
@@ -160,9 +187,17 @@ def main(argv: list[str] | None = None) -> int:
     # that could execute an unintended version. Fail closed: surface the error and exit non-zero so
     # the ACA Job retries, before any module code runs.
     assigned_versions: dict[str, str] = {}
+    # Build the worker's KEYLESS API token provider ONCE (issue #64/#79, FIX 2), BEFORE the first
+    # authenticated call. Under `WP_AUTH_MODE=required` it mints a bearer for the API audience via
+    # the worker's Managed Identity; under `disabled` it is `None` and no header is sent. The SAME
+    # provider authenticates BOTH the reader-protected assignment read and the result write-back —
+    # built here so the read is never sent unauthenticated (which would 401/403 and abort the run).
+    token_provider = build_api_token_provider()
     if workload:
         try:
-            assigned_versions = _fetch_assigned_versions(base_url, workload)
+            assigned_versions = _fetch_assigned_versions(
+                base_url, workload, token_provider=token_provider
+            )
         except (httpx.HTTPError, ValueError) as exc:
             print(
                 f"error: could not read pack assignments for {workload!r}: {exc}",
@@ -177,11 +212,9 @@ def main(argv: list[str] | None = None) -> int:
     result = run_module(module, scope=scope, state=state, packs=resolved_packs, clients=clients)
 
     if workload:
-        # Authenticate worker→API KEYLESSLY with the worker's own Managed Identity (issue #64/#79):
-        # under `WP_AUTH_MODE=required` a bearer for the API audience is minted and attached;
-        # inability to mint fails closed. Under `disabled` no token is sent (local/dev). No shared
-        # key anywhere. `build_api_token_provider` reads the same auth config as the API server.
-        token_provider = build_api_token_provider()
+        # Reuse the SAME keyless token provider built above (issue #64/#79): under
+        # `WP_AUTH_MODE=required` a bearer for the API audience is attached; inability to mint fails
+        # closed. Under `disabled` no token is sent (local/dev). No shared key anywhere.
         _submit_result(
             base_url, workload, result.model_dump(mode="json"), token_provider=token_provider
         )

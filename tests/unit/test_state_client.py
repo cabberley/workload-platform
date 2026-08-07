@@ -186,7 +186,7 @@ def _wire_worker(monkeypatch, get_handler):
         calls["run"] = int(calls["run"]) + 1  # type: ignore[arg-type]
         return ModuleRunResult(module=module.name, ok=True)
 
-    def _fake_post(url, *, json=None, timeout=None):
+    def _fake_post(url, *, json=None, headers=None, timeout=None):
         calls["post"] = int(calls["post"]) + 1  # type: ignore[arg-type]
         return httpx.Response(200, request=httpx.Request("POST", url))
 
@@ -195,7 +195,13 @@ def _wire_worker(monkeypatch, get_handler):
     monkeypatch.setattr(worker, "build_packs_engine", lambda: object())
     monkeypatch.setattr(worker, "build_client_registry", lambda: {})
     monkeypatch.setattr(worker, "run_module", _fake_run_module)
-    monkeypatch.setattr(httpx, "get", get_handler)
+
+    # The worker now attaches an (empty, under WP_AUTH_MODE=disabled) headers kwarg to the GET
+    # (FIX 2). Adapt so the existing (url, timeout=...) handlers keep working unchanged.
+    def _get_adapter(url, *, headers=None, timeout=None):
+        return get_handler(url, timeout=timeout)
+
+    monkeypatch.setattr(httpx, "get", _get_adapter)
     monkeypatch.setattr(httpx, "post", _fake_post)
     return worker, calls
 
