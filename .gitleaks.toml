@@ -5,8 +5,10 @@
 # GUIDs are public, documented constants (e.g. Key Vault Secrets User =
 # 4633458b-17de-408a-b874-0445c86b69e6), not secrets. The generic
 # secret-keyword heuristic mis-flags them because a variable name contains
-# "Secrets". We exempt ONLY lines that assign a GUID to a *RoleId variable;
-# real credentials are never shaped this way.
+# "Secrets". We exempt ONLY lines that assign a GUID to a *RoleId variable
+# (Bicep form) or a *RoleId JSON property (the compiled ARM mainTemplate.json
+# form used by the marketplace package); real credentials are never shaped
+# this way.
 title = "workloads-platform"
 
 [extend]
@@ -17,4 +19,5 @@ description = "Azure built-in RBAC role-definition GUIDs (public constants, not 
 regexTarget = "line"
 regexes = [
   '''(?i)RoleId\s*=\s*'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'?''',
+  '''(?i)"[a-z0-9_]*RoleId"\s*:\s*"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"''',
 ]

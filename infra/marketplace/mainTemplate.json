@@ -1,0 +1,2829 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.45.15.27210",
+      "templateHash": "3814988001609627757"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources. Defaults to the managed resource group region so data residency holds by construction."
+      }
+    },
+    "containerRegistry": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure Container Registry name (without .azurecr.io) the platform images are pulled from. As scaffolded, the platform core (infra/bicep/modules/core.bicep) CREATES this ACR in the managed resource group, so it starts empty — the container images must be STAGED into it after creation (image-source/staging is the unresolved Phase-2 decision; see README TODO). It does NOT support a turnkey image pull today."
+      }
+    },
+    "imageTag": {
+      "type": "string",
+      "defaultValue": "latest",
+      "metadata": {
+        "description": "Image tag to deploy (usually the release tag)."
+      }
+    },
+    "manageStateImmutabilityPolicy": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Manage the state container time-based immutability (WORM) policy from IaC. Set false once the policy has been LOCKED out-of-band."
+      }
+    },
+    "authMode": {
+      "type": "string",
+      "defaultValue": "disabled",
+      "allowedValues": [
+        "required",
+        "disabled"
+      ],
+      "metadata": {
+        "description": "Entra auth mode for the deployed API. Phase-1 DELIVERED default is \"disabled\" (Option 3, issue #127) — safe ONLY because the API is internal-only (network-isolated, not publicly exposed). \"required\" (fail-closed) validates a bearer token on every request and is the hardening path; it MUST be enabled before exposing the API publicly. NOTE: ../bicep/main.bicep keeps its OWN default of \"required\" for direct deployers; this delivered wrapper defaults to \"disabled\"."
+      }
+    },
+    "authTenantId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Entra tenant (directory) id the API validates tokens against. Non-secret. Required (with authAudience) when authMode = required."
+      }
+    },
+    "authAudience": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Expected API token audience (the API app registration Application ID URI / client id). Non-secret. Required (with authTenantId) when authMode = required."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "aegis-platform",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "containerRegistry": {
+            "value": "[parameters('containerRegistry')]"
+          },
+          "imageTag": {
+            "value": "[parameters('imageTag')]"
+          },
+          "manageStateImmutabilityPolicy": {
+            "value": "[parameters('manageStateImmutabilityPolicy')]"
+          },
+          "authMode": {
+            "value": "[parameters('authMode')]"
+          },
+          "authTenantId": {
+            "value": "[parameters('authTenantId')]"
+          },
+          "authAudience": {
+            "value": "[parameters('authAudience')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.45.15.27210",
+              "templateHash": "5628190771165887985"
+            }
+          },
+          "parameters": {
+            "location": {
+              "type": "string",
+              "defaultValue": "[resourceGroup().location]",
+              "metadata": {
+                "description": "Azure region"
+              }
+            },
+            "containerRegistry": {
+              "type": "string",
+              "metadata": {
+                "description": "Azure Container Registry name (without .azurecr.io). Created by core.bicep."
+              }
+            },
+            "imageTag": {
+              "type": "string",
+              "defaultValue": "latest",
+              "metadata": {
+                "description": "Image tag to deploy (usually the release tag)"
+              }
+            },
+            "manageStateImmutabilityPolicy": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "Manage (create/update) the state container time-based immutability (WORM) policy from IaC (issue #81). Set FALSE once the policy has been LOCKED out-of-band — Azure rejects any PUT on a LOCKED immutability policy, so leaving this true would break every subsequent deployment (core is always deployed)."
+              }
+            },
+            "authMode": {
+              "type": "string",
+              "defaultValue": "required",
+              "metadata": {
+                "description": "Entra auth mode for the deployed API (issue #64). Fail-closed by default: \"required\" means the API validates a bearer token on every request and REFUSES TO SERVE unless authTenantId + authAudience are supplied. Set to \"disabled\" ONLY for a deliberate no-auth environment. Never a secret."
+              }
+            },
+            "authTenantId": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Entra tenant (directory) id the API validates tokens against, and the worker authenticates from (issue #64). Non-secret identifier. Empty by default — MUST be provided (with authAudience) for the fail-closed \"required\" default, or the API will refuse to serve."
+              }
+            },
+            "authAudience": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Expected API token audience — the API app registration Application ID URI / client id (issue #64). Non-secret. Empty by default — MUST be provided (with authTenantId) for the \"required\" default."
+              }
+            }
+          },
+          "variables": {
+            "webIngressExternal": "[equals(parameters('authMode'), 'required')]",
+            "serviceCommand": [
+              "python",
+              "-m",
+              "cli.serve"
+            ],
+            "serviceModules": [
+              {
+                "name": "aiops",
+                "min": 1,
+                "max": 20,
+                "cpu": "1.0",
+                "mem": "2.0Gi",
+                "queue": "telemetry",
+                "cpuUtil": 70
+              },
+              {
+                "name": "alerts",
+                "min": 1,
+                "max": 10,
+                "cpu": "0.5",
+                "mem": "1.0Gi",
+                "queue": "findings",
+                "cpuUtil": 0
+              }
+            ],
+            "jobModules": [
+              {
+                "name": "discovery",
+                "triggerType": "Schedule",
+                "cronExpression": "0 */6 * * *",
+                "queue": "",
+                "min": 0,
+                "max": 10,
+                "cpu": "0.5",
+                "mem": "1.0Gi"
+              },
+              {
+                "name": "quality_checks",
+                "triggerType": "Event",
+                "cronExpression": "",
+                "queue": "assessments",
+                "min": 0,
+                "max": 30,
+                "cpu": "0.5",
+                "mem": "1.0Gi"
+              },
+              {
+                "name": "reassessments",
+                "triggerType": "Schedule",
+                "cronExpression": "0 3 * * *",
+                "queue": "",
+                "min": 0,
+                "max": 5,
+                "cpu": "0.5",
+                "mem": "1.0Gi"
+              },
+              {
+                "name": "dependency_graph",
+                "triggerType": "Event",
+                "cronExpression": "",
+                "queue": "dependency",
+                "min": 0,
+                "max": 10,
+                "cpu": "0.5",
+                "mem": "1.0Gi"
+              }
+            ]
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "core",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "registryName": {
+                    "value": "[parameters('containerRegistry')]"
+                  },
+                  "manageStateImmutabilityPolicy": {
+                    "value": "[parameters('manageStateImmutabilityPolicy')]"
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "13655044261304676736"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string",
+                      "defaultValue": "[resourceGroup().location]",
+                      "metadata": {
+                        "description": "Azure region"
+                      }
+                    },
+                    "namePrefix": {
+                      "type": "string",
+                      "defaultValue": "wp",
+                      "minLength": 1,
+                      "metadata": {
+                        "description": "Short name prefix for resources"
+                      }
+                    },
+                    "resourceToken": {
+                      "type": "string",
+                      "defaultValue": "[uniqueString(resourceGroup().id)]",
+                      "metadata": {
+                        "description": "Resource token to keep names unique"
+                      }
+                    },
+                    "registryName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Azure Container Registry name (alphanumeric, globally unique, without .azurecr.io)"
+                      }
+                    },
+                    "registrySku": {
+                      "type": "string",
+                      "defaultValue": "Basic",
+                      "allowedValues": [
+                        "Basic",
+                        "Standard",
+                        "Premium"
+                      ],
+                      "metadata": {
+                        "description": "Container Registry SKU"
+                      }
+                    },
+                    "queueNames": {
+                      "type": "array",
+                      "defaultValue": [
+                        "dependency",
+                        "assessments",
+                        "telemetry",
+                        "findings"
+                      ],
+                      "metadata": {
+                        "description": "Storage queues the module KEDA triggers reference (mirrors src/modules/*/manifest.yaml)."
+                      }
+                    },
+                    "stateContainerName": {
+                      "type": "string",
+                      "defaultValue": "state",
+                      "minLength": 3,
+                      "maxLength": 63,
+                      "metadata": {
+                        "description": "Name of the durable state Blob container (mirrors WORKLOADS_STATE_CONTAINER, default \"state\")."
+                      }
+                    },
+                    "stateSoftDeleteRetentionDays": {
+                      "type": "int",
+                      "defaultValue": 7,
+                      "minValue": 1,
+                      "maxValue": 365,
+                      "metadata": {
+                        "description": "Soft-delete retention (days) for blobs AND containers on the state account — window to recover a deleted/overwritten state artifact."
+                      }
+                    },
+                    "stateImmutabilityRetentionDays": {
+                      "type": "int",
+                      "defaultValue": 7,
+                      "minValue": 1,
+                      "maxValue": 146000,
+                      "metadata": {
+                        "description": "Time-based immutability (WORM) retention (days) on the state container — an artifact cannot be deleted/overwritten until this elapses. Unlocked so a human can extend/lock it out-of-band."
+                      }
+                    },
+                    "manageStateImmutabilityPolicy": {
+                      "type": "bool",
+                      "defaultValue": true,
+                      "metadata": {
+                        "description": "Manage (create/update) the state container time-based immutability (WORM) policy from IaC. Set FALSE once the policy has been LOCKED out-of-band — Azure rejects any PUT on a LOCKED immutability policy, so leaving this true would break every subsequent deployment (main.bicep always deploys core)."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "laName": "[format('{0}-log-{1}', parameters('namePrefix'), parameters('resourceToken'))]",
+                    "envName": "[format('{0}-env-{1}', parameters('namePrefix'), parameters('resourceToken'))]",
+                    "idApiName": "[format('{0}-id-api-{1}', parameters('namePrefix'), parameters('resourceToken'))]",
+                    "idWorkerName": "[format('{0}-id-worker-{1}', parameters('namePrefix'), parameters('resourceToken'))]",
+                    "idWebName": "[format('{0}-id-web-{1}', parameters('namePrefix'), parameters('resourceToken'))]",
+                    "idGrafanaName": "[format('{0}-id-grafana-{1}', parameters('namePrefix'), parameters('resourceToken'))]",
+                    "kvName": "[take(format('{0}kv{1}', parameters('namePrefix'), parameters('resourceToken')), 24)]",
+                    "saName": "[take(format('{0}st{1}', parameters('namePrefix'), parameters('resourceToken')), 24)]",
+                    "acrPullRoleId": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+                    "storageQueueDataContributorRoleId": "974c5e8b-45b9-4653-ba55-5f855dd0fb88",
+                    "keyVaultSecretsUserRoleId": "4633458b-17de-408a-b874-0445c86b69e6",
+                    "readerRoleId": "acdd72a7-3385-48ef-bd42-f606fba81ae7",
+                    "storageBlobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+                    "storageTableDataContributorRoleId": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
+                    "monitoringReaderRoleId": "43d0d8ad-25c7-4714-9337-8ba259a9fe05",
+                    "logAnalyticsReaderRoleId": "73c42c96-874c-492b-b04d-ab87d138a893"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+                      "apiVersion": "2023-01-31",
+                      "name": "[variables('idApiName')]",
+                      "location": "[parameters('location')]"
+                    },
+                    {
+                      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+                      "apiVersion": "2023-01-31",
+                      "name": "[variables('idWorkerName')]",
+                      "location": "[parameters('location')]"
+                    },
+                    {
+                      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+                      "apiVersion": "2023-01-31",
+                      "name": "[variables('idWebName')]",
+                      "location": "[parameters('location')]"
+                    },
+                    {
+                      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+                      "apiVersion": "2023-01-31",
+                      "name": "[variables('idGrafanaName')]",
+                      "location": "[parameters('location')]"
+                    },
+                    {
+                      "type": "Microsoft.ContainerRegistry/registries",
+                      "apiVersion": "2023-11-01-preview",
+                      "name": "[parameters('registryName')]",
+                      "location": "[parameters('location')]",
+                      "sku": {
+                        "name": "[parameters('registrySku')]"
+                      },
+                      "properties": {
+                        "adminUserEnabled": false
+                      }
+                    },
+                    {
+                      "type": "Microsoft.OperationalInsights/workspaces",
+                      "apiVersion": "2023-09-01",
+                      "name": "[variables('laName')]",
+                      "location": "[parameters('location')]",
+                      "properties": {
+                        "sku": {
+                          "name": "PerGB2018"
+                        },
+                        "retentionInDays": 30
+                      }
+                    },
+                    {
+                      "type": "Microsoft.Storage/storageAccounts",
+                      "apiVersion": "2023-05-01",
+                      "name": "[variables('saName')]",
+                      "location": "[parameters('location')]",
+                      "sku": {
+                        "name": "Standard_LRS"
+                      },
+                      "kind": "StorageV2",
+                      "properties": {
+                        "allowBlobPublicAccess": false,
+                        "allowSharedKeyAccess": false,
+                        "minimumTlsVersion": "TLS1_2"
+                      }
+                    },
+                    {
+                      "type": "Microsoft.Storage/storageAccounts/queueServices",
+                      "apiVersion": "2023-05-01",
+                      "name": "[format('{0}/{1}', variables('saName'), 'default')]",
+                      "dependsOn": [
+                        "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]"
+                      ]
+                    },
+                    {
+                      "copy": {
+                        "name": "queues",
+                        "count": "[length(parameters('queueNames'))]"
+                      },
+                      "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+                      "apiVersion": "2023-05-01",
+                      "name": "[format('{0}/{1}/{2}', variables('saName'), 'default', parameters('queueNames')[copyIndex()])]",
+                      "dependsOn": [
+                        "[resourceId('Microsoft.Storage/storageAccounts/queueServices', variables('saName'), 'default')]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Storage/storageAccounts/blobServices",
+                      "apiVersion": "2023-05-01",
+                      "name": "[format('{0}/{1}', variables('saName'), 'default')]",
+                      "properties": {
+                        "isVersioningEnabled": true,
+                        "changeFeed": {
+                          "enabled": true
+                        },
+                        "deleteRetentionPolicy": {
+                          "enabled": true,
+                          "days": "[parameters('stateSoftDeleteRetentionDays')]"
+                        },
+                        "containerDeleteRetentionPolicy": {
+                          "enabled": true,
+                          "days": "[parameters('stateSoftDeleteRetentionDays')]"
+                        }
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+                      "apiVersion": "2023-05-01",
+                      "name": "[format('{0}/{1}/{2}', variables('saName'), 'default', parameters('stateContainerName'))]",
+                      "properties": {
+                        "publicAccess": "None"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.Storage/storageAccounts/blobServices', variables('saName'), 'default')]"
+                      ]
+                    },
+                    {
+                      "condition": "[parameters('manageStateImmutabilityPolicy')]",
+                      "type": "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies",
+                      "apiVersion": "2023-05-01",
+                      "name": "[format('{0}/{1}/{2}/{3}', variables('saName'), 'default', parameters('stateContainerName'), 'default')]",
+                      "properties": {
+                        "immutabilityPeriodSinceCreationInDays": "[parameters('stateImmutabilityRetentionDays')]",
+                        "allowProtectedAppendWrites": true
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('saName'), 'default', parameters('stateContainerName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.KeyVault/vaults",
+                      "apiVersion": "2023-07-01",
+                      "name": "[variables('kvName')]",
+                      "location": "[parameters('location')]",
+                      "properties": {
+                        "sku": {
+                          "family": "A",
+                          "name": "standard"
+                        },
+                        "tenantId": "[subscription().tenantId]",
+                        "enableRbacAuthorization": true
+                      }
+                    },
+                    {
+                      "type": "Microsoft.App/managedEnvironments",
+                      "apiVersion": "2025-01-01",
+                      "name": "[variables('envName')]",
+                      "location": "[parameters('location')]",
+                      "properties": {
+                        "appLogsConfiguration": {
+                          "destination": "azure-monitor"
+                        }
+                      }
+                    },
+                    {
+                      "type": "Microsoft.Insights/diagnosticSettings",
+                      "apiVersion": "2021-05-01-preview",
+                      "scope": "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
+                      "name": "send-to-log-analytics",
+                      "properties": {
+                        "workspaceId": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('laName'))]",
+                        "logs": [
+                          {
+                            "categoryGroup": "allLogs",
+                            "enabled": true
+                          }
+                        ]
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
+                        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('laName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName'))]",
+                      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), variables('acrPullRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName'))]",
+                        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName'))]",
+                      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), variables('acrPullRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName'))]",
+                        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName'))]",
+                      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWebName')), variables('acrPullRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('acrPullRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWebName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWebName'))]",
+                        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]",
+                      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('saName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), variables('storageQueueDataContributorRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageQueueDataContributorRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName'))]",
+                        "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]",
+                      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('saName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), variables('storageQueueDataContributorRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageQueueDataContributorRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName'))]",
+                        "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]",
+                      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('kvName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), variables('keyVaultSecretsUserRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('keyVaultSecretsUserRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName'))]",
+                        "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]",
+                      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('kvName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), variables('keyVaultSecretsUserRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('keyVaultSecretsUserRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName'))]",
+                        "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "name": "[guid(resourceGroup().id, resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), variables('readerRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('readerRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "name": "[guid(resourceGroup().id, resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), variables('monitoringReaderRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('monitoringReaderRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('laName'))]",
+                      "name": "[guid(resourceId('Microsoft.OperationalInsights/workspaces', variables('laName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), variables('logAnalyticsReaderRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('logAnalyticsReaderRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName'))]",
+                        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('laName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]",
+                      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('saName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), variables('storageTableDataContributorRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageTableDataContributorRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName'))]",
+                        "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]",
+                      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('saName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), variables('storageBlobDataContributorRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDataContributorRoleId'))]",
+                        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), '2023-01-31').principalId]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName'))]",
+                        "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]"
+                      ]
+                    }
+                  ],
+                  "outputs": {
+                    "environmentId": {
+                      "type": "string",
+                      "value": "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]"
+                    },
+                    "identityApiId": {
+                      "type": "string",
+                      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName'))]"
+                    },
+                    "identityApiClientId": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), '2023-01-31').clientId]"
+                    },
+                    "identityApiPrincipalId": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idApiName')), '2023-01-31').principalId]"
+                    },
+                    "identityWorkerId": {
+                      "type": "string",
+                      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName'))]"
+                    },
+                    "identityWorkerClientId": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').clientId]"
+                    },
+                    "identityWorkerPrincipalId": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWorkerName')), '2023-01-31').principalId]"
+                    },
+                    "identityWebId": {
+                      "type": "string",
+                      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWebName'))]"
+                    },
+                    "identityWebClientId": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idWebName')), '2023-01-31').clientId]"
+                    },
+                    "identityGrafanaId": {
+                      "type": "string",
+                      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idGrafanaName'))]"
+                    },
+                    "identityGrafanaPrincipalId": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('idGrafanaName')), '2023-01-31').principalId]"
+                    },
+                    "storageName": {
+                      "type": "string",
+                      "value": "[variables('saName')]"
+                    },
+                    "storageAccountId": {
+                      "type": "string",
+                      "value": "[resourceId('Microsoft.Storage/storageAccounts', variables('saName'))]"
+                    },
+                    "keyVaultName": {
+                      "type": "string",
+                      "value": "[variables('kvName')]"
+                    },
+                    "keyVaultUri": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.KeyVault/vaults', variables('kvName')), '2023-07-01').vaultUri]"
+                    },
+                    "logAnalyticsId": {
+                      "type": "string",
+                      "value": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('laName'))]"
+                    },
+                    "logAnalyticsName": {
+                      "type": "string",
+                      "value": "[variables('laName')]"
+                    },
+                    "registryName": {
+                      "type": "string",
+                      "value": "[parameters('registryName')]"
+                    },
+                    "registryLoginServer": {
+                      "type": "string",
+                      "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('registryName')), '2023-11-01-preview').loginServer]"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "grafana",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "identityResourceId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityGrafanaId.value]"
+                  },
+                  "identityPrincipalId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityGrafanaPrincipalId.value]"
+                  },
+                  "logAnalyticsName": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.logAnalyticsName.value]"
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "2483472360130829914"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string",
+                      "defaultValue": "[resourceGroup().location]"
+                    },
+                    "namePrefix": {
+                      "type": "string",
+                      "defaultValue": "wp",
+                      "minLength": 1,
+                      "metadata": {
+                        "description": "Short name prefix for resources (matches core.bicep)"
+                      }
+                    },
+                    "resourceToken": {
+                      "type": "string",
+                      "defaultValue": "[uniqueString(resourceGroup().id)]",
+                      "metadata": {
+                        "description": "Resource token to keep the globally-unique Grafana name stable per resource group"
+                      }
+                    },
+                    "identityResourceId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Resource id of the dedicated read-only Grafana user-assigned Managed Identity (from core.outputs.identityGrafanaId, issue #79)"
+                      }
+                    },
+                    "identityPrincipalId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Principal (object) id of that identity (from core.outputs.identityGrafanaPrincipalId) — the RBAC target"
+                      }
+                    },
+                    "logAnalyticsName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Name of the in-boundary Log Analytics workspace (from core.outputs.logAnalyticsName). Used to scope the Log Analytics Reader assignment to that single workspace — least privilege."
+                      }
+                    },
+                    "grafanaSku": {
+                      "type": "string",
+                      "defaultValue": "Standard",
+                      "allowedValues": [
+                        "Standard"
+                      ],
+                      "metadata": {
+                        "description": "Grafana SKU. Standard is the only GA tier."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "grafanaName": "[take(format('{0}-grafana-{1}', parameters('namePrefix'), parameters('resourceToken')), 23)]",
+                    "monitoringReaderRoleId": "43d0d8ad-25c7-4714-9337-8ba259a9fe05",
+                    "logAnalyticsReaderRoleId": "73c42c96-874c-492b-b04d-ab87d138a893"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.Dashboard/grafana",
+                      "apiVersion": "2023-09-01",
+                      "name": "[variables('grafanaName')]",
+                      "location": "[parameters('location')]",
+                      "sku": {
+                        "name": "[parameters('grafanaSku')]"
+                      },
+                      "identity": {
+                        "type": "UserAssigned",
+                        "userAssignedIdentities": {
+                          "[format('{0}', parameters('identityResourceId'))]": {}
+                        }
+                      },
+                      "properties": {
+                        "apiKey": "Disabled",
+                        "publicNetworkAccess": "Enabled",
+                        "grafanaIntegrations": {
+                          "azureMonitorWorkspaceIntegrations": []
+                        }
+                      }
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "name": "[guid(resourceGroup().id, parameters('identityPrincipalId'), variables('monitoringReaderRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('monitoringReaderRoleId'))]",
+                        "principalId": "[parameters('identityPrincipalId')]",
+                        "principalType": "ServicePrincipal"
+                      }
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName'))]",
+                      "name": "[guid(resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsName')), parameters('identityPrincipalId'), variables('logAnalyticsReaderRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('logAnalyticsReaderRoleId'))]",
+                        "principalId": "[parameters('identityPrincipalId')]",
+                        "principalType": "ServicePrincipal"
+                      }
+                    }
+                  ],
+                  "outputs": {
+                    "grafanaEndpoint": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Public endpoint of the Managed Grafana instance (no secrets)."
+                      },
+                      "value": "[reference(resourceId('Microsoft.Dashboard/grafana', variables('grafanaName')), '2023-09-01').endpoint]"
+                    },
+                    "grafanaName": {
+                      "type": "string",
+                      "value": "[variables('grafanaName')]"
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Resources/deployments', 'core')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "telemetry-export",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "logAnalyticsId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.logAnalyticsId.value]"
+                  },
+                  "logAnalyticsName": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.logAnalyticsName.value]"
+                  },
+                  "publisherPrincipalId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerPrincipalId.value]"
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "8452908063266980556"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string",
+                      "defaultValue": "[resourceGroup().location]"
+                    },
+                    "namePrefix": {
+                      "type": "string",
+                      "defaultValue": "wp",
+                      "minLength": 1,
+                      "metadata": {
+                        "description": "Short name prefix for resources (matches core.bicep)"
+                      }
+                    },
+                    "resourceToken": {
+                      "type": "string",
+                      "defaultValue": "[uniqueString(resourceGroup().id)]",
+                      "metadata": {
+                        "description": "Resource token to keep names stable per resource group"
+                      }
+                    },
+                    "logAnalyticsId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Resource id of the in-boundary Log Analytics workspace (from core.outputs.logAnalyticsId)"
+                      }
+                    },
+                    "logAnalyticsName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Name of the in-boundary Log Analytics workspace (from core.outputs.logAnalyticsName)"
+                      }
+                    },
+                    "publisherPrincipalId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Principal (object) id of the worker Managed Identity that publishes telemetry (from core.outputs.identityWorkerPrincipalId, issue #79). It runs the telemetry_export Job."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "monitoringMetricsPublisherRoleId": "3913510d-42f4-4e42-8a64-420c390055eb",
+                    "dceName": "[take(format('{0}-dce-{1}', parameters('namePrefix'), parameters('resourceToken')), 44)]",
+                    "dcrName": "[take(format('{0}-dcr-telemetry-{1}', parameters('namePrefix'), parameters('resourceToken')), 64)]"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.OperationalInsights/workspaces/tables",
+                      "apiVersion": "2022-10-01",
+                      "name": "[format('{0}/{1}', parameters('logAnalyticsName'), 'WpNodeState_CL')]",
+                      "properties": {
+                        "plan": "Analytics",
+                        "schema": {
+                          "name": "WpNodeState_CL",
+                          "columns": [
+                            {
+                              "name": "TimeGenerated",
+                              "type": "datetime"
+                            },
+                            {
+                              "name": "Workload_s",
+                              "type": "string"
+                            },
+                            {
+                              "name": "State_s",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "Microsoft.OperationalInsights/workspaces/tables",
+                      "apiVersion": "2022-10-01",
+                      "name": "[format('{0}/{1}', parameters('logAnalyticsName'), 'WpSpof_CL')]",
+                      "properties": {
+                        "plan": "Analytics",
+                        "schema": {
+                          "name": "WpSpof_CL",
+                          "columns": [
+                            {
+                              "name": "TimeGenerated",
+                              "type": "datetime"
+                            },
+                            {
+                              "name": "Workload_s",
+                              "type": "string"
+                            },
+                            {
+                              "name": "NodeRef_s",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "Microsoft.OperationalInsights/workspaces/tables",
+                      "apiVersion": "2022-10-01",
+                      "name": "[format('{0}/{1}', parameters('logAnalyticsName'), 'WpFinding_CL')]",
+                      "properties": {
+                        "plan": "Analytics",
+                        "schema": {
+                          "name": "WpFinding_CL",
+                          "columns": [
+                            {
+                              "name": "TimeGenerated",
+                              "type": "datetime"
+                            },
+                            {
+                              "name": "Workload_s",
+                              "type": "string"
+                            },
+                            {
+                              "name": "BlastRadius_d",
+                              "type": "real"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "Microsoft.OperationalInsights/workspaces/tables",
+                      "apiVersion": "2022-10-01",
+                      "name": "[format('{0}/{1}', parameters('logAnalyticsName'), 'WpConnectorFetch_CL')]",
+                      "properties": {
+                        "plan": "Analytics",
+                        "schema": {
+                          "name": "WpConnectorFetch_CL",
+                          "columns": [
+                            {
+                              "name": "TimeGenerated",
+                              "type": "datetime"
+                            },
+                            {
+                              "name": "Connector_s",
+                              "type": "string"
+                            },
+                            {
+                              "name": "Success_b",
+                              "type": "boolean"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "Microsoft.Insights/dataCollectionEndpoints",
+                      "apiVersion": "2023-03-11",
+                      "name": "[variables('dceName')]",
+                      "location": "[parameters('location')]",
+                      "properties": {
+                        "networkAcls": {
+                          "publicNetworkAccess": "Enabled"
+                        }
+                      }
+                    },
+                    {
+                      "type": "Microsoft.Insights/dataCollectionRules",
+                      "apiVersion": "2023-03-11",
+                      "name": "[variables('dcrName')]",
+                      "location": "[parameters('location')]",
+                      "properties": {
+                        "dataCollectionEndpointId": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('dceName'))]",
+                        "streamDeclarations": {
+                          "Custom-WpNodeState_CL": {
+                            "columns": [
+                              {
+                                "name": "TimeGenerated",
+                                "type": "datetime"
+                              },
+                              {
+                                "name": "Workload_s",
+                                "type": "string"
+                              },
+                              {
+                                "name": "State_s",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "Custom-WpSpof_CL": {
+                            "columns": [
+                              {
+                                "name": "TimeGenerated",
+                                "type": "datetime"
+                              },
+                              {
+                                "name": "Workload_s",
+                                "type": "string"
+                              },
+                              {
+                                "name": "NodeRef_s",
+                                "type": "string"
+                              }
+                            ]
+                          },
+                          "Custom-WpFinding_CL": {
+                            "columns": [
+                              {
+                                "name": "TimeGenerated",
+                                "type": "datetime"
+                              },
+                              {
+                                "name": "Workload_s",
+                                "type": "string"
+                              },
+                              {
+                                "name": "BlastRadius_d",
+                                "type": "real"
+                              }
+                            ]
+                          },
+                          "Custom-WpConnectorFetch_CL": {
+                            "columns": [
+                              {
+                                "name": "TimeGenerated",
+                                "type": "datetime"
+                              },
+                              {
+                                "name": "Connector_s",
+                                "type": "string"
+                              },
+                              {
+                                "name": "Success_b",
+                                "type": "boolean"
+                              }
+                            ]
+                          }
+                        },
+                        "destinations": {
+                          "logAnalytics": [
+                            {
+                              "workspaceResourceId": "[parameters('logAnalyticsId')]",
+                              "name": "inBoundaryWorkspace"
+                            }
+                          ]
+                        },
+                        "dataFlows": [
+                          {
+                            "streams": [
+                              "Custom-WpNodeState_CL"
+                            ],
+                            "destinations": [
+                              "inBoundaryWorkspace"
+                            ],
+                            "transformKql": "source",
+                            "outputStream": "Custom-WpNodeState_CL"
+                          },
+                          {
+                            "streams": [
+                              "Custom-WpSpof_CL"
+                            ],
+                            "destinations": [
+                              "inBoundaryWorkspace"
+                            ],
+                            "transformKql": "source",
+                            "outputStream": "Custom-WpSpof_CL"
+                          },
+                          {
+                            "streams": [
+                              "Custom-WpFinding_CL"
+                            ],
+                            "destinations": [
+                              "inBoundaryWorkspace"
+                            ],
+                            "transformKql": "source",
+                            "outputStream": "Custom-WpFinding_CL"
+                          },
+                          {
+                            "streams": [
+                              "Custom-WpConnectorFetch_CL"
+                            ],
+                            "destinations": [
+                              "inBoundaryWorkspace"
+                            ],
+                            "transformKql": "source",
+                            "outputStream": "Custom-WpConnectorFetch_CL"
+                          }
+                        ]
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('dceName'))]",
+                        "[resourceId('Microsoft.OperationalInsights/workspaces/tables', parameters('logAnalyticsName'), 'WpConnectorFetch_CL')]",
+                        "[resourceId('Microsoft.OperationalInsights/workspaces/tables', parameters('logAnalyticsName'), 'WpFinding_CL')]",
+                        "[resourceId('Microsoft.OperationalInsights/workspaces/tables', parameters('logAnalyticsName'), 'WpNodeState_CL')]",
+                        "[resourceId('Microsoft.OperationalInsights/workspaces/tables', parameters('logAnalyticsName'), 'WpSpof_CL')]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.Authorization/roleAssignments",
+                      "apiVersion": "2022-04-01",
+                      "scope": "[resourceId('Microsoft.Insights/dataCollectionRules', variables('dcrName'))]",
+                      "name": "[guid(resourceId('Microsoft.Insights/dataCollectionRules', variables('dcrName')), parameters('publisherPrincipalId'), variables('monitoringMetricsPublisherRoleId'))]",
+                      "properties": {
+                        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('monitoringMetricsPublisherRoleId'))]",
+                        "principalId": "[parameters('publisherPrincipalId')]",
+                        "principalType": "ServicePrincipal"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.Insights/dataCollectionRules', variables('dcrName'))]"
+                      ]
+                    }
+                  ],
+                  "outputs": {
+                    "dceLogsIngestionEndpoint": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Logs Ingestion endpoint URI of the Data Collection Endpoint (no secret). Feeds TELEMETRY_EXPORT_DCE_ENDPOINT."
+                      },
+                      "value": "[reference(resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('dceName')), '2023-03-11').logsIngestion.endpoint]"
+                    },
+                    "dcrImmutableId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Immutable id of the Data Collection Rule (no secret). Feeds TELEMETRY_EXPORT_DCR_IMMUTABLE_ID."
+                      },
+                      "value": "[reference(resourceId('Microsoft.Insights/dataCollectionRules', variables('dcrName')), '2023-03-11').immutableId]"
+                    },
+                    "dceName": {
+                      "type": "string",
+                      "value": "[variables('dceName')]"
+                    },
+                    "dcrName": {
+                      "type": "string",
+                      "value": "[variables('dcrName')]"
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Resources/deployments', 'core')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "app-api",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "environmentId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.environmentId.value]"
+                  },
+                  "identityId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityApiId.value]"
+                  },
+                  "identityClientId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityApiClientId.value]"
+                  },
+                  "storageName": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.storageName.value]"
+                  },
+                  "registry": {
+                    "value": "[parameters('containerRegistry')]"
+                  },
+                  "imageTag": {
+                    "value": "[parameters('imageTag')]"
+                  },
+                  "moduleName": {
+                    "value": "api"
+                  },
+                  "image": {
+                    "value": "api"
+                  },
+                  "minReplicas": {
+                    "value": 1
+                  },
+                  "maxReplicas": {
+                    "value": 3
+                  },
+                  "cpu": {
+                    "value": "0.5"
+                  },
+                  "memoryGi": {
+                    "value": "1.0Gi"
+                  },
+                  "httpConcurrency": {
+                    "value": 50
+                  },
+                  "ingressExternal": {
+                    "value": false
+                  },
+                  "keyVaultUri": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.keyVaultUri.value]"
+                  },
+                  "authMode": {
+                    "value": "[parameters('authMode')]"
+                  },
+                  "authTenantId": {
+                    "value": "[parameters('authTenantId')]"
+                  },
+                  "authAudience": {
+                    "value": "[parameters('authAudience')]"
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "13848595473353582556"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string"
+                    },
+                    "environmentId": {
+                      "type": "string"
+                    },
+                    "identityId": {
+                      "type": "string"
+                    },
+                    "identityClientId": {
+                      "type": "string"
+                    },
+                    "registry": {
+                      "type": "string"
+                    },
+                    "imageTag": {
+                      "type": "string"
+                    },
+                    "moduleName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Module name, e.g. aiops"
+                      }
+                    },
+                    "image": {
+                      "type": "string"
+                    },
+                    "minReplicas": {
+                      "type": "int",
+                      "defaultValue": 1
+                    },
+                    "maxReplicas": {
+                      "type": "int",
+                      "defaultValue": 10
+                    },
+                    "cpu": {
+                      "type": "string",
+                      "defaultValue": "0.5"
+                    },
+                    "memoryGi": {
+                      "type": "string",
+                      "defaultValue": "1.0Gi"
+                    },
+                    "command": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Container command override (e.g. the service entrypoint). Empty => use image default."
+                      }
+                    },
+                    "storageName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Storage account name backing keyless azure-queue KEDA scalers"
+                      }
+                    },
+                    "queueName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "azure-queue KEDA trigger: queue name (\"\" = none). queueLength uses KEDA default (5)."
+                      }
+                    },
+                    "cpuUtilization": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "cpu KEDA trigger: target Utilization percent (0 = none)"
+                      }
+                    },
+                    "httpConcurrency": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "http KEDA trigger: concurrent requests per replica (0 = none)"
+                      }
+                    },
+                    "envVars": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Extra env vars"
+                      }
+                    },
+                    "keyVaultUri": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Key Vault resource URI (e.g. https://<vault>.vault.azure.net) backing secretRefs. Empty => no Key Vault-backed secrets and no WP_KEY_VAULT_URI injected."
+                      }
+                    },
+                    "keyVaultSecrets": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Key Vault-backed secrets to inject by identity (issue #85). Each item: { secretRefName, secretName, envVar } — a container secret named secretRefName sourced from keyVaultUri/secrets/secretName, surfaced to the app as env var envVar via secretRef. Never a plaintext value here."
+                      }
+                    },
+                    "authMode": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra auth mode for the API (issue #64): \"required\" (fail-closed default — the API refuses to serve unless authTenantId + authAudience are set), or \"disabled\" (deliberate no-auth). Empty => not injected (only the API core needs it). Non-secret."
+                      }
+                    },
+                    "authTenantId": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra tenant (directory) id the API validates tokens against (issue #64). Non-secret identifier. Empty => not injected."
+                      }
+                    },
+                    "authAudience": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Expected token audience — the API app registration Application ID URI / client id (issue #64). Non-secret. Empty => not injected."
+                      }
+                    },
+                    "ingressExternal": {
+                      "type": "bool",
+                      "defaultValue": false,
+                      "metadata": {
+                        "description": "Whether this app gets PUBLIC (external) Container Apps ingress. Only meaningful for the web app; the API is ALWAYS internal. review-67-v4 invariant: the public web front door is opened ONLY when the platform enforces required auth — main.bicep sets this to (authMode == required). Default false => internal-only (fail-closed, zero public surface)."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "copy": [
+                      {
+                        "name": "kvSecrets",
+                        "count": "[length(parameters('keyVaultSecrets'))]",
+                        "input": {
+                          "name": "[parameters('keyVaultSecrets')[copyIndex('kvSecrets')].secretRefName]",
+                          "keyVaultUrl": "[format('{0}/secrets/{1}', parameters('keyVaultUri'), parameters('keyVaultSecrets')[copyIndex('kvSecrets')].secretName)]",
+                          "identity": "[parameters('identityId')]"
+                        }
+                      },
+                      {
+                        "name": "kvSecretEnv",
+                        "count": "[length(parameters('keyVaultSecrets'))]",
+                        "input": {
+                          "name": "[parameters('keyVaultSecrets')[copyIndex('kvSecretEnv')].envVar]",
+                          "secretRef": "[parameters('keyVaultSecrets')[copyIndex('kvSecretEnv')].secretRefName]"
+                        }
+                      }
+                    ],
+                    "queueRules": "[if(empty(parameters('queueName')), createArray(), createArray(createObject('name', format('queue-{0}', parameters('queueName')), 'custom', createObject('type', 'azure-queue', 'identity', parameters('identityId'), 'metadata', createObject('accountName', parameters('storageName'), 'queueName', parameters('queueName'), 'cloud', 'AzurePublicCloud')))))]",
+                    "cpuRules": "[if(equals(parameters('cpuUtilization'), 0), createArray(), createArray(createObject('name', 'cpu', 'custom', createObject('type', 'cpu', 'metadata', createObject('type', 'Utilization', 'value', string(parameters('cpuUtilization')))))))]",
+                    "httpRules": "[if(equals(parameters('httpConcurrency'), 0), createArray(), createArray(createObject('name', 'http', 'http', createObject('metadata', createObject('concurrentRequests', string(parameters('httpConcurrency')))))))]",
+                    "scaleRules": "[concat(variables('queueRules'), variables('cpuRules'), variables('httpRules'))]",
+                    "kvUriEnv": "[if(empty(parameters('keyVaultUri')), createArray(), createArray(createObject('name', 'WP_KEY_VAULT_URI', 'value', parameters('keyVaultUri'))))]",
+                    "authModeEnv": "[if(empty(parameters('authMode')), createArray(), createArray(createObject('name', 'WP_AUTH_MODE', 'value', parameters('authMode'))))]",
+                    "authTenantEnv": "[if(empty(parameters('authTenantId')), createArray(), createArray(createObject('name', 'WP_AUTH_TENANT_ID', 'value', parameters('authTenantId'))))]",
+                    "authAudienceEnv": "[if(empty(parameters('authAudience')), createArray(), createArray(createObject('name', 'WP_AUTH_AUDIENCE', 'value', parameters('authAudience'))))]",
+                    "authEnv": "[concat(variables('authModeEnv'), variables('authTenantEnv'), variables('authAudienceEnv'))]",
+                    "resourceName": "[replace(parameters('moduleName'), '_', '-')]"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.App/containerApps",
+                      "apiVersion": "2025-01-01",
+                      "name": "[format('wp-{0}', variables('resourceName'))]",
+                      "location": "[parameters('location')]",
+                      "identity": {
+                        "type": "UserAssigned",
+                        "userAssignedIdentities": {
+                          "[format('{0}', parameters('identityId'))]": {}
+                        }
+                      },
+                      "properties": {
+                        "managedEnvironmentId": "[parameters('environmentId')]",
+                        "configuration": {
+                          "activeRevisionsMode": "Single",
+                          "secrets": "[variables('kvSecrets')]",
+                          "registries": [
+                            {
+                              "server": "[format('{0}.azurecr.io', parameters('registry'))]",
+                              "identity": "[parameters('identityId')]"
+                            }
+                          ],
+                          "ingress": "[if(or(equals(parameters('moduleName'), 'api'), equals(parameters('moduleName'), 'web')), createObject('external', if(equals(parameters('moduleName'), 'web'), parameters('ingressExternal'), false()), 'targetPort', if(equals(parameters('moduleName'), 'api'), 8000, 80), 'transport', 'auto'), null())]"
+                        },
+                        "template": {
+                          "containers": [
+                            {
+                              "name": "[variables('resourceName')]",
+                              "image": "[format('{0}.azurecr.io/workloads-platform/{1}:{2}', parameters('registry'), parameters('image'), parameters('imageTag'))]",
+                              "command": "[if(empty(parameters('command')), null(), parameters('command'))]",
+                              "resources": {
+                                "cpu": "[json(parameters('cpu'))]",
+                                "memory": "[parameters('memoryGi')]"
+                              },
+                              "env": "[concat(createArray(createObject('name', 'AZURE_CLIENT_ID', 'value', parameters('identityClientId')), createObject('name', 'WP_MODULE', 'value', parameters('moduleName'))), variables('kvUriEnv'), variables('kvSecretEnv'), variables('authEnv'), parameters('envVars'))]"
+                            }
+                          ],
+                          "scale": {
+                            "minReplicas": "[parameters('minReplicas')]",
+                            "maxReplicas": "[parameters('maxReplicas')]",
+                            "rules": "[variables('scaleRules')]"
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "outputs": {
+                    "fqdn": {
+                      "type": "string",
+                      "value": "[if(or(equals(parameters('moduleName'), 'api'), equals(parameters('moduleName'), 'web')), reference(resourceId('Microsoft.App/containerApps', format('wp-{0}', variables('resourceName'))), '2025-01-01').configuration.ingress.fqdn, '')]"
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Resources/deployments', 'core')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "app-web",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "environmentId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.environmentId.value]"
+                  },
+                  "identityId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWebId.value]"
+                  },
+                  "identityClientId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWebClientId.value]"
+                  },
+                  "storageName": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.storageName.value]"
+                  },
+                  "registry": {
+                    "value": "[parameters('containerRegistry')]"
+                  },
+                  "imageTag": {
+                    "value": "[parameters('imageTag')]"
+                  },
+                  "moduleName": {
+                    "value": "web"
+                  },
+                  "image": {
+                    "value": "web"
+                  },
+                  "minReplicas": {
+                    "value": 1
+                  },
+                  "maxReplicas": {
+                    "value": 3
+                  },
+                  "cpu": {
+                    "value": "0.25"
+                  },
+                  "memoryGi": {
+                    "value": "0.5Gi"
+                  },
+                  "httpConcurrency": {
+                    "value": 100
+                  },
+                  "ingressExternal": {
+                    "value": "[variables('webIngressExternal')]"
+                  },
+                  "keyVaultUri": {
+                    "value": ""
+                  },
+                  "authMode": {
+                    "value": ""
+                  },
+                  "authTenantId": {
+                    "value": ""
+                  },
+                  "authAudience": {
+                    "value": ""
+                  },
+                  "envVars": {
+                    "value": [
+                      {
+                        "name": "WP_API_BASE_URL",
+                        "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'app-api'), '2025-04-01').outputs.fqdn.value)]"
+                      }
+                    ]
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "13848595473353582556"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string"
+                    },
+                    "environmentId": {
+                      "type": "string"
+                    },
+                    "identityId": {
+                      "type": "string"
+                    },
+                    "identityClientId": {
+                      "type": "string"
+                    },
+                    "registry": {
+                      "type": "string"
+                    },
+                    "imageTag": {
+                      "type": "string"
+                    },
+                    "moduleName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Module name, e.g. aiops"
+                      }
+                    },
+                    "image": {
+                      "type": "string"
+                    },
+                    "minReplicas": {
+                      "type": "int",
+                      "defaultValue": 1
+                    },
+                    "maxReplicas": {
+                      "type": "int",
+                      "defaultValue": 10
+                    },
+                    "cpu": {
+                      "type": "string",
+                      "defaultValue": "0.5"
+                    },
+                    "memoryGi": {
+                      "type": "string",
+                      "defaultValue": "1.0Gi"
+                    },
+                    "command": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Container command override (e.g. the service entrypoint). Empty => use image default."
+                      }
+                    },
+                    "storageName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Storage account name backing keyless azure-queue KEDA scalers"
+                      }
+                    },
+                    "queueName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "azure-queue KEDA trigger: queue name (\"\" = none). queueLength uses KEDA default (5)."
+                      }
+                    },
+                    "cpuUtilization": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "cpu KEDA trigger: target Utilization percent (0 = none)"
+                      }
+                    },
+                    "httpConcurrency": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "http KEDA trigger: concurrent requests per replica (0 = none)"
+                      }
+                    },
+                    "envVars": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Extra env vars"
+                      }
+                    },
+                    "keyVaultUri": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Key Vault resource URI (e.g. https://<vault>.vault.azure.net) backing secretRefs. Empty => no Key Vault-backed secrets and no WP_KEY_VAULT_URI injected."
+                      }
+                    },
+                    "keyVaultSecrets": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Key Vault-backed secrets to inject by identity (issue #85). Each item: { secretRefName, secretName, envVar } — a container secret named secretRefName sourced from keyVaultUri/secrets/secretName, surfaced to the app as env var envVar via secretRef. Never a plaintext value here."
+                      }
+                    },
+                    "authMode": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra auth mode for the API (issue #64): \"required\" (fail-closed default — the API refuses to serve unless authTenantId + authAudience are set), or \"disabled\" (deliberate no-auth). Empty => not injected (only the API core needs it). Non-secret."
+                      }
+                    },
+                    "authTenantId": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra tenant (directory) id the API validates tokens against (issue #64). Non-secret identifier. Empty => not injected."
+                      }
+                    },
+                    "authAudience": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Expected token audience — the API app registration Application ID URI / client id (issue #64). Non-secret. Empty => not injected."
+                      }
+                    },
+                    "ingressExternal": {
+                      "type": "bool",
+                      "defaultValue": false,
+                      "metadata": {
+                        "description": "Whether this app gets PUBLIC (external) Container Apps ingress. Only meaningful for the web app; the API is ALWAYS internal. review-67-v4 invariant: the public web front door is opened ONLY when the platform enforces required auth — main.bicep sets this to (authMode == required). Default false => internal-only (fail-closed, zero public surface)."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "copy": [
+                      {
+                        "name": "kvSecrets",
+                        "count": "[length(parameters('keyVaultSecrets'))]",
+                        "input": {
+                          "name": "[parameters('keyVaultSecrets')[copyIndex('kvSecrets')].secretRefName]",
+                          "keyVaultUrl": "[format('{0}/secrets/{1}', parameters('keyVaultUri'), parameters('keyVaultSecrets')[copyIndex('kvSecrets')].secretName)]",
+                          "identity": "[parameters('identityId')]"
+                        }
+                      },
+                      {
+                        "name": "kvSecretEnv",
+                        "count": "[length(parameters('keyVaultSecrets'))]",
+                        "input": {
+                          "name": "[parameters('keyVaultSecrets')[copyIndex('kvSecretEnv')].envVar]",
+                          "secretRef": "[parameters('keyVaultSecrets')[copyIndex('kvSecretEnv')].secretRefName]"
+                        }
+                      }
+                    ],
+                    "queueRules": "[if(empty(parameters('queueName')), createArray(), createArray(createObject('name', format('queue-{0}', parameters('queueName')), 'custom', createObject('type', 'azure-queue', 'identity', parameters('identityId'), 'metadata', createObject('accountName', parameters('storageName'), 'queueName', parameters('queueName'), 'cloud', 'AzurePublicCloud')))))]",
+                    "cpuRules": "[if(equals(parameters('cpuUtilization'), 0), createArray(), createArray(createObject('name', 'cpu', 'custom', createObject('type', 'cpu', 'metadata', createObject('type', 'Utilization', 'value', string(parameters('cpuUtilization')))))))]",
+                    "httpRules": "[if(equals(parameters('httpConcurrency'), 0), createArray(), createArray(createObject('name', 'http', 'http', createObject('metadata', createObject('concurrentRequests', string(parameters('httpConcurrency')))))))]",
+                    "scaleRules": "[concat(variables('queueRules'), variables('cpuRules'), variables('httpRules'))]",
+                    "kvUriEnv": "[if(empty(parameters('keyVaultUri')), createArray(), createArray(createObject('name', 'WP_KEY_VAULT_URI', 'value', parameters('keyVaultUri'))))]",
+                    "authModeEnv": "[if(empty(parameters('authMode')), createArray(), createArray(createObject('name', 'WP_AUTH_MODE', 'value', parameters('authMode'))))]",
+                    "authTenantEnv": "[if(empty(parameters('authTenantId')), createArray(), createArray(createObject('name', 'WP_AUTH_TENANT_ID', 'value', parameters('authTenantId'))))]",
+                    "authAudienceEnv": "[if(empty(parameters('authAudience')), createArray(), createArray(createObject('name', 'WP_AUTH_AUDIENCE', 'value', parameters('authAudience'))))]",
+                    "authEnv": "[concat(variables('authModeEnv'), variables('authTenantEnv'), variables('authAudienceEnv'))]",
+                    "resourceName": "[replace(parameters('moduleName'), '_', '-')]"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.App/containerApps",
+                      "apiVersion": "2025-01-01",
+                      "name": "[format('wp-{0}', variables('resourceName'))]",
+                      "location": "[parameters('location')]",
+                      "identity": {
+                        "type": "UserAssigned",
+                        "userAssignedIdentities": {
+                          "[format('{0}', parameters('identityId'))]": {}
+                        }
+                      },
+                      "properties": {
+                        "managedEnvironmentId": "[parameters('environmentId')]",
+                        "configuration": {
+                          "activeRevisionsMode": "Single",
+                          "secrets": "[variables('kvSecrets')]",
+                          "registries": [
+                            {
+                              "server": "[format('{0}.azurecr.io', parameters('registry'))]",
+                              "identity": "[parameters('identityId')]"
+                            }
+                          ],
+                          "ingress": "[if(or(equals(parameters('moduleName'), 'api'), equals(parameters('moduleName'), 'web')), createObject('external', if(equals(parameters('moduleName'), 'web'), parameters('ingressExternal'), false()), 'targetPort', if(equals(parameters('moduleName'), 'api'), 8000, 80), 'transport', 'auto'), null())]"
+                        },
+                        "template": {
+                          "containers": [
+                            {
+                              "name": "[variables('resourceName')]",
+                              "image": "[format('{0}.azurecr.io/workloads-platform/{1}:{2}', parameters('registry'), parameters('image'), parameters('imageTag'))]",
+                              "command": "[if(empty(parameters('command')), null(), parameters('command'))]",
+                              "resources": {
+                                "cpu": "[json(parameters('cpu'))]",
+                                "memory": "[parameters('memoryGi')]"
+                              },
+                              "env": "[concat(createArray(createObject('name', 'AZURE_CLIENT_ID', 'value', parameters('identityClientId')), createObject('name', 'WP_MODULE', 'value', parameters('moduleName'))), variables('kvUriEnv'), variables('kvSecretEnv'), variables('authEnv'), parameters('envVars'))]"
+                            }
+                          ],
+                          "scale": {
+                            "minReplicas": "[parameters('minReplicas')]",
+                            "maxReplicas": "[parameters('maxReplicas')]",
+                            "rules": "[variables('scaleRules')]"
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "outputs": {
+                    "fqdn": {
+                      "type": "string",
+                      "value": "[if(or(equals(parameters('moduleName'), 'api'), equals(parameters('moduleName'), 'web')), reference(resourceId('Microsoft.App/containerApps', format('wp-{0}', variables('resourceName'))), '2025-01-01').configuration.ingress.fqdn, '')]"
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Resources/deployments', 'app-api')]",
+                "[resourceId('Microsoft.Resources/deployments', 'core')]"
+              ]
+            },
+            {
+              "copy": {
+                "name": "serviceApps",
+                "count": "[length(variables('serviceModules'))]"
+              },
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "[format('app-{0}', variables('serviceModules')[copyIndex()].name)]",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "environmentId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.environmentId.value]"
+                  },
+                  "identityId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerId.value]"
+                  },
+                  "identityClientId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerClientId.value]"
+                  },
+                  "storageName": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.storageName.value]"
+                  },
+                  "registry": {
+                    "value": "[parameters('containerRegistry')]"
+                  },
+                  "imageTag": {
+                    "value": "[parameters('imageTag')]"
+                  },
+                  "moduleName": {
+                    "value": "[variables('serviceModules')[copyIndex()].name]"
+                  },
+                  "image": {
+                    "value": "worker"
+                  },
+                  "command": {
+                    "value": "[variables('serviceCommand')]"
+                  },
+                  "minReplicas": {
+                    "value": "[variables('serviceModules')[copyIndex()].min]"
+                  },
+                  "maxReplicas": {
+                    "value": "[variables('serviceModules')[copyIndex()].max]"
+                  },
+                  "cpu": {
+                    "value": "[variables('serviceModules')[copyIndex()].cpu]"
+                  },
+                  "memoryGi": {
+                    "value": "[variables('serviceModules')[copyIndex()].mem]"
+                  },
+                  "queueName": {
+                    "value": "[variables('serviceModules')[copyIndex()].queue]"
+                  },
+                  "cpuUtilization": {
+                    "value": "[variables('serviceModules')[copyIndex()].cpuUtil]"
+                  },
+                  "keyVaultUri": "[if(equals(variables('serviceModules')[copyIndex()].name, 'aiops'), createObject('value', reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.keyVaultUri.value), createObject('value', ''))]",
+                  "keyVaultSecrets": "[if(equals(variables('serviceModules')[copyIndex()].name, 'aiops'), createObject('value', createArray(createObject('secretRefName', 'system-pulse-read-token', 'secretName', 'system-pulse-read-token', 'envVar', 'SYSTEM_PULSE_READ_TOKEN'))), createObject('value', createArray()))]"
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "13848595473353582556"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string"
+                    },
+                    "environmentId": {
+                      "type": "string"
+                    },
+                    "identityId": {
+                      "type": "string"
+                    },
+                    "identityClientId": {
+                      "type": "string"
+                    },
+                    "registry": {
+                      "type": "string"
+                    },
+                    "imageTag": {
+                      "type": "string"
+                    },
+                    "moduleName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Module name, e.g. aiops"
+                      }
+                    },
+                    "image": {
+                      "type": "string"
+                    },
+                    "minReplicas": {
+                      "type": "int",
+                      "defaultValue": 1
+                    },
+                    "maxReplicas": {
+                      "type": "int",
+                      "defaultValue": 10
+                    },
+                    "cpu": {
+                      "type": "string",
+                      "defaultValue": "0.5"
+                    },
+                    "memoryGi": {
+                      "type": "string",
+                      "defaultValue": "1.0Gi"
+                    },
+                    "command": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Container command override (e.g. the service entrypoint). Empty => use image default."
+                      }
+                    },
+                    "storageName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Storage account name backing keyless azure-queue KEDA scalers"
+                      }
+                    },
+                    "queueName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "azure-queue KEDA trigger: queue name (\"\" = none). queueLength uses KEDA default (5)."
+                      }
+                    },
+                    "cpuUtilization": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "cpu KEDA trigger: target Utilization percent (0 = none)"
+                      }
+                    },
+                    "httpConcurrency": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "http KEDA trigger: concurrent requests per replica (0 = none)"
+                      }
+                    },
+                    "envVars": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Extra env vars"
+                      }
+                    },
+                    "keyVaultUri": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Key Vault resource URI (e.g. https://<vault>.vault.azure.net) backing secretRefs. Empty => no Key Vault-backed secrets and no WP_KEY_VAULT_URI injected."
+                      }
+                    },
+                    "keyVaultSecrets": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Key Vault-backed secrets to inject by identity (issue #85). Each item: { secretRefName, secretName, envVar } — a container secret named secretRefName sourced from keyVaultUri/secrets/secretName, surfaced to the app as env var envVar via secretRef. Never a plaintext value here."
+                      }
+                    },
+                    "authMode": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra auth mode for the API (issue #64): \"required\" (fail-closed default — the API refuses to serve unless authTenantId + authAudience are set), or \"disabled\" (deliberate no-auth). Empty => not injected (only the API core needs it). Non-secret."
+                      }
+                    },
+                    "authTenantId": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra tenant (directory) id the API validates tokens against (issue #64). Non-secret identifier. Empty => not injected."
+                      }
+                    },
+                    "authAudience": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Expected token audience — the API app registration Application ID URI / client id (issue #64). Non-secret. Empty => not injected."
+                      }
+                    },
+                    "ingressExternal": {
+                      "type": "bool",
+                      "defaultValue": false,
+                      "metadata": {
+                        "description": "Whether this app gets PUBLIC (external) Container Apps ingress. Only meaningful for the web app; the API is ALWAYS internal. review-67-v4 invariant: the public web front door is opened ONLY when the platform enforces required auth — main.bicep sets this to (authMode == required). Default false => internal-only (fail-closed, zero public surface)."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "copy": [
+                      {
+                        "name": "kvSecrets",
+                        "count": "[length(parameters('keyVaultSecrets'))]",
+                        "input": {
+                          "name": "[parameters('keyVaultSecrets')[copyIndex('kvSecrets')].secretRefName]",
+                          "keyVaultUrl": "[format('{0}/secrets/{1}', parameters('keyVaultUri'), parameters('keyVaultSecrets')[copyIndex('kvSecrets')].secretName)]",
+                          "identity": "[parameters('identityId')]"
+                        }
+                      },
+                      {
+                        "name": "kvSecretEnv",
+                        "count": "[length(parameters('keyVaultSecrets'))]",
+                        "input": {
+                          "name": "[parameters('keyVaultSecrets')[copyIndex('kvSecretEnv')].envVar]",
+                          "secretRef": "[parameters('keyVaultSecrets')[copyIndex('kvSecretEnv')].secretRefName]"
+                        }
+                      }
+                    ],
+                    "queueRules": "[if(empty(parameters('queueName')), createArray(), createArray(createObject('name', format('queue-{0}', parameters('queueName')), 'custom', createObject('type', 'azure-queue', 'identity', parameters('identityId'), 'metadata', createObject('accountName', parameters('storageName'), 'queueName', parameters('queueName'), 'cloud', 'AzurePublicCloud')))))]",
+                    "cpuRules": "[if(equals(parameters('cpuUtilization'), 0), createArray(), createArray(createObject('name', 'cpu', 'custom', createObject('type', 'cpu', 'metadata', createObject('type', 'Utilization', 'value', string(parameters('cpuUtilization')))))))]",
+                    "httpRules": "[if(equals(parameters('httpConcurrency'), 0), createArray(), createArray(createObject('name', 'http', 'http', createObject('metadata', createObject('concurrentRequests', string(parameters('httpConcurrency')))))))]",
+                    "scaleRules": "[concat(variables('queueRules'), variables('cpuRules'), variables('httpRules'))]",
+                    "kvUriEnv": "[if(empty(parameters('keyVaultUri')), createArray(), createArray(createObject('name', 'WP_KEY_VAULT_URI', 'value', parameters('keyVaultUri'))))]",
+                    "authModeEnv": "[if(empty(parameters('authMode')), createArray(), createArray(createObject('name', 'WP_AUTH_MODE', 'value', parameters('authMode'))))]",
+                    "authTenantEnv": "[if(empty(parameters('authTenantId')), createArray(), createArray(createObject('name', 'WP_AUTH_TENANT_ID', 'value', parameters('authTenantId'))))]",
+                    "authAudienceEnv": "[if(empty(parameters('authAudience')), createArray(), createArray(createObject('name', 'WP_AUTH_AUDIENCE', 'value', parameters('authAudience'))))]",
+                    "authEnv": "[concat(variables('authModeEnv'), variables('authTenantEnv'), variables('authAudienceEnv'))]",
+                    "resourceName": "[replace(parameters('moduleName'), '_', '-')]"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.App/containerApps",
+                      "apiVersion": "2025-01-01",
+                      "name": "[format('wp-{0}', variables('resourceName'))]",
+                      "location": "[parameters('location')]",
+                      "identity": {
+                        "type": "UserAssigned",
+                        "userAssignedIdentities": {
+                          "[format('{0}', parameters('identityId'))]": {}
+                        }
+                      },
+                      "properties": {
+                        "managedEnvironmentId": "[parameters('environmentId')]",
+                        "configuration": {
+                          "activeRevisionsMode": "Single",
+                          "secrets": "[variables('kvSecrets')]",
+                          "registries": [
+                            {
+                              "server": "[format('{0}.azurecr.io', parameters('registry'))]",
+                              "identity": "[parameters('identityId')]"
+                            }
+                          ],
+                          "ingress": "[if(or(equals(parameters('moduleName'), 'api'), equals(parameters('moduleName'), 'web')), createObject('external', if(equals(parameters('moduleName'), 'web'), parameters('ingressExternal'), false()), 'targetPort', if(equals(parameters('moduleName'), 'api'), 8000, 80), 'transport', 'auto'), null())]"
+                        },
+                        "template": {
+                          "containers": [
+                            {
+                              "name": "[variables('resourceName')]",
+                              "image": "[format('{0}.azurecr.io/workloads-platform/{1}:{2}', parameters('registry'), parameters('image'), parameters('imageTag'))]",
+                              "command": "[if(empty(parameters('command')), null(), parameters('command'))]",
+                              "resources": {
+                                "cpu": "[json(parameters('cpu'))]",
+                                "memory": "[parameters('memoryGi')]"
+                              },
+                              "env": "[concat(createArray(createObject('name', 'AZURE_CLIENT_ID', 'value', parameters('identityClientId')), createObject('name', 'WP_MODULE', 'value', parameters('moduleName'))), variables('kvUriEnv'), variables('kvSecretEnv'), variables('authEnv'), parameters('envVars'))]"
+                            }
+                          ],
+                          "scale": {
+                            "minReplicas": "[parameters('minReplicas')]",
+                            "maxReplicas": "[parameters('maxReplicas')]",
+                            "rules": "[variables('scaleRules')]"
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "outputs": {
+                    "fqdn": {
+                      "type": "string",
+                      "value": "[if(or(equals(parameters('moduleName'), 'api'), equals(parameters('moduleName'), 'web')), reference(resourceId('Microsoft.App/containerApps', format('wp-{0}', variables('resourceName'))), '2025-01-01').configuration.ingress.fqdn, '')]"
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Resources/deployments', 'core')]"
+              ]
+            },
+            {
+              "copy": {
+                "name": "jobApps",
+                "count": "[length(variables('jobModules'))]"
+              },
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "[format('job-{0}', variables('jobModules')[copyIndex()].name)]",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "environmentId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.environmentId.value]"
+                  },
+                  "identityId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerId.value]"
+                  },
+                  "identityClientId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerClientId.value]"
+                  },
+                  "storageName": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.storageName.value]"
+                  },
+                  "registry": {
+                    "value": "[parameters('containerRegistry')]"
+                  },
+                  "imageTag": {
+                    "value": "[parameters('imageTag')]"
+                  },
+                  "moduleName": {
+                    "value": "[variables('jobModules')[copyIndex()].name]"
+                  },
+                  "triggerType": {
+                    "value": "[variables('jobModules')[copyIndex()].triggerType]"
+                  },
+                  "cronExpression": "[if(empty(variables('jobModules')[copyIndex()].cronExpression), createObject('value', '0 0 * * *'), createObject('value', variables('jobModules')[copyIndex()].cronExpression))]",
+                  "queueName": {
+                    "value": "[variables('jobModules')[copyIndex()].queue]"
+                  },
+                  "minExecutions": {
+                    "value": "[variables('jobModules')[copyIndex()].min]"
+                  },
+                  "maxExecutions": {
+                    "value": "[variables('jobModules')[copyIndex()].max]"
+                  },
+                  "cpu": {
+                    "value": "[variables('jobModules')[copyIndex()].cpu]"
+                  },
+                  "memoryGi": {
+                    "value": "[variables('jobModules')[copyIndex()].mem]"
+                  },
+                  "apiBaseUrl": {
+                    "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'app-api'), '2025-04-01').outputs.fqdn.value)]"
+                  },
+                  "authMode": {
+                    "value": "[parameters('authMode')]"
+                  },
+                  "authTenantId": {
+                    "value": "[parameters('authTenantId')]"
+                  },
+                  "authAudience": {
+                    "value": "[parameters('authAudience')]"
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "1312466769571193720"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string"
+                    },
+                    "environmentId": {
+                      "type": "string"
+                    },
+                    "identityId": {
+                      "type": "string"
+                    },
+                    "identityClientId": {
+                      "type": "string"
+                    },
+                    "registry": {
+                      "type": "string"
+                    },
+                    "imageTag": {
+                      "type": "string"
+                    },
+                    "moduleName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Module name, e.g. discovery"
+                      }
+                    },
+                    "image": {
+                      "type": "string",
+                      "defaultValue": "worker"
+                    },
+                    "minExecutions": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "Event jobs: minimum concurrent executions. Not applicable to Schedule jobs."
+                      }
+                    },
+                    "maxExecutions": {
+                      "type": "int",
+                      "defaultValue": 10,
+                      "metadata": {
+                        "description": "Event jobs: maximum concurrent executions. For Schedule jobs this maps to ACA `parallelism` (replicas launched per scheduled run)."
+                      }
+                    },
+                    "cpu": {
+                      "type": "string",
+                      "defaultValue": "0.5"
+                    },
+                    "memoryGi": {
+                      "type": "string",
+                      "defaultValue": "1.0Gi"
+                    },
+                    "triggerType": {
+                      "type": "string",
+                      "defaultValue": "Event",
+                      "metadata": {
+                        "description": "Trigger type: Schedule | Event | Manual"
+                      }
+                    },
+                    "cronExpression": {
+                      "type": "string",
+                      "defaultValue": "0 */6 * * *",
+                      "metadata": {
+                        "description": "Native Schedule cronExpression (used when triggerType == Schedule)"
+                      }
+                    },
+                    "storageName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Storage account name backing keyless azure-queue KEDA scalers"
+                      }
+                    },
+                    "queueName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "azure-queue KEDA trigger: queue name (\"\" = none). queueLength uses KEDA default (5)."
+                      }
+                    },
+                    "apiBaseUrl": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Internal base URL of the API core (single writer) the worker reads state from and submits results to, e.g. https://wp-api.internal.<env>.azurecontainerapps.io. Threaded from the API container-app's internal ingress FQDN by main.bicep so it is correct by construction (never a hardcoded host)."
+                      }
+                    },
+                    "extraEnv": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Extra environment variables for this job's container (array of { name, value }). Used to thread module-specific, non-secret config (e.g. the telemetry_export DCE endpoint + DCR immutable id) without baking it into this generic template. Defaults to none."
+                      }
+                    },
+                    "authMode": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra auth mode (issue #64): \"required\" => the worker mints a bearer for the API audience via its Managed Identity before submitting results; \"disabled\" => no token (local/dev). Empty => not injected. Non-secret."
+                      }
+                    },
+                    "authTenantId": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra tenant (directory) id (issue #64). Non-secret. Empty => not injected. Required (with authAudience) when authMode=required so the worker can resolve the API scope."
+                      }
+                    },
+                    "authAudience": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Expected token audience — the API app registration Application ID URI / client id (issue #64); the worker requests <audience>/.default. Non-secret. Empty => not injected."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "queueRules": "[if(empty(parameters('queueName')), createArray(), createArray(createObject('name', format('queue-{0}', parameters('queueName')), 'type', 'azure-queue', 'identity', parameters('identityId'), 'metadata', createObject('accountName', parameters('storageName'), 'queueName', parameters('queueName'), 'cloud', 'AzurePublicCloud'))))]",
+                    "scaleRules": "[variables('queueRules')]",
+                    "baseEnv": [
+                      {
+                        "name": "AZURE_CLIENT_ID",
+                        "value": "[parameters('identityClientId')]"
+                      },
+                      {
+                        "name": "WP_MODULE",
+                        "value": "[parameters('moduleName')]"
+                      }
+                    ],
+                    "apiEnv": "[if(empty(parameters('apiBaseUrl')), createArray(), createArray(createObject('name', 'WP_API_BASE_URL', 'value', parameters('apiBaseUrl'))))]",
+                    "authModeEnv": "[if(empty(parameters('authMode')), createArray(), createArray(createObject('name', 'WP_AUTH_MODE', 'value', parameters('authMode'))))]",
+                    "authTenantEnv": "[if(empty(parameters('authTenantId')), createArray(), createArray(createObject('name', 'WP_AUTH_TENANT_ID', 'value', parameters('authTenantId'))))]",
+                    "authAudienceEnv": "[if(empty(parameters('authAudience')), createArray(), createArray(createObject('name', 'WP_AUTH_AUDIENCE', 'value', parameters('authAudience'))))]",
+                    "containerEnv": "[concat(variables('baseEnv'), variables('apiEnv'), variables('authModeEnv'), variables('authTenantEnv'), variables('authAudienceEnv'), parameters('extraEnv'))]",
+                    "resourceName": "[replace(parameters('moduleName'), '_', '-')]"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.App/jobs",
+                      "apiVersion": "2025-01-01",
+                      "name": "[format('wp-{0}', variables('resourceName'))]",
+                      "location": "[parameters('location')]",
+                      "identity": {
+                        "type": "UserAssigned",
+                        "userAssignedIdentities": {
+                          "[format('{0}', parameters('identityId'))]": {}
+                        }
+                      },
+                      "properties": {
+                        "environmentId": "[parameters('environmentId')]",
+                        "configuration": {
+                          "triggerType": "[parameters('triggerType')]",
+                          "replicaTimeout": 1800,
+                          "registries": [
+                            {
+                              "server": "[format('{0}.azurecr.io', parameters('registry'))]",
+                              "identity": "[parameters('identityId')]"
+                            }
+                          ],
+                          "scheduleTriggerConfig": "[if(equals(parameters('triggerType'), 'Schedule'), createObject('cronExpression', parameters('cronExpression'), 'parallelism', 1, 'replicaCompletionCount', 1), null())]",
+                          "eventTriggerConfig": "[if(equals(parameters('triggerType'), 'Event'), createObject('parallelism', 1, 'replicaCompletionCount', 1, 'scale', createObject('minExecutions', parameters('minExecutions'), 'maxExecutions', parameters('maxExecutions'), 'rules', variables('scaleRules'))), null())]"
+                        },
+                        "template": {
+                          "containers": [
+                            {
+                              "name": "[variables('resourceName')]",
+                              "image": "[format('{0}.azurecr.io/workloads-platform/{1}:{2}', parameters('registry'), parameters('image'), parameters('imageTag'))]",
+                              "resources": {
+                                "cpu": "[json(parameters('cpu'))]",
+                                "memory": "[parameters('memoryGi')]"
+                              },
+                              "args": [
+                                "--module",
+                                "[parameters('moduleName')]"
+                              ],
+                              "command": [
+                                "python",
+                                "-m",
+                                "cli.worker"
+                              ],
+                              "env": "[variables('containerEnv')]"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "outputs": {
+                    "jobName": {
+                      "type": "string",
+                      "value": "[format('wp-{0}', variables('resourceName'))]"
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Resources/deployments', 'app-api')]",
+                "[resourceId('Microsoft.Resources/deployments', 'core')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2025-04-01",
+              "name": "job-telemetry_export",
+              "properties": {
+                "expressionEvaluationOptions": {
+                  "scope": "inner"
+                },
+                "mode": "Incremental",
+                "parameters": {
+                  "location": {
+                    "value": "[parameters('location')]"
+                  },
+                  "environmentId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.environmentId.value]"
+                  },
+                  "identityId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerId.value]"
+                  },
+                  "identityClientId": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerClientId.value]"
+                  },
+                  "storageName": {
+                    "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.storageName.value]"
+                  },
+                  "registry": {
+                    "value": "[parameters('containerRegistry')]"
+                  },
+                  "imageTag": {
+                    "value": "[parameters('imageTag')]"
+                  },
+                  "moduleName": {
+                    "value": "telemetry_export"
+                  },
+                  "triggerType": {
+                    "value": "Schedule"
+                  },
+                  "cronExpression": {
+                    "value": "*/5 * * * *"
+                  },
+                  "queueName": {
+                    "value": ""
+                  },
+                  "minExecutions": {
+                    "value": 0
+                  },
+                  "maxExecutions": {
+                    "value": 1
+                  },
+                  "cpu": {
+                    "value": "0.25"
+                  },
+                  "memoryGi": {
+                    "value": "0.5Gi"
+                  },
+                  "apiBaseUrl": {
+                    "value": "[format('https://{0}', reference(resourceId('Microsoft.Resources/deployments', 'app-api'), '2025-04-01').outputs.fqdn.value)]"
+                  },
+                  "extraEnv": {
+                    "value": [
+                      {
+                        "name": "TELEMETRY_EXPORT_DCE_ENDPOINT",
+                        "value": "[reference(resourceId('Microsoft.Resources/deployments', 'telemetry-export'), '2025-04-01').outputs.dceLogsIngestionEndpoint.value]"
+                      },
+                      {
+                        "name": "TELEMETRY_EXPORT_DCR_IMMUTABLE_ID",
+                        "value": "[reference(resourceId('Microsoft.Resources/deployments', 'telemetry-export'), '2025-04-01').outputs.dcrImmutableId.value]"
+                      }
+                    ]
+                  }
+                },
+                "template": {
+                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+                  "contentVersion": "1.0.0.0",
+                  "metadata": {
+                    "_generator": {
+                      "name": "bicep",
+                      "version": "0.45.15.27210",
+                      "templateHash": "1312466769571193720"
+                    }
+                  },
+                  "parameters": {
+                    "location": {
+                      "type": "string"
+                    },
+                    "environmentId": {
+                      "type": "string"
+                    },
+                    "identityId": {
+                      "type": "string"
+                    },
+                    "identityClientId": {
+                      "type": "string"
+                    },
+                    "registry": {
+                      "type": "string"
+                    },
+                    "imageTag": {
+                      "type": "string"
+                    },
+                    "moduleName": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Module name, e.g. discovery"
+                      }
+                    },
+                    "image": {
+                      "type": "string",
+                      "defaultValue": "worker"
+                    },
+                    "minExecutions": {
+                      "type": "int",
+                      "defaultValue": 0,
+                      "metadata": {
+                        "description": "Event jobs: minimum concurrent executions. Not applicable to Schedule jobs."
+                      }
+                    },
+                    "maxExecutions": {
+                      "type": "int",
+                      "defaultValue": 10,
+                      "metadata": {
+                        "description": "Event jobs: maximum concurrent executions. For Schedule jobs this maps to ACA `parallelism` (replicas launched per scheduled run)."
+                      }
+                    },
+                    "cpu": {
+                      "type": "string",
+                      "defaultValue": "0.5"
+                    },
+                    "memoryGi": {
+                      "type": "string",
+                      "defaultValue": "1.0Gi"
+                    },
+                    "triggerType": {
+                      "type": "string",
+                      "defaultValue": "Event",
+                      "metadata": {
+                        "description": "Trigger type: Schedule | Event | Manual"
+                      }
+                    },
+                    "cronExpression": {
+                      "type": "string",
+                      "defaultValue": "0 */6 * * *",
+                      "metadata": {
+                        "description": "Native Schedule cronExpression (used when triggerType == Schedule)"
+                      }
+                    },
+                    "storageName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Storage account name backing keyless azure-queue KEDA scalers"
+                      }
+                    },
+                    "queueName": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "azure-queue KEDA trigger: queue name (\"\" = none). queueLength uses KEDA default (5)."
+                      }
+                    },
+                    "apiBaseUrl": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Internal base URL of the API core (single writer) the worker reads state from and submits results to, e.g. https://wp-api.internal.<env>.azurecontainerapps.io. Threaded from the API container-app's internal ingress FQDN by main.bicep so it is correct by construction (never a hardcoded host)."
+                      }
+                    },
+                    "extraEnv": {
+                      "type": "array",
+                      "defaultValue": [],
+                      "metadata": {
+                        "description": "Extra environment variables for this job's container (array of { name, value }). Used to thread module-specific, non-secret config (e.g. the telemetry_export DCE endpoint + DCR immutable id) without baking it into this generic template. Defaults to none."
+                      }
+                    },
+                    "authMode": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra auth mode (issue #64): \"required\" => the worker mints a bearer for the API audience via its Managed Identity before submitting results; \"disabled\" => no token (local/dev). Empty => not injected. Non-secret."
+                      }
+                    },
+                    "authTenantId": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Entra tenant (directory) id (issue #64). Non-secret. Empty => not injected. Required (with authAudience) when authMode=required so the worker can resolve the API scope."
+                      }
+                    },
+                    "authAudience": {
+                      "type": "string",
+                      "defaultValue": "",
+                      "metadata": {
+                        "description": "Expected token audience — the API app registration Application ID URI / client id (issue #64); the worker requests <audience>/.default. Non-secret. Empty => not injected."
+                      }
+                    }
+                  },
+                  "variables": {
+                    "queueRules": "[if(empty(parameters('queueName')), createArray(), createArray(createObject('name', format('queue-{0}', parameters('queueName')), 'type', 'azure-queue', 'identity', parameters('identityId'), 'metadata', createObject('accountName', parameters('storageName'), 'queueName', parameters('queueName'), 'cloud', 'AzurePublicCloud'))))]",
+                    "scaleRules": "[variables('queueRules')]",
+                    "baseEnv": [
+                      {
+                        "name": "AZURE_CLIENT_ID",
+                        "value": "[parameters('identityClientId')]"
+                      },
+                      {
+                        "name": "WP_MODULE",
+                        "value": "[parameters('moduleName')]"
+                      }
+                    ],
+                    "apiEnv": "[if(empty(parameters('apiBaseUrl')), createArray(), createArray(createObject('name', 'WP_API_BASE_URL', 'value', parameters('apiBaseUrl'))))]",
+                    "authModeEnv": "[if(empty(parameters('authMode')), createArray(), createArray(createObject('name', 'WP_AUTH_MODE', 'value', parameters('authMode'))))]",
+                    "authTenantEnv": "[if(empty(parameters('authTenantId')), createArray(), createArray(createObject('name', 'WP_AUTH_TENANT_ID', 'value', parameters('authTenantId'))))]",
+                    "authAudienceEnv": "[if(empty(parameters('authAudience')), createArray(), createArray(createObject('name', 'WP_AUTH_AUDIENCE', 'value', parameters('authAudience'))))]",
+                    "containerEnv": "[concat(variables('baseEnv'), variables('apiEnv'), variables('authModeEnv'), variables('authTenantEnv'), variables('authAudienceEnv'), parameters('extraEnv'))]",
+                    "resourceName": "[replace(parameters('moduleName'), '_', '-')]"
+                  },
+                  "resources": [
+                    {
+                      "type": "Microsoft.App/jobs",
+                      "apiVersion": "2025-01-01",
+                      "name": "[format('wp-{0}', variables('resourceName'))]",
+                      "location": "[parameters('location')]",
+                      "identity": {
+                        "type": "UserAssigned",
+                        "userAssignedIdentities": {
+                          "[format('{0}', parameters('identityId'))]": {}
+                        }
+                      },
+                      "properties": {
+                        "environmentId": "[parameters('environmentId')]",
+                        "configuration": {
+                          "triggerType": "[parameters('triggerType')]",
+                          "replicaTimeout": 1800,
+                          "registries": [
+                            {
+                              "server": "[format('{0}.azurecr.io', parameters('registry'))]",
+                              "identity": "[parameters('identityId')]"
+                            }
+                          ],
+                          "scheduleTriggerConfig": "[if(equals(parameters('triggerType'), 'Schedule'), createObject('cronExpression', parameters('cronExpression'), 'parallelism', 1, 'replicaCompletionCount', 1), null())]",
+                          "eventTriggerConfig": "[if(equals(parameters('triggerType'), 'Event'), createObject('parallelism', 1, 'replicaCompletionCount', 1, 'scale', createObject('minExecutions', parameters('minExecutions'), 'maxExecutions', parameters('maxExecutions'), 'rules', variables('scaleRules'))), null())]"
+                        },
+                        "template": {
+                          "containers": [
+                            {
+                              "name": "[variables('resourceName')]",
+                              "image": "[format('{0}.azurecr.io/workloads-platform/{1}:{2}', parameters('registry'), parameters('image'), parameters('imageTag'))]",
+                              "resources": {
+                                "cpu": "[json(parameters('cpu'))]",
+                                "memory": "[parameters('memoryGi')]"
+                              },
+                              "args": [
+                                "--module",
+                                "[parameters('moduleName')]"
+                              ],
+                              "command": [
+                                "python",
+                                "-m",
+                                "cli.worker"
+                              ],
+                              "env": "[variables('containerEnv')]"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "outputs": {
+                    "jobName": {
+                      "type": "string",
+                      "value": "[format('wp-{0}', variables('resourceName'))]"
+                    }
+                  }
+                }
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.Resources/deployments', 'app-api')]",
+                "[resourceId('Microsoft.Resources/deployments', 'core')]",
+                "[resourceId('Microsoft.Resources/deployments', 'telemetry-export')]"
+              ]
+            }
+          ],
+          "outputs": {
+            "registryLoginServer": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.registryLoginServer.value]"
+            },
+            "apiFqdn": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Resources/deployments', 'app-api'), '2025-04-01').outputs.fqdn.value]"
+            },
+            "webFqdn": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Resources/deployments', 'app-web'), '2025-04-01').outputs.fqdn.value]"
+            },
+            "grafanaEndpoint": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Resources/deployments', 'grafana'), '2025-04-01').outputs.grafanaEndpoint.value]"
+            },
+            "storageAccountId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.storageAccountId.value]"
+            },
+            "apiIdentityPrincipalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityApiPrincipalId.value]"
+            },
+            "workerIdentityPrincipalId": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Resources/deployments', 'core'), '2025-04-01').outputs.identityWorkerPrincipalId.value]"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "apiFqdn": {
+      "type": "string",
+      "metadata": {
+        "description": "API core INTERNAL FQDN (internal ingress only — reachable from inside the Container Apps environment, not the public internet)."
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aegis-platform'), '2025-04-01').outputs.apiFqdn.value]"
+    },
+    "webFqdn": {
+      "type": "string",
+      "metadata": {
+        "description": "Web SPA public FQDN."
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aegis-platform'), '2025-04-01').outputs.webFqdn.value]"
+    },
+    "grafanaEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "Managed Grafana endpoint (no secrets)."
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deployments', 'aegis-platform'), '2025-04-01').outputs.grafanaEndpoint.value]"
+    }
+  }
+}

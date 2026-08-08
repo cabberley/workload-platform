@@ -1,0 +1,119 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "config": {
+      "isWizard": false,
+      "basics": {
+        "description": "**Aegis — Workloads Platform** deploys an in-boundary, keyless platform that discovers, validates and observes your multi-layer Azure workloads **entirely inside your own subscription**. No PHI/PII leaves your boundary. Every component runs as its own Managed Identity — no secrets are collected here.",
+        "location": {
+          "label": "Region",
+          "toolTip": "All resources are co-located in this single region (data residency by construction).",
+          "resourceTypes": [
+            "Microsoft.App/containerApps",
+            "Microsoft.Storage/storageAccounts",
+            "Microsoft.Dashboard/grafana"
+          ]
+        }
+      }
+    },
+    "basics": [],
+    "steps": [
+      {
+        "name": "platformConfig",
+        "label": "Platform configuration",
+        "elements": [
+          {
+            "name": "containerRegistry",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Container Registry name",
+            "toolTip": "Azure Container Registry name (without .azurecr.io) the platform images are pulled from. Must be globally unique; created if absent. Images must be present for a turnkey pull.",
+            "constraints": {
+              "required": true,
+              "regex": "^[a-z0-9]{5,50}$",
+              "validationMessage": "5-50 lowercase alphanumeric characters."
+            },
+            "visible": true
+          },
+          {
+            "name": "imageTag",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Image tag",
+            "defaultValue": "latest",
+            "toolTip": "Image tag to deploy (usually the release tag).",
+            "constraints": {
+              "required": true,
+              "regex": "^[A-Za-z0-9._-]{1,128}$",
+              "validationMessage": "1-128 chars: letters, digits, '.', '_', '-'."
+            },
+            "visible": true
+          },
+          {
+            "name": "authMode",
+            "type": "Microsoft.Common.DropDown",
+            "label": "API authentication mode",
+            "defaultValue": "Disabled (no auth)",
+            "toolTip": "Phase-1 delivered default is 'Disabled' — safe ONLY because the API is internal-only (network-isolated, not publicly exposed). 'Required' validates an Entra bearer token on every API request and is the hardening path (issue #127); it MUST be enabled before exposing the API publicly.",
+            "constraints": {
+              "allowedValues": [
+                { "label": "Required (fail-closed)", "value": "required" },
+                { "label": "Disabled (no auth)", "value": "disabled" }
+              ],
+              "required": true
+            },
+            "visible": true
+          },
+          {
+            "name": "authTenantId",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Entra tenant (directory) id",
+            "toolTip": "Non-secret tenant GUID the API validates tokens against. Required when authentication mode is 'Required'.",
+            "constraints": {
+              "required": "[equals(steps('platformConfig').authMode, 'required')]",
+              "regex": "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$",
+              "validationMessage": "Enter a valid GUID."
+            },
+            "visible": true
+          },
+          {
+            "name": "authAudience",
+            "type": "Microsoft.Common.TextBox",
+            "label": "API token audience",
+            "toolTip": "Non-secret API app registration Application ID URI or client id (e.g. api://aegis-workloads-platform). Required when authentication mode is 'Required'.",
+            "constraints": {
+              "required": "[equals(steps('platformConfig').authMode, 'required')]",
+              "regex": "^.{1,256}$",
+              "validationMessage": "Enter the API Application ID URI or client id."
+            },
+            "visible": true
+          },
+          {
+            "name": "manageStateImmutabilityPolicy",
+            "type": "Microsoft.Common.DropDown",
+            "label": "Manage state WORM immutability policy from IaC",
+            "defaultValue": "Yes (manage from IaC)",
+            "toolTip": "Keep 'Yes' unless the state-container immutability (WORM) policy has been LOCKED out-of-band, after which Azure rejects further updates — then choose 'No'.",
+            "constraints": {
+              "allowedValues": [
+                { "label": "Yes (manage from IaC)", "value": true },
+                { "label": "No (policy locked out-of-band)", "value": false }
+              ],
+              "required": true
+            },
+            "visible": true
+          }
+        ]
+      }
+    ],
+    "outputs": {
+      "location": "[location()]",
+      "containerRegistry": "[steps('platformConfig').containerRegistry]",
+      "imageTag": "[steps('platformConfig').imageTag]",
+      "authMode": "[steps('platformConfig').authMode]",
+      "authTenantId": "[steps('platformConfig').authTenantId]",
+      "authAudience": "[steps('platformConfig').authAudience]",
+      "manageStateImmutabilityPolicy": "[steps('platformConfig').manageStateImmutabilityPolicy]"
+    }
+  }
+}

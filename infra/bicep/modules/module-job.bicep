@@ -92,8 +92,15 @@ var authAudienceEnv = empty(authAudience) ? [] : [
 ]
 var containerEnv = concat(baseEnv, apiEnv, authModeEnv, authTenantEnv, authAudienceEnv, extraEnv)
 
+// Azure RESOURCE NAMES (Microsoft.App/jobs, and the container label below) allow only lowercase
+// alphanumerics and hyphens — an underscore makes `az deployment` fail. Module ids such as
+// `telemetry_export` / `quality_checks` / `dependency_graph` carry underscores, so hyphenate them
+// for the Azure name ONLY. The real module identity (WP_MODULE env + `--module` arg above) keeps
+// the underscore so the Python worker dispatches on the true module name.
+var resourceName = replace(moduleName, '_', '-')
+
 resource job 'Microsoft.App/jobs@2025-01-01' = {
-  name: 'wp-${moduleName}'
+  name: 'wp-${resourceName}'
   location: location
   identity: {
     type: 'UserAssigned'
@@ -129,7 +136,7 @@ resource job 'Microsoft.App/jobs@2025-01-01' = {
     template: {
       containers: [
         {
-          name: moduleName
+          name: resourceName
           image: '${registry}.azurecr.io/workloads-platform/${image}:${imageTag}'
           resources: { cpu: json(cpu), memory: memoryGi }
           args: ['--module', moduleName]

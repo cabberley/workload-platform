@@ -8,4 +8,8 @@ RUN npm run build
 
 FROM nginx:1.27-alpine
 COPY --from=build /web/dist /usr/share/nginx/html
+# Reverse-proxy same-origin /api/* to the API core's INTERNAL ingress (issue #67). The nginx image
+# entrypoint runs envsubst over /etc/nginx/templates/*.template at start, expanding ${WP_API_BASE_URL}
+# (injected by main.bicep) and writing the result to /etc/nginx/conf.d/default.conf.
+COPY infra/docker/nginx.conf.template /etc/nginx/templates/default.conf.template
 EXPOSE 80
