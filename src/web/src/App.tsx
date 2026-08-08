@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
-import { fetchModules, fetchPackAssignments, fetchWorkloads } from "./api/client";
-import type { ModuleManifest, PackAssignment } from "./api/types";
+import {
+  fetchModules,
+  fetchPackAssignments,
+  fetchRcaExplanations,
+  fetchWorkloads,
+} from "./api/client";
+import type { ModuleManifest, PackAssignment, RcaAdvisory } from "./api/types";
 import { useAsync, type AsyncState } from "./hooks/useAsync";
 import { WorkloadSelector } from "./panels/WorkloadSelector";
 import { WorkloadView } from "./panels/WorkloadView";
@@ -11,6 +16,7 @@ import { PackAssignmentsTable } from "./panels/PackAssignmentsTable";
 import { GrafanaPanel } from "./panels/GrafanaPanel";
 import { EstateView } from "./panels/EstateView";
 import { FindingsView } from "./panels/FindingsView";
+import { advisoriesToViews } from "./panels/RcaExplanation";
 import { DriftView } from "./panels/DriftView";
 import { card, muted } from "./styles";
 
@@ -44,6 +50,11 @@ export function App() {
   const [assignments, setAssignments] = useState<PackAssignment[]>([]);
   const [assignmentsError, setAssignmentsError] = useState<string | null>(null);
 
+  // Grounded, advisory-only RCA explanations for the selected workload (issue #54). Fetched from
+  // the in-boundary console read path; `[]` when none is available (fail-closed by absence). Reset
+  // on selection change so one workload's advisory can never paint under another's findings.
+  const [rcaAdvisories, setRcaAdvisories] = useState<RcaAdvisory[]>([]);
+
   useEffect(() => {
     fetchModules()
       .then(setModules)
@@ -55,6 +66,27 @@ export function App() {
       .then(setAssignments)
       .catch((e: unknown) => setAssignmentsError(e instanceof Error ? e.message : String(e)));
   }, []);
+
+  useEffect(() => {
+    if (selected === null) {
+      setRcaAdvisories([]);
+      return;
+    }
+    let live = true;
+    setRcaAdvisories([]);
+    fetchRcaExplanations(selected)
+      .then((advisories) => {
+        if (live) setRcaAdvisories(advisories);
+      })
+      .catch(() => {
+        // Advisory is a non-critical enrichment: a fetch failure is fail-closed to "no advisory"
+        // (the findings read stands on its own) rather than blocking the findings view.
+        if (live) setRcaAdvisories([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [selected]);
 
   // Default to the first workload once the list arrives.
   useEffect(() => {
@@ -106,7 +138,7 @@ export function App() {
         })}
       </nav>
 
-      <section style={card}>{renderTab(tab, selected, workloadsState)}</section>
+      <section style={card}>{renderTab(tab, selected, workloadsState, rcaAdvisories)}</section>
 
       <div style={{ display: "grid", gap: 20, marginTop: 24 }}>
         <GrafanaPanel />
@@ -139,7 +171,12 @@ export function App() {
  * `loading` synchronously and no render can paint one workload's success under another's heading
  * (fail-closed: a selection change never shows a stale green/all-clear view).
  */
-function renderTab(tab: Tab, selected: string | null, workloadsState: AsyncState<string[]>) {
+function renderTab(
+  tab: Tab,
+  selected: string | null,
+  workloadsState: AsyncState<string[]>,
+  rcaAdvisories: RcaAdvisory[],
+) {
   if (tab === "estate") {
     return <EstateView state={workloadsState} />;
   }
@@ -160,7 +197,13 @@ function renderTab(tab: Tab, selected: string | null, workloadsState: AsyncState
     case "workload":
       return <WorkloadView key={selected} workload={selected} />;
     case "findings":
-      return <FindingsView key={selected} workload={selected} />;
+      return (
+        <FindingsView
+          key={selected}
+          workload={selected}
+          rcaExplanations={advisoriesToViews(rcaAdvisories)}
+        />
+      );
     case "drift":
       return <DriftView key={selected} workload={selected} />;
   }

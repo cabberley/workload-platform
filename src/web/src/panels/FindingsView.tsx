@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
 import { ApiError, fetchFindings } from "../api/client";
-import type { Finding } from "../api/types";
+import type { Finding, RcaExplanationView } from "../api/types";
 import { useAsync } from "../hooks/useAsync";
 import { FindingRow } from "./FindingRow";
+import { RcaExplanation } from "./RcaExplanation";
 import { muted } from "../styles";
 
 /**
@@ -12,8 +13,19 @@ import { muted } from "../styles";
  *
  * The optional module filter is client-side over a single fetch (the API also accepts a `module`
  * query param via `fetchFindings(workload, module)` if a server-side filter is ever preferred).
+ *
+ * `rcaExplanations` is the OPTIONAL grounded, advisory RCA explanation projection (issue #54),
+ * joined from a module run result's `extra.rca` + `extra.rcaExplanation` via
+ * `selectRcaExplanations`. It is advisory-only and renders nothing when absent — so the read-only
+ * console stays graceful until/unless a run result is surfaced to it (the SPA never runs modules).
  */
-export function FindingsView({ workload }: { workload: string }) {
+export function FindingsView({
+  workload,
+  rcaExplanations = [],
+}: {
+  workload: string;
+  rcaExplanations?: RcaExplanationView[];
+}) {
   const state = useAsync<Finding[]>(() => fetchFindings(workload), [workload]);
   const [module, setModule] = useState<string>("");
 
@@ -49,6 +61,7 @@ export function FindingsView({ workload }: { workload: string }) {
 
   return (
     <section aria-label="Findings">
+      <RcaExplanation views={rcaExplanations} />
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
         <label htmlFor="findings-module" style={{ fontWeight: 600, fontSize: 13 }}>
           Module

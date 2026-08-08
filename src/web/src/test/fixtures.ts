@@ -1,6 +1,6 @@
 // Clearly-fake synthetic fixtures for web component tests. NO real customer data / PHI / PII —
 // every id, name and value here is invented for testing only.
-import type { DriftReport, Finding, ModuleManifest, PackRegistryEntry, WorkloadGraph } from "../api/types";
+import type { AgentResponse, DriftReport, Finding, ModuleManifest, PackRegistryEntry, RcaAdvisory, WorkloadGraph } from "../api/types";
 
 export function makeModule(overrides: Partial<ModuleManifest> = {}): ModuleManifest {
   return {
@@ -66,6 +66,44 @@ export function makeGraph(overrides: Partial<WorkloadGraph> = {}): WorkloadGraph
       { source: "n-api", target: "n-db", type: "depends_on", redundant: false, origin: "auto" },
     ],
     graphRevision: "rev-fake-1",
+    ...overrides,
+  };
+}
+
+export function makeAgentResponse(overrides: Partial<AgentResponse> = {}): AgentResponse {
+  return {
+    agentName: "aiops",
+    taskType: "auto-rca",
+    inputSummary: "synthetic input summary",
+    findings: ["node-fake-01 shows cpu_saturation_ratio above threshold"],
+    risks: ["availability degraded for the widget workload"],
+    recommendations: ["investigate the cited node"],
+    sourceReferences: [
+      { kind: "resource", id: "/fake/resource/widget-01", detail: "observed" },
+      { kind: "metric", id: "cpu_saturation_ratio", detail: null },
+    ],
+    confidence: 0.9,
+    nextActions: ["auto-rca"],
+    generatedAt: "2026-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+export function makeRcaAdvisory(overrides: Partial<RcaAdvisory> = {}): RcaAdvisory {
+  return {
+    index: 0,
+    agentName: "aiops.autorca",
+    taskType: "root_cause_analysis",
+    confidence: 0.9,
+    advisory: "The evidence indicates node-fake-01 is saturated.",
+    findings: ["node-fake-01 shows cpu_saturation_ratio above threshold"],
+    risks: ["availability degraded for the widget workload"],
+    recommendations: ["investigate the cited node"],
+    sourceReferences: [
+      { kind: "resource", id: "/fake/resource/widget-01", detail: "observed" },
+      { kind: "metric", id: "cpu_saturation_ratio", detail: null },
+    ],
+    generatedAt: "2026-01-01T00:00:00Z",
     ...overrides,
   };
 }

@@ -55,6 +55,177 @@ class AgentResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
+# RcaAdvisory — the bounded, PII-safe console read model for the grounded RCA explanation
+# (issue #54). It is the ONLY shape the advisory takes on the console read path: an in-boundary
+# GET projection persisted alongside findings. Every field is a bounded scalar or a list of the
+# already-egress-classified :class:`SourceReference`; there is NO open ``dict[str, Any]`` free-text
+# carrier, so the no-PII egress auditor stays green without a new waiver. The advisory is grounded
+# STRICTLY on its RCA's cited evidence (see ``modules.aiops.rca_grounding``) and is ADVISORY ONLY —
+# never a finding/risk/recommendation/remediation; a human disposes.
+# --------------------------------------------------------------------------------------
+class RcaAdvisory(BaseModel):
+    """Bounded console read model: one grounded, advisory-only RCA explanation.
+
+    Fail-closed by absence: only a GROUNDED, non-empty advisory is ever materialised into this
+    model (see :func:`build_rca_advisories`); an ungrounded/empty explanation is simply not
+    persisted, so the console shows nothing rather than an unsupported claim.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=0, description="Position aligned with the run's RCA responses.")
+    agentName: str
+    taskType: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    advisory: str = Field(description="The grounded, advisory-only natural-language explanation.")
+    findings: list[str] = Field(
+        default_factory=list,
+        description="Bounded cited findings the advisory is grounded on (shown alongside it).",
+    )
+    risks: list[str] = Field(
+        default_factory=list,
+        description="Bounded cited risks the advisory is grounded on (shown alongside it).",
+    )
+    recommendations: list[str] = Field(
+        default_factory=list,
+        description="Bounded cited recommendations the advisory grounds on (shown alongside it).",
+    )
+    sourceReferences: list[SourceReference] = Field(
+        default_factory=list,
+        description="The cited evidence the advisory is grounded on (already egress-classified).",
+    )
+    generatedAt: datetime = Field(default_factory=_utcnow)
+
+
+def build_rca_advisories(extra: Mapping[str, Any]) -> list[RcaAdvisory]:
+    """Derive the bounded, RE-GROUNDED advisories from a run's ``extra`` surface (fail-closed).
+
+    This is the DURABLE-boundary no-hallucination gate (issue #54, MED-2). The findings path already
+    re-asserts provenance at persistence (``enforce_finding_provenance`` / #59, #83); the advisory
+    path must too, because ``POST /api/workloads/{workload}/results`` accepts a worker-supplied
+    ``extra`` with arbitrary text. We therefore do NOT trust the caller's advisory: for each entry
+    we RECONSTRUCT the canonical :class:`AgentResponse` from the index-aligned ``extra["rca"][i]``
+    and RE-RUN the pure grounding gate (:func:`shared.rca_grounding.ground_or_reject`). An entry is
+    materialised ONLY when it re-grounds (fail-closed by absence), so EVERY persisted/served
+    advisory is grounded regardless of how the result was produced.
+
+    The projection is bounded: the advisory text is capped at ``MAX_ADVISORY_CHARS``, only the RCA's
+    OWN already-cited ``sourceReferences`` are kept (capped at ``MAX_SOURCE_REFERENCES``), and at
+    most ``MAX_RCA_ADVISORIES`` advisories are returned. Every entry's construction is wrapped so a
+    malformed ``extra`` (e.g. ``confidence: "not-a-number"``, a bad source reference) SKIPS the bad
+    entry and continues — it never raises (no 500 on hostile/garbled input).
+    """
+    from shared.rca_grounding import (  # lazy import: breaks the contracts<->grounding cycle
+        MAX_ADVISORY_CHARS,
+        MAX_GROUNDING_ITEM_CHARS,
+        MAX_GROUNDING_ITEMS,
+        MAX_RCA_ADVISORIES,
+        MAX_SOURCE_REFERENCES,
+        ground_or_reject,
+    )
+
+    rca_raw = extra.get("rca")
+    expl_raw = extra.get("rcaExplanation")
+    if not isinstance(rca_raw, list) or not isinstance(expl_raw, list):
+        return []
+    advisories: list[RcaAdvisory] = []
+    for index, entry in enumerate(expl_raw):
+        if len(advisories) >= MAX_RCA_ADVISORIES:
+            break
+        advisory = _build_one_advisory(
+            index,
+            entry,
+            rca_raw,
+            ground_or_reject,
+            max_chars=MAX_ADVISORY_CHARS,
+            max_refs=MAX_SOURCE_REFERENCES,
+            max_items=MAX_GROUNDING_ITEMS,
+            max_item_chars=MAX_GROUNDING_ITEM_CHARS,
+        )
+        if advisory is not None:
+            advisories.append(advisory)
+    return advisories
+
+
+def _bounded_items(items: Any, max_items: int, max_item_chars: int) -> list[str]:
+    """Bound a cited str-list to ``max_items`` entries, each truncated to ``max_item_chars``."""
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    for item in items[:max_items]:
+        if isinstance(item, str):
+            out.append(item[:max_item_chars])
+    return out
+
+
+def _build_one_advisory(
+    index: int,
+    entry: Any,
+    rca_raw: list[Any],
+    ground_or_reject: Any,
+    *,
+    max_chars: int,
+    max_refs: int,
+    max_items: int,
+    max_item_chars: int,
+) -> RcaAdvisory | None:
+    """Re-ground and bound ONE advisory entry; return ``None`` (skip) on anything malformed.
+
+    Fail-closed by absence: a non-Mapping entry, an empty advisory, a missing/mismatched RCA, an
+    RCA that fails to validate (e.g. an un-coercible ``confidence`` or malformed source reference),
+    or an advisory that does NOT re-ground on the reconstructed RCA all yield ``None`` — never a
+    raise — so a hostile/garbled ``extra`` degrades to a shorter (possibly empty) list, not a 500.
+    """
+    try:
+        if not isinstance(entry, Mapping):
+            return None
+        text = entry.get("advisory")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if index >= len(rca_raw):
+            return None
+        rca = rca_raw[index]
+        if not isinstance(rca, Mapping):
+            return None
+        response = AgentResponse.model_validate(rca)
+        # MED-5: ground against the SAME bounded evidence projection that will be persisted AND
+        # SHOWN. Persistence keeps only the bounded findings/risks/recs + sourceReferences, so an
+        # advisory grounded SOLELY by a dropped item (an over-bound finding or an out-of-bounds
+        # reference) must fail closed — otherwise the console would display an advisory whose
+        # grounding evidence is absent from what it shows. Build the bounded projection ONCE, ground
+        # on a copy carrying exactly that projection, and persist exactly it.
+        bounded_findings = _bounded_items(response.findings, max_items, max_item_chars)
+        bounded_risks = _bounded_items(response.risks, max_items, max_item_chars)
+        bounded_recs = _bounded_items(response.recommendations, max_items, max_item_chars)
+        bounded_refs = list(response.sourceReferences[:max_refs])
+        bounded_response = response.model_copy(
+            update={
+                "findings": bounded_findings,
+                "risks": bounded_risks,
+                "recommendations": bounded_recs,
+                "sourceReferences": bounded_refs,
+            }
+        )
+        grounded = ground_or_reject(bounded_response, text)
+        if grounded is None:
+            return None
+        return RcaAdvisory(
+            index=index,
+            agentName=response.agentName,
+            taskType=response.taskType,
+            confidence=response.confidence,
+            advisory=grounded[:max_chars],
+            findings=bounded_findings,
+            risks=bounded_risks,
+            recommendations=bounded_recs,
+            sourceReferences=bounded_refs,
+            generatedAt=response.generatedAt,
+        )
+    except Exception:  # noqa: BLE001 - durable boundary: skip the bad entry, never raise (no 500)
+        return None
+
+
+# --------------------------------------------------------------------------------------
 # Tenancy — the isolation identity threaded through state + read models (issue #65).
 #
 # The platform ships customer-owned single-tenant by DEFAULT (exactly one configured tenant, in the

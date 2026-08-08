@@ -40,9 +40,11 @@ from shared.contracts import (
     ModuleRunResult,
     PackAssignment,
     PackType,
+    RcaAdvisory,
     ResourceNode,
     TenantModuleConfig,
     WorkloadGraph,
+    build_rca_advisories,
 )
 from shared.provenance import enforce_finding_provenance, revalidate_finding_provenance
 
@@ -155,6 +157,15 @@ class StateStore(ReadableState, Protocol):
 
     def snapshot(self, workload: str) -> str:
         """Freeze the current findings into a point-in-time snapshot; return its id."""
+        ...
+
+    def get_rca_advisories(self, workload: str) -> list[RcaAdvisory]:
+        """Return the persisted, grounded RCA advisories for ``workload`` (empty if none).
+
+        A bounded, PII-safe console read model persisted by :meth:`commit_run` from the run's
+        grounded ``extra.rcaExplanation`` — only GROUNDED/non-empty advisories are ever stored
+        (fail-closed by absence). This is a read-model getter (no write surface of its own).
+        """
         ...
 
     def put_pack_assignment(self, assignment: PackAssignment) -> None:
@@ -379,6 +390,15 @@ _SCHEMA = (
     " workload TEXT NOT NULL, pack_id TEXT NOT NULL, version TEXT NOT NULL,"
     " assigned_by TEXT NOT NULL, assigned_at TEXT NOT NULL,"
     " PRIMARY KEY (workload, pack_id))",
+    # Grounded RCA advisory console read model (issue #54). One row per RCA index per workload,
+    # holding the BOUNDED, PII-safe ``RcaAdvisory`` JSON. Written by ``commit_run`` ONLY for
+    # grounded/non-empty advisories (fail-closed by absence) and replaced wholesale each aiops run
+    # so a later ungrounded run leaves no stale advisory. Served verbatim by the authenticated
+    # in-boundary console GET — never through the blanket egress-redaction projection.
+    "CREATE TABLE IF NOT EXISTS rca_advisories ("
+    " workload TEXT NOT NULL, idx INTEGER NOT NULL,"
+    " data TEXT NOT NULL, updated_at TEXT NOT NULL,"
+    " PRIMARY KEY (workload, idx))",
     # Per-tenant imported packs (issue #68). ``scope`` is the tenant partition key (namespace
     # carrier); the pack BYTES live in the shared content-addressed store keyed by ``digest``, so
     # this table is the per-tenant OWNERSHIP/visibility index only. One row per imported pack
@@ -661,6 +681,29 @@ class LocalStateStore:
             rows,
         )
 
+    @staticmethod
+    def _write_rca_advisories(
+        conn: sqlite3.Connection, workload: str, advisories: list[RcaAdvisory]
+    ) -> None:
+        """Replace the grounded RCA advisories for ``workload`` (fail-closed by absence).
+
+        Only the caller's already-grounded/non-empty advisories are persisted; the prior set is
+        cleared first so a later ungrounded aiops run leaves NO stale advisory. Runs inside the
+        caller's transaction, so it composes atomically with the rest of the run commit.
+        """
+        conn.execute("DELETE FROM rca_advisories WHERE workload = ?", (workload,))
+        now = _now_iso()
+        rows = [
+            (workload, advisory.index, advisory.model_dump_json(), now)
+            for advisory in advisories
+        ]
+        if rows:
+            conn.executemany(
+                "INSERT INTO rca_advisories (workload, idx, data, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                rows,
+            )
+
     # -- writes (API core only) ----------------------------------------------------------
     def put_estate(self, workload: str, nodes: list[ResourceNode]) -> None:
         with self._transaction() as conn:
@@ -692,7 +735,24 @@ class LocalStateStore:
             if result.findings:
                 self._write_findings(conn, workload, result.findings)
                 counts["findings"] = len(result.findings)
+            # Grounded RCA advisory read model (issue #54): only aiops runs carry ``extra["rca"]``,
+            # so only they (re)write the advisory table — a discovery/quality run never clears
+            # aiops advisories. Among those, only GROUNDED/non-empty entries persist (fail-closed
+            # by absence). Not surfaced in ``counts`` (the API's persisted-counts contract is
+            # stable at estate/graph/findings).
+            if isinstance(result.extra, dict) and "rca" in result.extra:
+                self._write_rca_advisories(
+                    conn, workload, build_rca_advisories(result.extra)
+                )
         return counts
+
+    def get_rca_advisories(self, workload: str) -> list[RcaAdvisory]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT data FROM rca_advisories WHERE workload = ? ORDER BY idx",
+                (workload,),
+            ).fetchall()
+        return [RcaAdvisory.model_validate_json(row["data"]) for row in rows]
 
     def snapshot(self, workload: str) -> str:
         """Freeze current findings + estate node ids into a point-in-time snapshot; return its id.
@@ -1126,6 +1186,21 @@ class AzureStateStore:
         findings.sort(key=lambda finding: (finding.module, finding.id))
         return findings
 
+    def _advisories_of(self, manifest: dict[str, Any] | None) -> list[RcaAdvisory]:
+        """Resolve the grounded RCA advisories THROUGH the manifest (issue #54, MED-3).
+
+        Carried in the manifest exactly like findings, so advisories are visible only after the
+        atomic manifest commit and can never be observed partially or reordered by a racing run.
+        """
+        if manifest is None:
+            return []
+        blob = str(manifest.get("advisories_blob") or "")
+        raw = self._read_blob(blob) if blob else None
+        if raw is None:
+            return []
+        advisories = [RcaAdvisory.model_validate(item) for item in json.loads(raw)]
+        return sorted(advisories, key=lambda advisory: advisory.index)
+
     @staticmethod
     def _merge_findings(previous: list[Finding], new: list[Finding]) -> list[Finding]:
         """Additive upsert of findings by ``(module, id)`` (new wins), preserving prior findings.
@@ -1150,6 +1225,7 @@ class AzureStateStore:
         estate: list[ResourceNode] | None,
         graph: WorkloadGraph | None,
         findings: list[Finding],
+        advisories: list[RcaAdvisory] | None = None,
     ) -> dict[str, int]:
         """Atomic commit via the manifest — the SINGLE commit point.
 
@@ -1160,6 +1236,12 @@ class AzureStateStore:
         resolve everything through the manifest, a failure before the manifest write is invisible.
         ``estate``/``graph`` of ``None`` leave the existing pointer untouched; an empty estate list
         clears the estate; findings are merged additively onto the current committed set.
+
+        ``advisories`` (issue #54, MED-3) are the grounded RCA console read model. ``None`` leaves
+        the existing pointer untouched (non-aiops runs never touch advisories); a list (even empty)
+        REPLACES the pointer, so a later ungrounded aiops run clears them. Carried IN the manifest
+        exactly like findings, so the whole run — advisories included — commits atomically and is
+        race-safe under the same optimistic concurrency (Local/Azure parity; no standalone table).
         """
         from azure.core import MatchConditions
         from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
@@ -1179,6 +1261,7 @@ class AzureStateStore:
             estate_blob = str(manifest["estate_blob"]) if manifest else ""
             graph_blob = str(manifest["graph_blob"]) if manifest else ""
             findings_blob = str(manifest["findings_blob"]) if manifest else ""
+            advisories_blob = str(manifest.get("advisories_blob") or "") if manifest else ""
             commit_id = uuid4().hex  # unique per attempt: concurrent commits can't clobber blobs
 
             counts = {"estate": 0, "graph": 0, "findings": 0}
@@ -1200,6 +1283,13 @@ class AzureStateStore:
                     json.dumps([finding.model_dump(mode="json") for finding in merged]),
                 )
                 counts["findings"] = len(findings)
+            if advisories is not None:
+                # REPLACE (even with []): a later ungrounded aiops run clears the prior advisories.
+                advisories_blob = f"{scope}/advisories/{commit_id}.json"
+                self._write_blob(
+                    advisories_blob,
+                    json.dumps([advisory.model_dump(mode="json") for advisory in advisories]),
+                )
 
             entity = {
                 "PartitionKey": _AZ_INDEX_PARTITION,
@@ -1208,6 +1298,7 @@ class AzureStateStore:
                 "estate_blob": estate_blob,
                 "graph_blob": graph_blob,
                 "findings_blob": findings_blob,
+                "advisories_blob": advisories_blob,
                 "version": version,
                 "complete": True,
                 "committed_at": _now_iso(),
@@ -1248,6 +1339,9 @@ class AzureStateStore:
 
     def get_findings(self, workload: str, module: str | None = None) -> list[Finding]:
         return self._findings_of(self._manifest(workload), module)
+
+    def get_rca_advisories(self, workload: str) -> list[RcaAdvisory]:
+        return self._advisories_of(self._manifest(workload))
 
     def get_previous_findings(self, workload: str) -> list[Finding]:
         snap = self._latest_snapshot(workload)
@@ -1291,9 +1385,25 @@ class AzureStateStore:
         self._commit(workload, estate=None, graph=None, findings=findings)
 
     def commit_run(self, workload: str, result: ModuleRunResult) -> dict[str, int]:
-        """Persist a whole run atomically through the manifest. See :meth:`_commit`."""
+        """Persist a whole run atomically through the manifest. See :meth:`_commit`.
+
+        Grounded RCA advisories (issue #54) ride INSIDE the same atomic manifest commit as findings
+        (MED-3): only aiops runs carry ``extra["rca"]``, so only they replace the advisory pointer
+        (``None`` leaves non-aiops runs' advisories untouched; ``[]`` clears a prior grounded set
+        when a later aiops run re-grounds to nothing). ``build_rca_advisories`` RE-RUNS the gate at
+        this durable boundary, so a caller-supplied ungrounded advisory is never persisted.
+        """
+        advisories = (
+            build_rca_advisories(result.extra)
+            if isinstance(result.extra, dict) and "rca" in result.extra
+            else None
+        )
         return self._commit(
-            workload, estate=result.estate, graph=result.graph, findings=result.findings
+            workload,
+            estate=result.estate,
+            graph=result.graph,
+            findings=result.findings,
+            advisories=advisories,
         )
 
     def snapshot(self, workload: str) -> str:

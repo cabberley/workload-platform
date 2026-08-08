@@ -136,6 +136,10 @@ _WELL_KNOWN_SOURCES: tuple[str, ...] = ("system_pulse", "azure_monitor")
 # alone. Neither is ever required for the metric/threshold detection path.
 _LOG_SAMPLE_SOURCE = "log_sample"
 _LLM_ENRICHMENT_SOURCE = "llm_enrichment"
+# Registry key for the OPTIONAL, flag-gated grounded RCA-explanation edge (issue #54). Absent/
+# UNCONFIGURED ⇒ no explanation is produced and the pure RCA result stands (the no-op IS the off
+# state of the feature flag). Never required for detection/RCA.
+_RCA_EXPLANATION_SOURCE = "rca_explanation"
 
 _ROLE_SELECTOR_PREFIX = "role:"
 
@@ -221,6 +225,26 @@ class _EnrichmentClientLike(Protocol):
     """
 
     def enrich(self, features: LogFeatures) -> _EnrichmentResultLike: ...
+
+
+class _RcaExplanationResultLike(Protocol):
+    """Structural view of the grounded RCA-explanation result. ``available=False`` ⇒ no-op."""
+
+    @property
+    def available(self) -> bool: ...
+
+    @property
+    def advisory(self) -> str | None: ...
+
+
+class _RcaExplanationClientLike(Protocol):
+    """Structural view of the keyless, fail-closed, grounded RCA-explanation edge (issue #54).
+
+    Sends ONLY the RCA :class:`AgentResponse`'s already-cited fields; no-ops when UNCONFIGURED /
+    low-confidence / ungrounded so the pure RCA result always stands alone.
+    """
+
+    def explain(self, response: AgentResponse) -> _RcaExplanationResultLike: ...
 
 
 class TelemetryRuleSpec(BaseModel):
@@ -609,6 +633,28 @@ def run_log_anomaly_enrichment(
         result = client.enrich(current)
         if result.available and result.advisory:
             entries.append({"nodeId": node_id, "advisory": result.advisory})
+    return entries
+
+
+def run_rca_explanation(
+    client: _RcaExplanationClientLike,
+    rca_responses: list[AgentResponse],
+) -> list[dict[str, str]]:
+    """Attach a grounded advisory EXPLANATION to each RCA response (issue #54), fail-closed.
+
+    OPTIONAL and advisory-only: for each RCA it sends ONLY the AgentResponse's already-cited fields
+    (findings/risks/recommendations/sourceReferences/confidence) — never new data — and the edge
+    fails closed to an EMPTY advisory when UNCONFIGURED, below the confidence floor, ungrounded, or
+    on any error (the pure RCA result stands). Returns one entry per RCA response, index-aligned
+    with ``extra["rca"]``, each ``{"advisory": <text-or-empty>}`` — the module attaches it to the
+    redact-on-egress ``extra`` surface (never a finding/risk/recommendation/nextAction). The
+    explanation is NEVER auto-applied; a human disposes.
+    """
+    entries: list[dict[str, str]] = []
+    for rca in rca_responses:
+        result = client.explain(rca)
+        advisory = result.advisory if (result.available and result.advisory) else ""
+        entries.append({"advisory": advisory})
     return entries
 
 
@@ -1065,6 +1111,22 @@ class AiopsModule(Module):
                 rca_responses.append(rca)
             detections.extend(workload_detections)
 
+        # Grounded RCA EXPLANATION (issue #54) — OPTIONAL, flag-gated, advisory-only. When the
+        # keyless in-boundary edge is configured/enabled, attach a natural-language explanation of
+        # each RCA, grounded STRICTLY on that RCA's already-cited evidence (no new facts). The edge
+        # fails closed (unconfigured / low-confidence / ungrounded ⇒ empty), so the pure RCA result
+        # stands unchanged — the no-op IS the off state of the feature flag. It never becomes a
+        # finding/recommendation/remediation and is never auto-applied; a human disposes.
+        # TODO(human): GO-LIVE of this in-boundary, no-Microsoft-processing pattern is gated on
+        # CELA/HiTrust sign-off (external legal gate, NOT a code blocker). The grounded hook ships
+        # behind config now; ship-enable it once signed off.
+        rca_explanation: list[dict[str, str]] = []
+        rca_explanation_client = ctx.clients.get(_RCA_EXPLANATION_SOURCE)
+        if rca_responses and rca_explanation_client is not None:
+            rca_explanation = run_rca_explanation(
+                cast(_RcaExplanationClientLike, rca_explanation_client), rca_responses
+            )
+
         # Accurate accounting (partial outages preserved): ``sourcesAvailable`` = sources that
         # returned data for at least one observed workload; ``sourcesUnavailable`` = sources absent
         # or that failed for at least one observed workload — we do NOT subtract available, so a
@@ -1102,6 +1164,11 @@ class AiopsModule(Module):
             # (``main._redact_run_result_for_egress``) neutralizes the free text on the way out —
             # fail-closed by construction, and the pure statistical findings stand regardless.
             "logAnomalyEnrichment": log_enrichment,
+            # Advisory-only grounded RCA explanation (issue #54): natural-language explanation of
+            # each RCA, grounded STRICTLY on its already-cited evidence. Index-aligned with
+            # ``rca`` above. Placed in ``extra`` so the egress redaction pass neutralizes the free
+            # text on the way out — fail-closed by construction; the pure RCA result stands.
+            "rcaExplanation": rca_explanation,
         }
         return ModuleRunResult(
             module=self.name, ok=True, findings=detections, response=response, extra=extra
@@ -1123,5 +1190,6 @@ __all__ = [
     "propose_remediation",
     "run_log_anomaly_detections",
     "run_log_anomaly_enrichment",
+    "run_rca_explanation",
     "run_windowed_detectors",
 ]
