@@ -11,8 +11,13 @@ from collections.abc import Mapping
 import pytest
 
 from cli.wiring import (
+    ENV_AIOPS_LLM_DEPLOYMENT,
+    ENV_AIOPS_LLM_ENDPOINT,
+    ENV_AIOPS_LLM_REGION,
     ENV_ALERT_WEBHOOK_ALLOW_INSECURE_LOOPBACK,
     ENV_ALERT_WEBHOOK_URL,
+    ENV_LOG_SAMPLE_WORKSPACE_ID,
+    ENV_PLATFORM_REGION,
     ENV_SUBSCRIPTION_ID,
     ENV_SYSTEM_PULSE_BASE_URL,
     build_client_registry,
@@ -303,6 +308,72 @@ def test_build_client_registry_omits_resource_graph_when_sdk_missing(monkeypatch
     registry = build_client_registry(config={ENV_ALERT_WEBHOOK_URL: FAKE_WEBHOOK_URL})
     assert "resource_graph" not in registry
     assert "notifier" in registry
+
+
+# --------------------------------------------------------------------------------------
+# log-anomaly edges (issue #53) — keyless, fail-closed, opt-in.
+# --------------------------------------------------------------------------------------
+def test_build_client_registry_log_sample_absent_without_credential(monkeypatch):
+    # No credential ⇒ the log-sample edge is omitted even with a workspace id configured
+    # (fail-closed by absence).
+    monkeypatch.setattr("cli.wiring._build_credential", lambda: None)
+    registry = build_client_registry(
+        config={ENV_LOG_SAMPLE_WORKSPACE_ID: "00000000-0000-0000-0000-000000000000"}
+    )
+    assert "log_sample" not in registry
+
+
+def test_build_client_registry_log_sample_present_with_credential(monkeypatch):
+    monkeypatch.setattr("cli.wiring._build_credential", lambda: object())
+    registry = build_client_registry(
+        config={ENV_LOG_SAMPLE_WORKSPACE_ID: "00000000-0000-0000-0000-000000000000"}
+    )
+    assert "log_sample" in registry
+
+
+def test_build_client_registry_log_sample_absent_without_workspace(monkeypatch):
+    monkeypatch.setattr("cli.wiring._build_credential", lambda: object())
+    registry = build_client_registry(config={})
+    assert "log_sample" not in registry
+
+
+def test_build_client_registry_llm_enrichment_present_when_fully_configured(monkeypatch):
+    monkeypatch.setattr("cli.wiring._build_credential", lambda: object())
+    registry = build_client_registry(
+        config={
+            ENV_AIOPS_LLM_ENDPOINT: "https://synthetic-fake.openai.azure.com",
+            ENV_AIOPS_LLM_DEPLOYMENT: "fake-deployment",
+            ENV_AIOPS_LLM_REGION: "westus3",
+            ENV_PLATFORM_REGION: "westus3",
+        }
+    )
+    assert "llm_enrichment" in registry
+
+
+def test_build_client_registry_llm_enrichment_absent_without_platform_region(monkeypatch):
+    # Missing the platform region ⇒ the edge is UNCONFIGURED and omitted (the pure result stands).
+    monkeypatch.setattr("cli.wiring._build_credential", lambda: object())
+    registry = build_client_registry(
+        config={
+            ENV_AIOPS_LLM_ENDPOINT: "https://synthetic-fake.openai.azure.com",
+            ENV_AIOPS_LLM_DEPLOYMENT: "fake-deployment",
+            ENV_AIOPS_LLM_REGION: "westus3",
+        }
+    )
+    assert "llm_enrichment" not in registry
+
+
+def test_build_client_registry_llm_enrichment_absent_without_credential(monkeypatch):
+    monkeypatch.setattr("cli.wiring._build_credential", lambda: None)
+    registry = build_client_registry(
+        config={
+            ENV_AIOPS_LLM_ENDPOINT: "https://synthetic-fake.openai.azure.com",
+            ENV_AIOPS_LLM_DEPLOYMENT: "fake-deployment",
+            ENV_AIOPS_LLM_REGION: "westus3",
+            ENV_PLATFORM_REGION: "westus3",
+        }
+    )
+    assert "llm_enrichment" not in registry
 
 
 # --------------------------------------------------------------------------------------

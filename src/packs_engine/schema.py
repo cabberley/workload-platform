@@ -95,7 +95,54 @@ def _telemetry_finite_errors(body: dict[str, Any]) -> list[str]:
             errors.append(f"signals/{index}/threshold: {threshold!r} is not a finite number")
         errors.extend(_window_finite_errors(index, signal.get("window")))
         errors.extend(_expression_errors(index, signal.get("expression")))
+    errors.extend(_anomaly_finite_errors(body))
     return errors
+
+
+def _anomaly_finite_errors(body: dict[str, Any]) -> list[str]:
+    """Reject non-finite (nan/inf) constants in the ``logAnalysis.anomaly`` section (issue #53).
+
+    JSON Schema cannot express a finite check, and a non-finite z-band / ``ewmaAlpha`` /
+    ``advisoryZScore`` cannot define a meaningful anomaly threshold, so surface it here as a
+    fail-closed error (mirrors the telemetry threshold/window checks). Structural validity is left
+    to the schema; this only guards the numeric leaves against ``nan``/``inf``.
+    """
+    log_analysis = body.get("logAnalysis")
+    if not isinstance(log_analysis, dict):
+        return []
+    anomaly = log_analysis.get("anomaly")
+    if not isinstance(anomaly, dict):
+        return []
+    errors: list[str] = []
+    errors.extend(_finite_leaf_error("logAnalysis/anomaly/ewmaAlpha", anomaly.get("ewmaAlpha")))
+    features = anomaly.get("features")
+    if isinstance(features, list):
+        for f_index, feature in enumerate(features):
+            if not isinstance(feature, dict):
+                continue
+            base = f"logAnalysis/anomaly/features/{f_index}"
+            errors.extend(
+                _finite_leaf_error(f"{base}/advisoryZScore", feature.get("advisoryZScore"))
+            )
+            bands = feature.get("bands")
+            if isinstance(bands, list):
+                for b_index, band in enumerate(bands):
+                    if isinstance(band, dict):
+                        errors.extend(
+                            _finite_leaf_error(f"{base}/bands/{b_index}/z", band.get("z"))
+                        )
+    return errors
+
+
+def _finite_leaf_error(path: str, value: Any) -> list[str]:
+    """Return a single error iff ``value`` is a non-finite (nan/inf) number; else ``[]``."""
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and not math.isfinite(float(value))
+    ):
+        return [f"{path}: {value!r} is not a finite number"]
+    return []
 
 
 def _window_finite_errors(index: int, window: Any) -> list[str]:

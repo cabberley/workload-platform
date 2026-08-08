@@ -339,6 +339,140 @@ def test_synthetic_windowed_example_pack_validates_clean() -> None:
     assert validate_pack(_load(example)) == []
 
 
+# --- Telemetry issue #53: optional log-anomaly section ----------------------------------------
+
+def test_synthetic_log_anomaly_example_pack_validates_clean() -> None:
+    example = CONTENT / "telemetry" / "synthetic-log-anomaly.json"
+    assert validate_pack(_load(example)) == []
+
+
+def _log_anomaly_pack() -> dict[str, Any]:
+    pack = _load(_SHIPPED["telemetry"])
+    pack["body"]["logAnalysis"] = {
+        "enabled": True,
+        "anomaly": {
+            "nodeId": "role:odb",
+            "minBaseline": 5,
+            "method": "mad",
+            "features": [
+                {
+                    "feature": "errorRate",
+                    "direction": "up",
+                    "bands": [{"z": 3.5, "severity": "high"}],
+                }
+            ],
+        },
+    }
+    return pack
+
+
+def test_telemetry_valid_anomaly_section_validates() -> None:
+    assert validate_pack(_log_anomaly_pack()) == []
+
+
+def test_telemetry_anomaly_non_role_nodeid_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["nodeId"] = "odb"
+    assert validate_pack(pack)
+
+
+def test_telemetry_anomaly_unknown_feature_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["features"][0]["feature"] = "notAFeature"
+    assert validate_pack(pack)
+
+
+def test_telemetry_anomaly_bad_method_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["method"] = "kmeans"
+    assert validate_pack(pack)
+
+
+def test_telemetry_anomaly_min_baseline_below_two_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["minBaseline"] = 1
+    assert validate_pack(pack)
+
+
+def test_telemetry_anomaly_empty_features_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["features"] = []
+    assert validate_pack(pack)
+
+
+def test_telemetry_anomaly_extra_property_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["bogus"] = 1
+    assert validate_pack(pack)
+
+
+def test_telemetry_anomaly_non_finite_band_z_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["features"][0]["bands"][0]["z"] = float("inf")
+    errors = validate_pack(pack)
+    assert errors and any("finite" in e for e in errors)
+
+
+def test_telemetry_anomaly_non_finite_ewma_alpha_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["ewmaAlpha"] = float("nan")
+    errors = validate_pack(pack)
+    assert errors and any("finite" in e for e in errors)
+
+
+def test_telemetry_anomaly_non_finite_advisory_zscore_rejected() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["features"][0]["advisoryZScore"] = float("inf")
+    errors = validate_pack(pack)
+    assert errors and any("finite" in e for e in errors)
+
+
+def test_telemetry_anomaly_ewma_alpha_one_rejected() -> None:
+    # MED-2: alpha=1 degenerates EWMA variance to zero (no detection); schema exclusiveMaximum:1.
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["method"] = "ewma"
+    pack["body"]["logAnalysis"]["anomaly"]["ewmaAlpha"] = 1
+    assert validate_pack(pack)
+
+
+def test_telemetry_anomaly_ewma_alpha_in_open_interval_ok() -> None:
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["method"] = "ewma"
+    pack["body"]["logAnalysis"]["anomaly"]["ewmaAlpha"] = 0.3
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_log_analysis_disabled_still_validates() -> None:
+    # MED-3: enabled=false is a structurally-valid pack (compile honors it at runtime, not schema).
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["enabled"] = False
+    assert validate_pack(pack) == []
+
+
+def test_telemetry_anomaly_enabled_false_validates_and_compiles_to_zero_specs() -> None:
+    # MED-3b: the schema declares anomaly.enabled so a pack the compiler skips is schema-ACCEPTED
+    # (not rejected by additionalProperties:false), and the compiler returns zero specs + a note.
+    from modules.aiops.log_anomaly import compile_log_anomaly_specs
+
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["enabled"] = False
+    assert validate_pack(pack) == []
+    specs, notes = compile_log_anomaly_specs(pack["body"], "synthetic-log-anomaly", "0.1.0")
+    assert specs == []
+    assert any("anomaly disabled" in n for n in notes)
+
+
+def test_telemetry_anomaly_enabled_true_validates_and_compiles() -> None:
+    from modules.aiops.log_anomaly import compile_log_anomaly_specs
+
+    pack = _log_anomaly_pack()
+    pack["body"]["logAnalysis"]["anomaly"]["enabled"] = True
+    assert validate_pack(pack) == []
+    specs, notes = compile_log_anomaly_specs(pack["body"], "synthetic-log-anomaly", "0.1.0")
+    assert notes == []
+    assert len(specs) == 1
+
+
 # --- Dependency (unchanged shape) -------------------------------------------------------------
 
 def test_dependency_unnamespaced_endpoint_rejected() -> None:

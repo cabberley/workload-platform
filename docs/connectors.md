@@ -12,6 +12,10 @@ lives in [`src/shared/connectors`](../src/shared/connectors); see
   aggregated, PII-safe logs (`azure-monitor-query`), keyless via Managed Identity. See that page
   for the least-privilege RBAC (Monitoring Reader / Log Analytics Reader), config env vars, and the
   no-raw-log-egress guarantee.
+- **Log Sample** — in-boundary PII-free **log-feature** assist for AIOps log-anomaly detection
+  (issue #53); returns only aggregate `LogFeatures`, never a raw log body (see below).
+- **Azure OpenAI enrichment** — thin, keyless, in-boundary **LLM enrichment** edge (issue #53);
+  advisory-only, sends only PII-free `LogFeatures`, no-ops when unconfigured (see below).
 - **Kuiper** — Epic *Kuiper* **discovery assist** (`src/modules/discovery/connectors/kuiper.py`).
   Unlike the AIOps telemetry connectors, Kuiper feeds the **Discovery** module. It is
   **fail-closed by default**: the concrete Kuiper endpoint, payload contract, and auth scheme are an
@@ -177,6 +181,29 @@ lives in [`src/shared/connectors`](../src/shared/connectors); see
   - **Off by default.** Optional; with no approved endpoint / no credential the connector is inert
     (`available=False`) and emits nothing. Everything is exercised with synthetic fixtures only —
     no real NITRO/iControl schema or endpoint is baked in.
+- **Log Sample** — in-boundary **PII-free log-feature assist** for AIOps log-anomaly detection
+  ([`src/modules/aiops/connectors/log_sample.py`](../src/modules/aiops/connectors/log_sample.py),
+  issue #53). Fetches a bounded in-boundary log sample per resource window and returns **only**
+  `shared.contracts.LogFeatures` — aggregate counts/rates, one-way structural-template hashes, and
+  numeric duration percentiles. **The raw log body never leaves the edge:** the pure extractor
+  (`modules.aiops.log_features.extract_log_features`) is applied *inside* the connector, so what
+  crosses the boundary (and what the module ever sees) is the aggregate feature contract, never a
+  message/id/PII. Keyless via `DefaultAzureCredential`; field NAMES (level/message/duration/
+  timestamp) come from **env-var names**, never pack content. Off by default: the real SDK backend
+  raises `LogSampleSdkNotWired` until a human wires it, so absent config the connector is inert and
+  log-anomaly detection simply does not run (fail-closed by absence). Expected PII egress is
+  **NONE**; exercised with synthetic fixtures only.
+- **Azure OpenAI enrichment** — thin **keyless, in-boundary LLM enrichment edge**
+  ([`src/modules/aiops/connectors/openai_enrichment.py`](../src/modules/aiops/connectors/openai_enrichment.py),
+  issue #53, reusable by #54). Built on the shared connector base; configured **purely by env-var
+  NAMES** (endpoint/deployment/region). It sends **only** the already-computed PII-free
+  `LogFeatures` (never raw logs/PII), **region-pins** (deployment region must match the platform
+  region), validates the endpoint (SSRF guard, `https`-only) **before** resolving a credential via
+  `DefaultAzureCredential`, and returns **advisory-only** enrichment. **No-ops / degrades
+  gracefully** to the pure statistical result when UNCONFIGURED — the pure anomaly core is fully
+  valuable with **no** endpoint configured; the LLM is enrichment, not a dependency. Free-text
+  enrichment lands in `extra["logAnomalyEnrichment"]`, which the egress choke point redacts. See
+  [ADR 0019](adr/0019-pii-free-log-anomaly-advisory.md).
 
 ## The pattern
 

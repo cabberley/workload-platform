@@ -1120,3 +1120,149 @@ class MetricsSnapshotView(BaseModel):
             counters=[MetricSampleView.from_sample(s) for s in snapshot.counters],
             durations=[DurationSampleView.from_sample(s) for s in snapshot.durations],
         )
+
+
+# --------------------------------------------------------------------------------------
+# PII-free log features (issue #53).
+#
+# The AIOps module derives ADVISORY log-anomaly findings from a bounded, in-boundary log sample.
+# The ONLY thing that ever leaves the log boundary is this AGGREGATE, PII-free contract — never a
+# raw log body, message, identifier, or any other free text. Safety is by CONSTRUCTION:
+#
+# * ``LogLevel`` is a CLOSED enum, so ``countsByLevel`` keys are bounded/enumerable (auditor-safe)
+#   and no arbitrary level string (which could smuggle text) is ever retained.
+# * ``TemplateFrequency.signature`` is a **one-way SHA-256 hex hash** of a structural shape whose
+#   value tokens (numbers, GUIDs, emails, IPs, paths, ids) were already stripped to placeholders,
+#   with residual identifier-like tokens (anything with a digit/underscore, mixed/upper case, or
+#   over-long) further neutralized, BEFORE hashing. It is an INTERNAL, in-boundary-only structural
+#   correlation key: it MAY embed residual *lowercase lexical keyword* tokens in its preimage, so it
+#   is NOT claimed to be literal-free — instead it NEVER egresses. The no-egress guarantee is
+#   enforced structurally by :meth:`LogFeatures.enrichment_payload` (which projects signatures OUT
+#   of the only outbound payload), not by asserting the preimage is PII-free.
+# * Every other field is a count, rate, or numeric percentile — pure aggregate statistics.
+# * ``extra="forbid"`` guarantees no arbitrary raw-payload passthrough can attach to the features.
+# --------------------------------------------------------------------------------------
+class LogLevel(StrEnum):
+    """Closed, bounded set of normalized log severities (keys of ``LogFeatures.countsByLevel``).
+
+    A CLOSED enum (not a free-form string) makes the emitted key set statically enumerable and
+    auditor-safe, and guarantees a raw/arbitrary level token can never be retained. Any
+    unrecognized or absent level normalizes to :attr:`other` (fail-safe, never dropped silently).
+    """
+
+    debug = "debug"
+    info = "info"
+    warn = "warn"
+    error = "error"
+    critical = "critical"
+    other = "other"
+
+
+class TemplateFrequency(BaseModel):
+    """One structural log template and how often it occurred.
+
+    ``signature`` is a **one-way SHA-256 hex digest** of the normalized structural shape of a log
+    message (value tokens replaced with class placeholders, residual identifier-like tokens
+    neutralized, BEFORE hashing). It is an INTERNAL, in-boundary-only structural correlation key:
+    its preimage MAY still contain residual *lowercase lexical keyword* tokens, so it is NOT
+    claimed to be literal-free and MUST NOT leave the boundary. The no-egress guarantee is enforced
+    by :meth:`LogFeatures.enrichment_payload`, which drops signatures from the only outbound
+    payload — never by treating the hash preimage as PII-free. ``count`` is the absolute occurrence
+    count; ``fraction`` is its share of the sampled log volume in ``[0, 1]``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signature: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+        description="SHA-256 hex of the value-stripped structural shape (one-way; never the text)",
+    )
+    count: int = Field(ge=0)
+    fraction: float = Field(ge=0.0, le=1.0)
+
+
+class LogFeatures(BaseModel):
+    """Aggregate, PII-free features derived from a bounded in-boundary log sample (issue #53).
+
+    This is the SOLE log-derived payload used inside the boundary. It holds only counts, rates,
+    one-way structural-template hashes, and numeric duration percentiles — never a raw log body,
+    message, identifier, or any free text. ``extra="forbid"`` blocks any raw-payload passthrough.
+    Consumed by the pure statistical anomaly scorer (:mod:`modules.aiops.log_anomaly`). The
+    optional keyless in-boundary LLM enrichment edge receives ONLY the further-reduced
+    :meth:`enrichment_payload` projection (structural-template *signatures dropped*), so the
+    template hashes never egress. Deterministic function of its input sample; no I/O.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    windowStart: datetime | None = Field(
+        default=None, description="Earliest observation time in the sample (UTC), if known"
+    )
+    windowEnd: datetime | None = Field(
+        default=None, description="Latest observation time in the sample (UTC), if known"
+    )
+    totalCount: int = Field(default=0, ge=0, description="Total log records in the sample")
+    countsByLevel: dict[LogLevel, int] = Field(
+        default_factory=dict, description="Record counts keyed by the CLOSED LogLevel enum"
+    )
+    errorRate: float = Field(
+        default=0.0, ge=0.0, le=1.0, description="Fraction of records at error|critical level"
+    )
+    warnRate: float = Field(
+        default=0.0, ge=0.0, le=1.0, description="Fraction of records at warn level"
+    )
+    distinctTemplateCount: int = Field(
+        default=0, ge=0, description="Number of distinct structural templates (by signature)"
+    )
+    topTemplates: list[TemplateFrequency] = Field(
+        default_factory=list,
+        description="Most frequent structural templates (signatures only), highest first",
+    )
+    durationP50: float | None = Field(
+        default=None, description="50th percentile of the numeric duration field, if present"
+    )
+    durationP90: float | None = Field(
+        default=None, description="90th percentile of the numeric duration field, if present"
+    )
+    durationP95: float | None = Field(
+        default=None, description="95th percentile of the numeric duration field, if present"
+    )
+    durationP99: float | None = Field(
+        default=None, description="99th percentile of the numeric duration field, if present"
+    )
+    durationSampleCount: int = Field(
+        default=0, ge=0, description="Number of records that carried a finite numeric duration"
+    )
+
+    def enrichment_payload(self) -> dict[str, Any]:
+        """PII-free projection for the OPTIONAL in-boundary LLM enrichment edge — signatures gone.
+
+        This is the ONLY shape allowed to leave the log boundary to the (in-boundary, keyless)
+        Azure OpenAI enrichment edge. It OMITS every ``topTemplates[].signature``: those one-way
+        hashes are an INTERNAL structural correlation key whose PREIMAGE may embed residual
+        lowercase lexical tokens (a bare word the value-token stripper did not classify), so they
+        must never egress — and an opaque hash gives the model no value anyway. Everything retained
+        is a count, rate, level tally, numeric duration percentile, or a template's count/fraction —
+        pure aggregate statistics, provably PII-free.
+        """
+        return {
+            "totalCount": self.totalCount,
+            "countsByLevel": {
+                level.value: count for level, count in self.countsByLevel.items()
+            },
+            "errorRate": self.errorRate,
+            "warnRate": self.warnRate,
+            "distinctTemplateCount": self.distinctTemplateCount,
+            "topTemplates": [
+                {"count": t.count, "fraction": t.fraction} for t in self.topTemplates
+            ],
+            "durationP50": self.durationP50,
+            "durationP90": self.durationP90,
+            "durationP95": self.durationP95,
+            "durationP99": self.durationP99,
+            "durationSampleCount": self.durationSampleCount,
+            "windowStart": self.windowStart.isoformat() if self.windowStart else None,
+            "windowEnd": self.windowEnd.isoformat() if self.windowEnd else None,
+        }
