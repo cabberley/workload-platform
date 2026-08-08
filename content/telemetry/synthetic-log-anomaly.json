@@ -1,0 +1,68 @@
+{
+  "manifest": {
+    "id": "synthetic-log-anomaly",
+    "type": "telemetry",
+    "name": "SYNTHETIC demo — log AI analysis + anomaly detection (FAKE)",
+    "version": "0.1.0",
+    "targets": ["synthetic-demo"],
+    "sha256": "280584cc937bab4efc12fcf60f61569717762cb4f61f07f521abb951ab226b18",
+    "author": "microsoft"
+  },
+  "body": {
+    "signals": [
+      {
+        "name": "fake_widget_error_rate",
+        "op": "gt",
+        "threshold": 0.05,
+        "severity": "high",
+        "nodeId": "role:fake-widget",
+        "logAnalysisNote": "A plain threshold kept alongside the anomaly section — behaves exactly as before."
+      }
+    ],
+    "logAnalysis": {
+      "enabled": true,
+      "note": "SYNTHETIC/FAKE demo pack for issue #53: showcases advisory statistical log-anomaly detection over aggregate, PII-free LogFeatures. All values are fabricated; targets a fake 'synthetic-demo' workload so it never runs against a real estate. Field mapping (which record key holds the level/message/duration) is a connector/deployment concern, NOT declared here.",
+      "anomaly": {
+        "nodeId": "role:fake-widget",
+        "minBaseline": 5,
+        "method": "mad",
+        "features": [
+          {
+            "feature": "errorRate",
+            "direction": "up",
+            "bands": [
+              { "z": 3.5, "severity": "medium" },
+              { "z": 6.0, "severity": "high" },
+              { "z": 9.0, "severity": "critical" }
+            ],
+            "advisoryZScore": 2.0
+          },
+          {
+            "feature": "totalCount",
+            "direction": "both",
+            "bands": [
+              { "z": 4.0, "severity": "low" },
+              { "z": 7.0, "severity": "medium" }
+            ]
+          },
+          {
+            "feature": "durationP95",
+            "direction": "up",
+            "bands": [
+              { "z": 3.5, "severity": "medium" },
+              { "z": 6.0, "severity": "high" }
+            ]
+          },
+          {
+            "feature": "distinctTemplateCount",
+            "direction": "up",
+            "bands": [
+              { "z": 4.0, "severity": "low" },
+              { "z": 6.0, "severity": "medium" }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

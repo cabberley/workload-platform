@@ -17,6 +17,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from modules.aiops.connectors.azure_monitor import to_signals as azure_monitor_to_signals
 from modules.aiops.connectors.system_pulse import FetchResult, Signal
 from modules.aiops.connectors.system_pulse import to_signals as system_pulse_to_signals
+from modules.aiops.log_anomaly import (
+    LogAnomalySpec,
+    compile_log_anomaly_specs,
+    score_log_anomalies,
+)
 from modules.aiops.rca import (
     RCA_CONFIDENCE_FLOOR,
     correlate_rca,
@@ -33,6 +38,7 @@ from shared.blast_radius import blast_radius
 from shared.contracts import (
     AgentResponse,
     Finding,
+    LogFeatures,
     ModuleKind,
     ModuleManifest,
     ModuleRunResult,
@@ -124,6 +130,13 @@ def detect_metric_breach(signal: dict) -> Finding | None:
 # fabricated over. Adding a source is a registry-key + adapter change, not a contract change.
 _WELL_KNOWN_SOURCES: tuple[str, ...] = ("system_pulse", "azure_monitor")
 
+# Registry keys for the log-anomaly edges (issue #53). Both are OPTIONAL and fail-closed: with no
+# ``log_sample`` client present there is simply no log-anomaly detection (fail-closed by absence),
+# and with no ``llm_enrichment`` client (or an UNCONFIGURED one) the pure statistical result stands
+# alone. Neither is ever required for the metric/threshold detection path.
+_LOG_SAMPLE_SOURCE = "log_sample"
+_LLM_ENRICHMENT_SOURCE = "llm_enrichment"
+
 _ROLE_SELECTOR_PREFIX = "role:"
 
 
@@ -165,6 +178,49 @@ class _SignalFetcher(Protocol):
     """
 
     def fetch_raw(self, *, metric_names: Sequence[str] | None = None) -> FetchResult: ...
+
+
+class _LogFeatureFetchResultLike(Protocol):
+    """Structural view of the log-sample edge's fetch envelope (PII-free features only).
+
+    ``windowsByResource`` maps an estate node id (Azure resource id) to its windows ordered
+    oldest→newest — the last element is the current window, the rest are the baseline. The edge
+    returns only :class:`shared.contracts.LogFeatures`; no raw log body ever crosses this boundary.
+    """
+
+    @property
+    def available(self) -> bool: ...
+
+    @property
+    def windowsByResource(self) -> dict[str, list[LogFeatures]]: ...
+
+
+class _LogSampleClientLike(Protocol):
+    """Structural view of the keyless, fail-closed log-sample edge client (issue #53)."""
+
+    def fetch_features(
+        self, *, resource_ids: Sequence[str] | None = None
+    ) -> _LogFeatureFetchResultLike: ...
+
+
+class _EnrichmentResultLike(Protocol):
+    """Structural view of the advisory LLM-enrichment result. ``available=False`` ⇒ no-op."""
+
+    @property
+    def available(self) -> bool: ...
+
+    @property
+    def advisory(self) -> str | None: ...
+
+
+class _EnrichmentClientLike(Protocol):
+    """Structural view of the keyless, fail-closed Azure OpenAI enrichment edge (issue #53).
+
+    Sends ONLY the already-computed aggregate :class:`LogFeatures`; no-ops when UNCONFIGURED so the
+    pure statistical result always stands alone.
+    """
+
+    def enrich(self, features: LogFeatures) -> _EnrichmentResultLike: ...
 
 
 class TelemetryRuleSpec(BaseModel):
@@ -440,6 +496,162 @@ def _role_nodes(estate: list[ResourceNode]) -> dict[str, list[ResourceNode]]:
         if node.role:
             index[node.role.lower()].append(node)
     return index
+
+
+def load_log_anomaly_specs(
+    packs: object | None, workload: str
+) -> tuple[list[LogAnomalySpec], list[str]]:
+    """Compile target-aware log-anomaly specs for ``workload``. Returns ``(specs, notes)``.
+
+    Content-over-code: the log-anomaly detection KNOWLEDGE (which aggregate features to watch, the
+    z→severity bands, the baseline/method params) lives in the VERIFIED telemetry pack body's
+    ``logAnalysis.anomaly`` section — never a hard-coded Python threshold. Delegates to the pure
+    :func:`modules.aiops.log_anomaly.compile_log_anomaly_specs`, reached only downstream of the
+    engine's signature/trust gate (``load_for_workload`` verifies + target-filters first).
+    Malformed sections are surfaced as notes and skipped (fail-closed), never raised.
+    """
+    if packs is None:
+        return [], []
+    engine = cast(_PacksEngineLike, packs)
+    specs: list[LogAnomalySpec] = []
+    notes: list[str] = []
+    for pack in engine.load_for_workload(workload, PackType.telemetry):
+        pack_specs, pack_notes = compile_log_anomaly_specs(
+            pack.body, pack.manifest.id, pack.manifest.version
+        )
+        specs.extend(pack_specs)
+        notes.extend(pack_notes)
+    return specs, notes
+
+
+def _collect_log_anomaly_pack_sources(
+    specs: list[LogAnomalySpec],
+    into: dict[tuple[str | None, str | None], SourceReference],
+) -> None:
+    """Accumulate a distinct ``SourceReference`` per log-anomaly spec's Telemetry Pack (id/ver)."""
+    for spec in specs:
+        key = (spec.pack_id, spec.pack_version)
+        if not spec.pack_id or key in into:
+            continue
+        into[key] = SourceReference(
+            kind="pack", id=str(spec.pack_id), detail=f"version {spec.pack_version}"
+        )
+
+
+def run_log_anomaly_detections(
+    specs: list[LogAnomalySpec],
+    fetch_result: _LogFeatureFetchResultLike,
+    estate: list[ResourceNode],
+) -> tuple[list[Finding], list[str]]:
+    """Score the log-sample windows against the pack specs, per role→node. Returns ``(findings,
+    notes)``.
+
+    Fail-closed and advisory only. Each spec's role selector resolves to estate nodes via
+    :func:`_role_nodes`; for each node the edge's oldest→newest windows are split into a baseline
+    (all-but-last) and the current window (last). The pure
+    :func:`modules.aiops.log_anomaly.score_log_anomalies` enforces the confidence floor and the
+    short-baseline no-detection rule. A role matching no node, or a node with no/too-few windows, is
+    SURFACED and yields no finding — never a fabricated one. Consumes only PII-free
+    :class:`LogFeatures`; no raw log body reaches this layer.
+    """
+    if not fetch_result.available:
+        return [], []
+    findings: list[Finding] = []
+    notes: list[str] = []
+    role_index = _role_nodes(estate)
+    windows_by_resource = fetch_result.windowsByResource
+    for spec in specs:
+        nodes = role_index.get(spec.role, [])
+        if not nodes:
+            notes.append(
+                f"pack {spec.pack_id}: log-anomaly role {spec.role!r} matched no estate node — "
+                "no detection"
+            )
+            continue
+        for node in nodes:
+            windows = windows_by_resource.get(node.id)
+            if not windows:
+                notes.append(
+                    f"pack {spec.pack_id}: no log windows for node {node.id!r} (role {spec.role}) "
+                    "— no detection (fail-closed)"
+                )
+                continue
+            baseline = windows[:-1]
+            current = windows[-1]
+            node_findings, node_notes = score_log_anomalies(baseline, current, spec, node.id)
+            findings.extend(node_findings)
+            notes.extend(node_notes)
+    findings.sort(key=lambda finding: finding.id)
+    return findings, notes
+
+
+def run_log_anomaly_enrichment(
+    client: _EnrichmentClientLike,
+    findings: list[Finding],
+    fetch_result: _LogFeatureFetchResultLike,
+) -> list[dict[str, str]]:
+    """Attach an advisory LLM explanation to each node that produced a log-anomaly finding.
+
+    Enrichment is OPTIONAL and fail-closed: sends ONLY the already-computed aggregate current-window
+    :class:`LogFeatures` for a node (never a raw log), and an UNCONFIGURED / erroring client simply
+    contributes nothing (the pure statistical result stands). Returns a list of
+    ``{"nodeId": ..., "advisory": ...}`` entries the module attaches to the redact-on-egress
+    ``extra`` surface (never a finding/response field).
+    """
+    windows_by_resource = fetch_result.windowsByResource
+    node_ids = sorted({f.nodeId for f in findings if f.nodeId is not None})
+    entries: list[dict[str, str]] = []
+    for node_id in node_ids:
+        windows = windows_by_resource.get(node_id)
+        if not windows:
+            continue
+        current = windows[-1]
+        result = client.enrich(current)
+        if result.available and result.advisory:
+            entries.append({"nodeId": node_id, "advisory": result.advisory})
+    return entries
+
+
+def _observe_log_anomalies(
+    clients: Mapping[str, object],
+    specs: list[LogAnomalySpec],
+    estate: list[ResourceNode],
+) -> tuple[list[Finding], list[str], list[dict[str, str]]]:
+    """Fetch PII-free log features from the keyless edge, score them, and optionally enrich.
+
+    Returns ``(findings, notes, enrichment_entries)``. Fail-closed and advisory only:
+
+    * with no ``log_sample`` client present there is NO log-anomaly detection (a surfaced note,
+      empty findings) — fail-closed by absence;
+    * only PII-free :class:`LogFeatures` cross the edge; the raw rows stay inside the connector;
+    * enrichment is attempted only when findings exist AND an ``llm_enrichment`` client is present;
+      an UNCONFIGURED/erroring enrichment client contributes nothing (the statistical stands).
+    """
+    client = clients.get(_LOG_SAMPLE_SOURCE)
+    if client is None:
+        return [], ["log-sample source unavailable — no log-anomaly detection (fail-closed)"], []
+    role_index = _role_nodes(estate)
+    watched_roles = {spec.role for spec in specs}
+    resource_ids = sorted(
+        {node.id for role in watched_roles for node in role_index.get(role, [])}
+    )
+    if not resource_ids:
+        return [], ["log-anomaly specs matched no estate node — no detection (fail-closed)"], []
+
+    fetcher = cast(_LogSampleClientLike, client)
+    fetch_result = fetcher.fetch_features(resource_ids=resource_ids)
+    findings, notes = run_log_anomaly_detections(specs, fetch_result, estate)
+    if not fetch_result.available:
+        notes.append("log-sample edge unavailable — no log-anomaly detection (fail-closed)")
+
+    enrichment: list[dict[str, str]] = []
+    if findings:
+        llm = clients.get(_LLM_ENRICHMENT_SOURCE)
+        if llm is not None:
+            enrichment = run_log_anomaly_enrichment(
+                cast(_EnrichmentClientLike, llm), findings, fetch_result
+            )
+    return findings, notes, enrichment
 
 
 def fuse_detections(
@@ -757,6 +969,7 @@ class AiopsModule(Module):
         detections: list[Finding] = []
         rca_responses: list[AgentResponse] = []
         notes: list[str] = []
+        log_enrichment: list[dict[str, str]] = []
         sources_available: set[str] = set()
         sources_unavailable: set[str] = set()
         sources_observed = False
@@ -780,30 +993,53 @@ class AiopsModule(Module):
             windowed_detectors, detector_notes = load_windowed_detectors(ctx.packs, workload)
             notes.extend(detector_notes)
             _collect_detector_pack_sources(windowed_detectors, pack_sources)
-            if not rules and not windowed_detectors:
+            # Log-anomaly specs (issue #53) — content-over-code detection knowledge from the same
+            # verified telemetry packs. Independent of the metric signal stream: they are scored
+            # against the keyless log-sample edge's PII-free feature windows, not ``Signal``s.
+            log_specs, log_spec_notes = load_log_anomaly_specs(ctx.packs, workload)
+            notes.extend(log_spec_notes)
+            _collect_log_anomaly_pack_sources(log_specs, pack_sources)
+            if not rules and not windowed_detectors and not log_specs:
                 continue  # no telemetry detection content for this workload
 
-            # Fetch every metric named by a threshold rule OR a compiled detector, so a windowed
-            # detector over a metric no threshold watches still gets its observations.
-            metric_names = sorted(
-                {str(rule["name"]) for rule in rules}
-                | {str(det.name) for det in windowed_detectors}
-            )
-            signals, available, unavailable = _observe_signals(ctx.clients, metric_names)
-            sources_observed = True
-            sources_available.update(available)
-            sources_unavailable.update(unavailable)
-            if not signals:
-                notes.append(f"{workload}: no telemetry observed from any source")
+            estate = state.get_estate(workload)
+            workload_detections: list[Finding] = []
+
+            # Metric threshold path (cross-pack collision-merge) + compiled windowed/expression
+            # detectors — both consume the observed ``Signal`` stream.
+            if rules or windowed_detectors:
+                # Fetch every metric named by a threshold rule OR a compiled detector, so a windowed
+                # detector over a metric no threshold watches still gets its observations.
+                metric_names = sorted(
+                    {str(rule["name"]) for rule in rules}
+                    | {str(det.name) for det in windowed_detectors}
+                )
+                signals, available, unavailable = _observe_signals(ctx.clients, metric_names)
+                sources_observed = True
+                sources_available.update(available)
+                sources_unavailable.update(unavailable)
+                if signals:
+                    workload_detections.extend(fuse_detections(rules, signals, estate))
+                    workload_detections.extend(
+                        run_windowed_detectors(windowed_detectors, signals, estate)
+                    )
+                else:
+                    notes.append(f"{workload}: no telemetry observed from any source")
+
+            # Log-anomaly path (issue #53) — PII-free features from the keyless log-sample edge,
+            # scored by the pure robust-statistics scorer, fused into the SAME detection→RCA path.
+            # Optional + fail-closed: absent the edge there is simply no log-anomaly detection.
+            if log_specs:
+                log_findings, log_notes, log_enrich = _observe_log_anomalies(
+                    ctx.clients, log_specs, estate
+                )
+                notes.extend(log_notes)
+                workload_detections.extend(log_findings)
+                log_enrichment.extend(log_enrich)
+
+            if not workload_detections:
                 continue
 
-            estate = state.get_estate(workload)
-            # Threshold path (unchanged, cross-pack collision-merge) + compiled windowed/expression
-            # detectors, combined into one order-free detection set for correlation.
-            workload_detections = fuse_detections(rules, signals, estate)
-            workload_detections.extend(
-                run_windowed_detectors(windowed_detectors, signals, estate)
-            )
             workload_detections.sort(key=lambda finding: finding.id)
             graph = state.get_graph(workload)
             blast_of = _blast_radius_map(graph)
@@ -861,6 +1097,11 @@ class AiopsModule(Module):
             "sourcesUnavailable": sorted(sources_unavailable),
             "sourcesPartial": sorted(sources_partial),
             "packSources": [ref.model_dump(mode="json") for ref in pack_sources.values()],
+            # Advisory-only LLM enrichment (issue #53, deliverable 4): free-text explanations of the
+            # log anomalies, keyed by node. Placed in ``extra`` so the egress redaction pass
+            # (``main._redact_run_result_for_egress``) neutralizes the free text on the way out —
+            # fail-closed by construction, and the pure statistical findings stand regardless.
+            "logAnomalyEnrichment": log_enrichment,
         }
         return ModuleRunResult(
             module=self.name, ok=True, findings=detections, response=response, extra=extra
@@ -875,9 +1116,12 @@ __all__ = [
     "detect_metric_breach",
     "enrich_rca_with_remediation",
     "fuse_detections",
+    "load_log_anomaly_specs",
     "load_ops_remediations",
     "load_telemetry_rules",
     "load_windowed_detectors",
     "propose_remediation",
+    "run_log_anomaly_detections",
+    "run_log_anomaly_enrichment",
     "run_windowed_detectors",
 ]

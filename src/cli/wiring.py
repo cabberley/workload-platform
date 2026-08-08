@@ -78,6 +78,25 @@ ENV_AZURE_MONITOR_METRIC_NAMESPACE = "AZURE_MONITOR_METRIC_NAMESPACE"
 # Identity supplies the credential; only the env var names live in code.
 ENV_TELEMETRY_EXPORT_DCE_ENDPOINT = "TELEMETRY_EXPORT_DCE_ENDPOINT"
 ENV_TELEMETRY_EXPORT_DCR_IMMUTABLE_ID = "TELEMETRY_EXPORT_DCR_IMMUTABLE_ID"
+# Log-sample connector (aiops log-anomaly, issue #53). A Log Analytics workspace id gates the
+# keyless, read-only logs edge that reduces raw windows to PII-free ``LogFeatures`` in-boundary.
+# Optional resource ids + a field mapping (which record key holds the level/message/duration/
+# timestamp) are a DEPLOYMENT concern (never pack content). All are Key Vault-backed *values*; only
+# the env var names live in code (keyless — Managed Identity supplies the credential).
+ENV_LOG_SAMPLE_WORKSPACE_ID = "LOG_SAMPLE_WORKSPACE_ID"
+ENV_LOG_SAMPLE_RESOURCE_IDS = "LOG_SAMPLE_RESOURCE_IDS"
+ENV_LOG_SAMPLE_LEVEL_FIELD = "LOG_SAMPLE_LEVEL_FIELD"
+ENV_LOG_SAMPLE_MESSAGE_FIELD = "LOG_SAMPLE_MESSAGE_FIELD"
+ENV_LOG_SAMPLE_DURATION_FIELD = "LOG_SAMPLE_DURATION_FIELD"
+ENV_LOG_SAMPLE_TIMESTAMP_FIELD = "LOG_SAMPLE_TIMESTAMP_FIELD"
+# Keyless Azure OpenAI enrichment edge (aiops log-anomaly, issue #53, deliverable 4). OPTIONAL and
+# fail-closed: absent any of endpoint/deployment/region the edge is UNCONFIGURED and no-ops (the
+# pure statistical result stands). The AOAI resource region MUST equal the platform region
+# (region-pinned); both are non-secret Key Vault-backed *values*. Keyless — Managed Identity.
+ENV_AIOPS_LLM_ENDPOINT = "AIOPS_LLM_ENDPOINT"
+ENV_AIOPS_LLM_DEPLOYMENT = "AIOPS_LLM_DEPLOYMENT"
+ENV_AIOPS_LLM_REGION = "AIOPS_LLM_REGION"
+ENV_PLATFORM_REGION = "WP_PLATFORM_REGION"
 
 _DEFAULT_CONTENT_ROOT = "content"
 _WEBHOOK_TIMEOUT_S = 10.0
@@ -420,6 +439,8 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     _add_system_pulse(registry, cfg, secret_provider)
     _add_azure_monitor(registry, cfg, credential)
     _add_telemetry_exporter(registry, cfg, credential)
+    _add_log_sample(registry, cfg, credential)
+    _add_llm_enrichment(registry, cfg, credential)
 
     return registry
 
@@ -620,4 +641,102 @@ def _add_telemetry_exporter(
             fail_closed_observer=connector_fail_closed_observer("telemetry_export"),
         )
     except Exception:  # noqa: BLE001 - fail closed: omit the exporter, never crash wiring
+        return
+
+
+def _add_log_sample(
+    registry: dict[str, object], cfg: Mapping[str, str], credential: object | None
+) -> None:
+    """aiops log-anomaly's keyless log-sample connector (issue #53) — read-only, fail-closed.
+
+    Registered ONLY when a Log Analytics workspace id (``$LOG_SAMPLE_WORKSPACE_ID``) **and** a
+    keyless credential are both present. A ``credential_provider`` closure over the wiring
+    credential keeps it keyless (Managed Identity via ``DefaultAzureCredential``) — no
+    key/secret/connection string is ever read here. Optional ``$LOG_SAMPLE_RESOURCE_IDS``
+    (comma-separated) scopes the sample; the field mapping (``$LOG_SAMPLE_LEVEL_FIELD`` /
+    ``MESSAGE`` / ``DURATION`` / ``TIMESTAMP``) describes how a raw record is shaped — a DEPLOYMENT
+    concern, never pack content. The connector reduces raw windows to PII-free ``LogFeatures`` at
+    its edge; raw rows never leave it. It imports its SDK lazily, so a missing package fails closed
+    at query time; this builder never raises — a missing workspace or credential leaves the key
+    **absent** so the module simply performs no log-anomaly detection (fail-closed by absence).
+    """
+    workspace_id = (cfg.get(ENV_LOG_SAMPLE_WORKSPACE_ID) or "").strip()
+    if not workspace_id or credential is None:
+        return
+    resource_ids = [
+        rid.strip()
+        for rid in (cfg.get(ENV_LOG_SAMPLE_RESOURCE_IDS) or "").split(",")
+        if rid.strip()
+    ]
+    try:
+        from modules.aiops.connectors.log_sample import LogSampleClient, LogSampleConfig
+        from modules.aiops.log_features import LogFeatureExtractionSpec
+
+        base = LogFeatureExtractionSpec()
+        level_field = (cfg.get(ENV_LOG_SAMPLE_LEVEL_FIELD) or "").strip() or base.levelField
+        message_field = (cfg.get(ENV_LOG_SAMPLE_MESSAGE_FIELD) or "").strip() or base.messageField
+        duration_field = (cfg.get(ENV_LOG_SAMPLE_DURATION_FIELD) or "").strip() or None
+        timestamp_field = (cfg.get(ENV_LOG_SAMPLE_TIMESTAMP_FIELD) or "").strip() or None
+        extraction = LogFeatureExtractionSpec(
+            levelField=level_field,
+            messageField=message_field,
+            durationField=duration_field,
+            timestampField=timestamp_field,
+        )
+
+        registry["log_sample"] = LogSampleClient(
+            LogSampleConfig(
+                workspace_id=workspace_id,
+                resource_ids=resource_ids,
+                extraction=extraction,
+            ),
+            credential_provider=lambda: credential,
+            # Keyless observer (issue #60): a real fail-closed fetch increments
+            # connector_fail_closed_total{module="aiops"} on the process registry the API exposes.
+            fail_closed_observer=connector_fail_closed_observer("aiops"),
+        )
+    except Exception:  # noqa: BLE001 - fail closed: omit the connector, never crash wiring
+        return
+
+
+def _add_llm_enrichment(
+    registry: dict[str, object], cfg: Mapping[str, str], credential: object | None
+) -> None:
+    """aiops log-anomaly's keyless Azure OpenAI enrichment edge (issue #53, deliverable 4).
+
+    OPTIONAL and fail-closed. Registered ONLY when the endpoint (``$AIOPS_LLM_ENDPOINT``),
+    deployment (``$AIOPS_LLM_DEPLOYMENT``), AOAI region (``$AIOPS_LLM_REGION``), the platform region
+    (``$WP_PLATFORM_REGION``), **and** a keyless credential are ALL present — otherwise the key is
+    absent and the pure statistical result stands alone (the LLM is enrichment, not a dependency).
+    A ``credential_provider`` closure over the wiring credential keeps it keyless (Managed Identity
+    via ``DefaultAzureCredential``); no key/secret/connection string is ever read here. The region
+    is pinned to the platform region and the endpoint host is validated against the trusted Azure
+    OpenAI hosts at the edge (SSRF guard). The SDK imports lazily, so a missing package fails closed
+    at call time; this builder never raises — a missing value leaves the key absent.
+    """
+    endpoint = (cfg.get(ENV_AIOPS_LLM_ENDPOINT) or "").strip()
+    deployment = (cfg.get(ENV_AIOPS_LLM_DEPLOYMENT) or "").strip()
+    region = (cfg.get(ENV_AIOPS_LLM_REGION) or "").strip()
+    platform_region = (cfg.get(ENV_PLATFORM_REGION) or "").strip()
+    if not endpoint or not deployment or not region or not platform_region or credential is None:
+        return
+    try:
+        from modules.aiops.connectors.openai_enrichment import (
+            OpenAIEnrichmentClient,
+            OpenAIEnrichmentConfig,
+        )
+
+        registry["llm_enrichment"] = OpenAIEnrichmentClient(
+            OpenAIEnrichmentConfig(
+                endpoint=endpoint,
+                deployment=deployment,
+                region=region,
+                platform_region=platform_region,
+            ),
+            credential_provider=lambda: credential,
+            # Keyless observer (issue #60): a fail-closed enrichment increments
+            # connector_fail_closed_total{module="aiops"} on the process registry.
+            fail_closed_observer=connector_fail_closed_observer("aiops"),
+        )
+    except Exception:  # noqa: BLE001 - fail closed: omit the edge, never crash wiring
         return
