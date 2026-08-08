@@ -26,6 +26,96 @@ FAKE_CITRIX_TARGET_ID = (
     "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/citrix-vda-02"
 )
 
+# Clearly-fake load-balancer ids for the NetScaler/F5 connector fixtures (issue #49) — never real.
+FAKE_LB_ID = "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/lb-vserver-01"
+FAKE_LB_MEMBER_A = "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/backend-a"
+FAKE_LB_MEMBER_B = "/subscriptions/00000000-0000-0000-0000-000000000000/rg/fake/backend-b"
+
+
+class MockLbTokenProvider:
+    """A synthetic, keyless :class:`~shared.connectors.TokenProvider` for the LB connectors.
+
+    Returns an obviously-fake bearer token so the whole keyless resolve→auth-header→fetch path is
+    exercised WITHOUT any real NetScaler/F5 facts or credential. Records how many times it was
+    consulted so a test can assert an invalid endpoint never resolves a credential. Construct with
+    ``token=None`` to model a provider that cannot mint a token (⇒ the connector fails closed).
+    """
+
+    def __init__(self, token: str | None = "fake-lb-read-token") -> None:  # noqa: S107 - fake
+        self.calls = 0
+        self._token = token
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        return self._token
+
+
+def synthetic_nitro_payload(
+    *,
+    lb_id: str = FAKE_LB_ID,
+    members: tuple[tuple[str, str], ...] = (
+        (FAKE_LB_MEMBER_A, "UP"),
+        (FAKE_LB_MEMBER_B, "DOWN"),
+    ),
+    logs: tuple[tuple[str, str, float], ...] = ((FAKE_LB_ID, "error_rate", 0.02),),
+) -> dict[str, Any]:
+    """A synthetic Citrix NetScaler NITRO response envelope — obviously fake, PII/PHI-free.
+
+    Shapes a single ``lbvserver_binding`` (backend-pool membership) plus an aggregate ``logsummary``
+    section. ``members`` is a tuple of ``(memberId, nitroState)`` and ``logs`` a tuple of
+    ``(lbId, metric, value)``. There is no free-form field, so no PII can ride along.
+    """
+    return {
+        "errorcode": 0,
+        "lbvserver_binding": [
+            {
+                "name": lb_id,
+                "members": [
+                    {"resourceId": member_id, "state": state} for member_id, state in members
+                ],
+            }
+        ],
+        "logsummary": [
+            {"resourceId": log_lb, "metric": metric, "value": value}
+            for log_lb, metric, value in logs
+        ],
+    }
+
+
+def synthetic_icontrol_payload(
+    *,
+    lb_id: str = FAKE_LB_ID,
+    members: tuple[tuple[str, str, str], ...] = (
+        (FAKE_LB_MEMBER_A, "up", "monitor-enabled"),
+        (FAKE_LB_MEMBER_B, "down", "monitor-enabled"),
+    ),
+    logs: tuple[tuple[str, str, float], ...] = ((FAKE_LB_ID, "reset_rate", 0.5),),
+) -> dict[str, Any]:
+    """A synthetic F5 BIG-IP iControl REST pool response — obviously fake, PII/PHI-free.
+
+    Shapes a single LTM pool (``items``) with a ``membersReference.items`` backend list plus an
+    aggregate ``logSummary`` section. ``members`` is a tuple of ``(memberId, state, session)`` and
+    ``logs`` a tuple of ``(lbId, metric, value)``. There is no free-form field, so no PII can ride
+    along.
+    """
+    return {
+        "items": [
+            {
+                "fullPath": lb_id,
+                "membersReference": {
+                    "items": [
+                        {"fullPath": member_id, "state": state, "session": session}
+                        for member_id, state, session in members
+                    ]
+                },
+            }
+        ],
+        "logSummary": [
+            {"fullPath": log_lb, "metric": metric, "value": value}
+            for log_lb, metric, value in logs
+        ],
+    }
+
 
 class MockCitrixTokenProvider:
     """A synthetic, keyless :class:`~shared.connectors.TokenProvider` — no real Citrix, no secret.

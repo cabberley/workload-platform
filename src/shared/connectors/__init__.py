@@ -17,6 +17,14 @@ consistent and the only per-connector code is the actual transport at the edge:
 * :func:`fail_closed` — converts *any* exception from an edge callable into an unavailable
   :class:`FetchResult` carrying the error **class name only**.
 
+The :mod:`shared.connectors.edge` helpers add the two other pieces of edge machinery that
+connectors used to re-derive — a credential-exfil-safe HTTPS endpoint validator
+(:func:`validate_https_endpoint`), a streamed size/time-bounded JSON reader
+(:func:`read_bounded_json`), and a generic fail-closed :class:`HttpEdgeClient` that runs the whole
+fetch loop given a config and a pure payload transform. The load-balancer connectors added for
+issue #49 (:mod:`shared.connectors.netscaler`, :mod:`shared.connectors.f5`) build on these plus the
+pure, vendor-neutral transform layer in :mod:`shared.connectors.lb`.
+
 No Azure or vendor SDK is imported here; any SDK stays lazy inside a connector's edge method.
 """
 from __future__ import annotations
@@ -31,14 +39,38 @@ from shared.connectors.base import (
     resolve_bearer_token,
     run_with_retries,
 )
+from shared.connectors.edge import (
+    DeadlineExceeded,
+    EdgeEndpointError,
+    EndpointNotApproved,
+    HttpEdgeClient,
+    HttpEdgeConfig,
+    InvalidEndpoint,
+    InvalidResponse,
+    ResponseTooLarge,
+    coerce_dict_list,
+    read_bounded_json,
+    validate_https_endpoint,
+)
 
 __all__ = [
     "CredentialProvider",
+    "DeadlineExceeded",
+    "EdgeEndpointError",
+    "EndpointNotApproved",
     "FailClosedObserver",
     "FetchResult",
+    "HttpEdgeClient",
+    "HttpEdgeConfig",
+    "InvalidEndpoint",
+    "InvalidResponse",
+    "ResponseTooLarge",
     "SecretProvider",
     "TokenProvider",
+    "coerce_dict_list",
     "fail_closed",
+    "read_bounded_json",
     "resolve_bearer_token",
     "run_with_retries",
+    "validate_https_endpoint",
 ]

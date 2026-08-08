@@ -119,6 +119,64 @@ lives in [`src/shared/connectors`](../src/shared/connectors); see
     the `dependency_graph` module runs **exactly as today** (byte-for-byte identical graph). A
     fail-closed, failing, or empty/unusable connector is swallowed as "estate-only graph" with a
     bounded, PII-free note (error **class name only**) — a Citrix problem can never break the module.
+- **NetScaler & F5 (load-balancer connectors)** — two read-only **backend-pool + health assist**
+  connectors that feed **smart blast-radius** via dependency edges
+  ([`src/shared/connectors/netscaler.py`](../src/shared/connectors/netscaler.py) — Citrix NetScaler
+  over **NITRO REST**; [`src/shared/connectors/f5.py`](../src/shared/connectors/f5.py) — F5 BIG-IP
+  over **iControl REST**). Both are thin edges over the **shared LB machinery**: an
+  [`edge.py`](../src/shared/connectors/edge.py) HTTPS edge (endpoint validation + streamed,
+  size/time-bounded JSON reader + generic `HttpEdgeClient`) and a **vendor-neutral pure transform**
+  [`lb.py`](../src/shared/connectors/lb.py). Like Kuiper/Citrix they are **fail-closed by default**:
+  the concrete vendor endpoint, payload contract, and auth scheme are external dependencies owned by
+  the product team (`TODO(human):` seams — the real NITRO/iControl schemas are not baked in), so
+  until a human wires an **approved `https` endpoint** the connector stays *unavailable*, resolves
+  **no** credential, builds **no** `Authorization` header, and makes **no** network call. Endpoint
+  validation runs **before** any credential is resolved with the same guarantees as the sibling
+  connectors — `https`-only; no userinfo/query/fragment; a real (non-placeholder) host; **no**
+  explicit port; not an **IP literal** (loopback/link-local and legacy octal/hex/integer/short
+  numeric forms included); host canonicalized with the **same IDNA implementation HTTPX uses**
+  (`idna.encode`, non-encodable host fails **closed**); and then present in an explicit
+  operator-configured **approved-host allowlist** (**no** default host). The request target is
+  **rebuilt from the validated canonical host**, never the raw `base_url`.
+  - **Keyless via a KV-backed token env name.** The bearer resolves (keyless order) via an injected
+    `CredentialProvider`/`TokenProvider` → a Key Vault `SecretProvider` → a documented local-dev
+    env-var fallback — `NETSCALER_READ_TOKEN` / `F5_READ_TOKEN` — using the shared
+    `resolve_bearer_token`. No secret literal ever appears in code, config, or tests; the env var
+    holds only a **name**. A contract-mock `MockLbTokenProvider` plus synthetic NITRO / iControl
+    payloads exercise the whole path without any real vendor — no schema or endpoint is baked in.
+  - **Backend-pool membership → dependency edges.** The pure `dependency_edges(...)` maps each
+    `backend-member` signal to an `EdgeType.load_balances` edge (`source=lbId → target=memberId`,
+    origin `connector:netscaler` / `connector:f5`, `redundant` set when a pool has more than one
+    distinct member). **Both** endpoints must already exist in the estate id set — an edge touching
+    an unknown id, a self-edge, a duplicate, or a bypass-constructed (`model_construct`) invalid id
+    is **dropped**. These edges land in the exact shape smart blast-radius / the dependency graph
+    already consumes (matching #47/#48).
+  - **Aggregate health, never per-request bodies.** `aggregate_health(...)` reduces each LB's
+    distinct member-health token set to a single `HealthState` (`{up}`→up, `{down}`→down,
+    `{unknown}`→unknown, any other mix→degraded); `apply_health(...)` writes it as a bounded
+    supplemental tag (`aegis:lb-health`) and **additively** unions the connector into the existing
+    `aegis:source` set (never clobbering another connector's provenance). Only aggregate health and
+    fixed-vocabulary **filtered-log-derived signals** (`log_signals` → closed metric allowlist
+    `{error_rate, reset_rate, conn_drops}`) leave the boundary — **never a raw log body**; expected
+    PII egress is **NONE**.
+  - **PII-safe & atomic.** The common signal model is a **closed** two-kind key set
+    (`backend-member` / `log-signal`); the vendor parsers **project only known fields**, so any
+    unexpected vendor key is **dropped** (never copied into a signal, so it can never ride the
+    boundary), while a charset/length-invalid id or non-allowlisted health/metric token in a field
+    that *is* read **rejects the entire fetch** (atomic — never a partially-fabricated topology).
+    Both hint models **self-validate**, and — because `model_construct`/`model_copy` bypass
+    validators — `signals_from_result` **re-validates** every injected `FetchResult` as untrusted
+    before use, failing closed on the whole batch.
+  - **Bounded & SDK-free.** TLS verify on, finite timeout, a **streamed** size- AND time-bounded
+    response body (over-limit `Content-Length` rejected before reading; running byte total checked
+    per chunk; non-identity `Content-Encoding` refused), a max record count, a max per-field length,
+    capped retries/delays with jitter, and an overall elapsed deadline checked **before every
+    attempt and sleep** and on **every** chunk. Malformed payloads are **not** retried (mapping runs
+    once, outside the retry loop). `httpx` is imported **lazily inside the edge**, so importing
+    either connector never imports `httpx` when the vendor is absent.
+  - **Off by default.** Optional; with no approved endpoint / no credential the connector is inert
+    (`available=False`) and emits nothing. Everything is exercised with synthetic fixtures only —
+    no real NITRO/iControl schema or endpoint is baked in.
 
 ## The pattern
 
