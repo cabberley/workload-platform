@@ -51,16 +51,19 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from pydantic import ValidationError
 
 from packs_engine.canonical import canonical_digest
 from shared.contracts import PackSignature, PackType
+
+if TYPE_CHECKING:  # pragma: no cover - typing-only import; avoids a runtime import cycle
+    from shared.contracts import ImportedPack
 
 DEFAULT_INDEX_PATH = Path("content/registry/index.json")
 # Bumped 1 -> 2 for issue #89 (R2): a v2 entry additionally persists the detached Ed25519 pack
@@ -325,6 +328,17 @@ def _serialize_pack_signature(signature: PackSignature) -> str:
     return json.dumps(signature.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
 
 
+def serialize_pack_signature(signature: PackSignature) -> str:
+    """Public deterministic serializer for a detached :class:`PackSignature` (issue #68).
+
+    The per-tenant import path (``api.app.main.import_pack``) persists the verified detached
+    signature on its tenant-scoped :class:`~shared.contracts.ImportedPack` record using the SAME
+    deterministic serialization the on-disk registry uses, so the runtime resolver reconstructs and
+    re-verifies the identical envelope (via :meth:`RegistryEntry.detached_signature`).
+    """
+    return _serialize_pack_signature(signature)
+
+
 def _normalize_publish_signature(
     signature: PackSignature | str | None,
 ) -> tuple[str | None, str | None]:
@@ -390,6 +404,82 @@ def parse_registry_index(
             raise CorruptRegistryError(f"Duplicate registry entry for {entry.ref}")
         entries[entry.ref] = entry
     return entries
+
+
+# --------------------------------------------------------------------------------------
+# PackRegistryReader — the READ surface consumers (engine resolver, per-workload pinning) need.
+# --------------------------------------------------------------------------------------
+@runtime_checkable
+class PackRegistryReader(Protocol):
+    """The minimal, read-only registry surface the runtime resolver + pinning depend on (#68).
+
+    Both the on-disk :class:`PackRegistry` and the in-memory :class:`InMemoryPackRegistry` satisfy
+    it, so the engine can be handed a PER-TENANT view of imported packs (issue #68) without knowing
+    which concrete registry backs it — the tenant's imports are resolved exactly like the shared
+    on-disk index, keeping cross-tenant isolation at the registry boundary.
+    """
+
+    def get(self, ref: PackRef) -> RegistryEntry | None:
+        """Return the entry for an exact ``id@version`` ref, or ``None``."""
+        ...
+
+    def list(self, pack_type: PackType | None = None) -> list[RegistryEntry]:
+        """List entries (optionally filtered by type), ordered by (id, semver)."""
+        ...
+
+    def latest(self, pack_id: str) -> RegistryEntry | None:
+        """Return the highest-semver entry for ``pack_id``, or ``None`` if unknown."""
+        ...
+
+
+def imported_pack_to_entry(pack: ImportedPack) -> RegistryEntry:
+    """Project a persisted per-tenant :class:`~shared.contracts.ImportedPack` into a RegistryEntry.
+
+    The tenant-scoped imported-pack record carries the SAME verified identity the on-disk registry
+    would (``id``/``version``/``type``/``digest`` + the serialized detached signature and its
+    ``key_id``), so the runtime resolver re-verifies it against the pinned trust bundle exactly like
+    a shared-registry entry — trust is never inherited from the fact that it was imported.
+    """
+    return RegistryEntry(
+        ref=PackRef(id=pack.packId, version=pack.version),
+        type=pack.packType,
+        digest=pack.digest,
+        createdAt=pack.importedAt,
+        signature=pack.signature,
+        key_id=pack.keyId,
+    )
+
+
+@dataclass
+class InMemoryPackRegistry:
+    """An in-memory, read-only :class:`PackRegistryReader` over a fixed set of entries (issue #68).
+
+    Used to hand the engine a PER-TENANT registry of the caller tenant's imported packs (and, where
+    a caller needs it, the shared built-in entries merged in) WITHOUT persisting anything or
+    touching the shared on-disk index. It is deliberately read-only: imports are recorded in the
+    tenant-scoped state store (the single writer), and this view is rebuilt per request from that
+    state, so it can never leak one tenant's imports into another's resolution.
+    """
+
+    entries: dict[PackRef, RegistryEntry] = field(default_factory=dict)
+
+    @classmethod
+    def from_entries(cls, entries: Iterable[RegistryEntry]) -> InMemoryPackRegistry:
+        """Build a registry from ``entries`` (later entries win on a duplicate ref)."""
+        return cls(entries={entry.ref: entry for entry in entries})
+
+    def get(self, ref: PackRef) -> RegistryEntry | None:
+        return self.entries.get(ref)
+
+    def list(self, pack_type: PackType | None = None) -> list[RegistryEntry]:
+        selected = [e for e in self.entries.values() if pack_type is None or e.type == pack_type]
+        return sorted(selected, key=lambda e: e.ref)
+
+    def latest(self, pack_id: str) -> RegistryEntry | None:
+        candidates = [e for e in self.entries.values() if e.ref.id == pack_id]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda e: e.ref.semver)
 
 
 # --------------------------------------------------------------------------------------

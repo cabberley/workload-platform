@@ -22,18 +22,22 @@ from shared.contracts import (
     DependencyEdge,
     EdgeType,
     Finding,
+    ImportedPack,
     ModuleKind,
     ModuleManifest,
     ModuleRunResult,
+    PackType,
     ResourceNode,
     ScaleProfile,
     Severity,
     SourceReference,
+    TenantModuleConfig,
     WorkloadGraph,
 )
 from shared.module_base import Module, ModuleContext, run_module
 from shared.state import (
     AzureStateStore,
+    ImportConflictError,
     LocalStateStore,
     ReadableState,
     ReadOnlyState,
@@ -934,6 +938,21 @@ class _FakeTable:
         with self.lock:
             return [dict(v) for (p, _r), v in self.rows.items() if p == pk]
 
+    def upsert_entity(self, entity: dict[str, object], *, mode: str = "merge") -> None:
+        # Create-or-replace/merge in one call (no ETag), like ``TableClient.upsert_entity``.
+        with self.lock:
+            key = (str(entity["PartitionKey"]), str(entity["RowKey"]))
+            if key in self.rows and mode != "replace":
+                self.rows[key].update(dict(entity))
+            else:
+                self.rows[key] = dict(entity)
+            self.etags[key] = self._new_etag()
+
+    def list_entities(self) -> list[dict[str, object]]:
+        # Whole-table scan (copies), like ``TableClient.list_entities``.
+        with self.lock:
+            return [dict(v) for v in self.rows.values()]
+
 
 class _FakeTableService:
     def __init__(self) -> None:
@@ -1145,3 +1164,123 @@ def test_azure_commit_uses_unconditional_free_write_once_blobs() -> None:
     # All version-scoped names are unique (write-once guarantee, no clobber).
     names = [name for name, _overwrite in container.writes]
     assert len(names) == len(set(names))
+
+
+# --------------------------------------------------------------------------------------
+# Per-tenant imported packs + module config (issue #68) — Azure Table backend round-trips
+# and scope isolation. ``scope`` is the tenant-namespace carrier the API threads; here we drive
+# disjoint scopes directly to prove the Azure backend never crosses records between two scopes.
+# --------------------------------------------------------------------------------------
+_IMP_SCOPE_A = "aaaaaaaa.__imports"
+_IMP_SCOPE_B = "bbbbbbbb.__imports"
+_MOD_SCOPE_A = "aaaaaaaa.__modules"
+_MOD_SCOPE_B = "bbbbbbbb.__modules"
+
+
+def _az_imported(
+    scope: str,
+    pack_id: str = "epic-core",
+    version: str = "1.0.0",
+    digest: str = "sha256:aaa",
+    pack_type: PackType = PackType.workload,
+    signature: str | None = None,
+    key_id: str | None = None,
+) -> ImportedPack:
+    return ImportedPack(
+        scope=scope,
+        packId=pack_id,
+        version=version,
+        packType=pack_type,
+        digest=digest,
+        signature=signature,
+        keyId=key_id,
+        importedBy="tester",
+    )
+
+
+@azure_only
+def test_azure_put_and_get_imported_pack_round_trips() -> None:
+    store, _service, _container = _azure_store()
+    assert store.get_imported_pack(_IMP_SCOPE_A, "epic-core", "1.0.0") is None
+    store.put_imported_pack(
+        _az_imported(_IMP_SCOPE_A, signature="sig", key_id="test-kid", pack_type=PackType.rule)
+    )
+    got = store.get_imported_pack(_IMP_SCOPE_A, "epic-core", "1.0.0")
+    assert got is not None
+    assert got.packId == "epic-core"
+    assert got.version == "1.0.0"
+    assert got.packType is PackType.rule
+    assert got.digest == "sha256:aaa"
+    assert got.signature == "sig"
+    assert got.keyId == "test-kid"
+
+
+@azure_only
+def test_azure_imported_pack_replaces_same_id_version() -> None:
+    store, _service, _container = _azure_store()
+    store.put_imported_pack(_az_imported(_IMP_SCOPE_A, digest="sha256:aaa"))
+    store.put_imported_pack(_az_imported(_IMP_SCOPE_A, digest="sha256:bbb"))
+    got = store.get_imported_pack(_IMP_SCOPE_A, "epic-core", "1.0.0")
+    assert got is not None and got.digest == "sha256:bbb"
+    assert len(store.list_imported_packs(_IMP_SCOPE_A)) == 1
+
+
+@azure_only
+def test_azure_imported_pack_is_scope_isolated() -> None:
+    store, _service, _container = _azure_store()
+    store.put_imported_pack(_az_imported(_IMP_SCOPE_A, digest="sha256:aaa"))
+    assert store.get_imported_pack(_IMP_SCOPE_B, "epic-core", "1.0.0") is None
+    store.put_imported_pack(_az_imported(_IMP_SCOPE_B, digest="sha256:bbb"))
+    a = store.get_imported_pack(_IMP_SCOPE_A, "epic-core", "1.0.0")
+    b = store.get_imported_pack(_IMP_SCOPE_B, "epic-core", "1.0.0")
+    assert a is not None and a.digest == "sha256:aaa"
+    assert b is not None and b.digest == "sha256:bbb"
+
+
+@azure_only
+def test_azure_list_imported_packs_is_scope_filtered_at_storage_layer() -> None:
+    # FIX 4 (issue #68): the Azure list filters by ``PartitionKey eq`` at the backend, so a query
+    # for one tenant never returns another tenant's rows even at the storage layer.
+    store, _service, _container = _azure_store()
+    assert store.list_imported_packs(_IMP_SCOPE_A) == []
+    store.put_imported_pack(_az_imported(_IMP_SCOPE_A, pack_id="a-pack"))
+    store.put_imported_pack(_az_imported(_IMP_SCOPE_B, pack_id="b-pack"))
+    assert {(p.scope, p.packId) for p in store.list_imported_packs(_IMP_SCOPE_A)} == {
+        (_IMP_SCOPE_A, "a-pack")
+    }
+    assert {(p.scope, p.packId) for p in store.list_imported_packs(_IMP_SCOPE_B)} == {
+        (_IMP_SCOPE_B, "b-pack")
+    }
+
+
+@azure_only
+def test_azure_try_record_imported_pack_atomic_immutability() -> None:
+    # FIX 2 (issue #68): create_entity is the atomic guard — a same-digest re-import is idempotent
+    # (returns the stored record), a different-digest re-import conflicts and preserves the first.
+    store, _service, _container = _azure_store()
+    first = store.try_record_imported_pack(
+        _az_imported(_IMP_SCOPE_A, digest="sha256:aaa", key_id="kid-1")
+    )
+    same = store.try_record_imported_pack(
+        _az_imported(_IMP_SCOPE_A, digest="sha256:aaa", key_id="kid-2")
+    )
+    assert same.keyId == first.keyId == "kid-1"
+    assert len(store.list_imported_packs(_IMP_SCOPE_A)) == 1
+    with pytest.raises(ImportConflictError):
+        store.try_record_imported_pack(_az_imported(_IMP_SCOPE_A, digest="sha256:bbb"))
+    got = store.get_imported_pack(_IMP_SCOPE_A, "epic-core", "1.0.0")
+    assert got is not None and got.digest == "sha256:aaa"  # first content preserved
+
+
+@azure_only
+def test_azure_module_config_round_trips_and_is_scope_isolated() -> None:
+    store, _service, _container = _azure_store()
+    assert store.get_module_config(_MOD_SCOPE_A) is None
+    store.put_module_config(TenantModuleConfig(scope=_MOD_SCOPE_A, disabled=["quality_checks"]))
+    got = store.get_module_config(_MOD_SCOPE_A)
+    assert got is not None and got.disabled == ["quality_checks"]
+    # A different tenant scope is untouched (isolation), and replace semantics hold.
+    assert store.get_module_config(_MOD_SCOPE_B) is None
+    store.put_module_config(TenantModuleConfig(scope=_MOD_SCOPE_A, disabled=["drift"]))
+    replaced = store.get_module_config(_MOD_SCOPE_A)
+    assert replaced is not None and replaced.disabled == ["drift"]

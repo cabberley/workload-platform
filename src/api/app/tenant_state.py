@@ -24,19 +24,31 @@ ADR 0014) and is delegated UNCHANGED — tenant-scoping the audit log is out of 
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from api.app.tenancy import tenant_partition_key, workload_of
 from shared.contracts import (
     AuditEvent,
     Finding,
+    ImportedPack,
     ModuleRunResult,
     PackAssignment,
     ResourceNode,
     TenantContext,
+    TenantModuleConfig,
     WorkloadGraph,
 )
 from shared.state import StateStore
 
 __all__ = ["TenantScopedState"]
+
+# Reserved internal "workload" names used ONLY to derive the tenant-namespaced physical key for
+# per-tenant module config and imported packs (issue #68). They live in the SAME composite-key
+# space as real workloads (``tenant_partition_key``), so each tenant gets a disjoint physical
+# partition and ``workload_of`` filters other tenants out deny-by-default — exactly like pack
+# assignments. The leading underscore keeps them clear of user-facing workload names (never egress).
+_IMPORTS_SCOPE = "_imports"
+_MODULES_SCOPE = "_modules"
 
 
 class TenantScopedState:
@@ -152,3 +164,78 @@ class TenantScopedState:
 
     def audit_head(self) -> str:
         return self._inner.audit_head()
+
+    # -- per-tenant imported packs (issue #68, tenant-scoped) ----------------------------
+    def _imports_scope(self) -> str:
+        """The tenant-namespaced physical key under which THIS tenant's imports are recorded."""
+        return self._key(_IMPORTS_SCOPE)
+
+    def record_imported_pack(self, pack: ImportedPack) -> None:
+        """Record a pack imported by THIS tenant under its composite key (single writer).
+
+        ``pack.scope`` is namespaced with the tenant partition key before it reaches the inner
+        store, so two tenants importing the SAME pack id+version write to DISJOINT physical keys — a
+        tenant can never see or overwrite another tenant's import. The pack BYTES live in the shared
+        content-addressed store; this records only the per-tenant ownership/visibility.
+
+        Unconditional replace semantics — the import path uses :meth:`try_record_imported_pack` for
+        the ATOMIC per-tenant immutability guard instead.
+        """
+        scoped = pack.model_copy(update={"scope": self._imports_scope()})
+        self._inner.put_imported_pack(scoped)
+
+    def try_record_imported_pack(self, pack: ImportedPack) -> ImportedPack:
+        """Atomically record THIS tenant's import, enforcing per-tenant immutability (issue #68).
+
+        Namespaces ``pack.scope`` with the tenant partition key, then delegates to the backend's
+        ATOMIC insert-if-absent-else-verify-digest guard — closing the read-then-write race so two
+        concurrent imports of the same id@version with different content cannot last-writer-win. An
+        identical-digest re-import is idempotent (returns the stored record); a different-digest
+        re-import raises :class:`~shared.state.ImportConflictError`. The returned record carries the
+        composite scope; callers egress only the LOGICAL id/version, never the scope.
+        """
+        scoped = pack.model_copy(update={"scope": self._imports_scope()})
+        return self._inner.try_record_imported_pack(scoped)
+
+    def get_imported_pack(self, pack_id: str, version: str) -> ImportedPack | None:
+        """Return THIS tenant's imported pack ``(pack_id, version)`` or ``None`` (deny-by-default).
+
+        Addresses only the tenant's own scope, so another tenant's import of the same id+version is
+        never returned.
+        """
+        return self._inner.get_imported_pack(self._imports_scope(), pack_id, version)
+
+    def list_imported_packs(self) -> list[ImportedPack]:
+        """Return only THIS tenant's imported packs (others filtered out, deny-by-default).
+
+        The backend list is filtered by THIS tenant's scope AT THE STORAGE LAYER (issue #68) — it
+        never scans another tenant's rows — and we keep a cheap ``workload_of`` check on top as
+        defense-in-depth, mirroring :meth:`list_pack_assignments`.
+        """
+        tenant_id = self._tenant.tenant_id
+        return [
+            pack
+            for pack in self._inner.list_imported_packs(self._imports_scope())
+            if workload_of(pack.scope, tenant_id) == _IMPORTS_SCOPE
+        ]
+
+    # -- per-tenant module enablement (issue #68, tenant-scoped) -------------------------
+    def _modules_scope(self) -> str:
+        """The tenant-namespaced physical key under which THIS tenant's module config is stored."""
+        return self._key(_MODULES_SCOPE)
+
+    def get_module_config(self) -> TenantModuleConfig | None:
+        """Return THIS tenant's module-enablement config, or ``None`` if unset (default-enabled)."""
+        return self._inner.get_module_config(self._modules_scope())
+
+    def get_disabled_modules(self) -> set[str]:
+        """Return the set of module names THIS tenant has disabled (empty if no config set)."""
+        config = self.get_module_config()
+        return set(config.disabled) if config is not None else set()
+
+    def set_disabled_modules(self, disabled: Iterable[str]) -> None:
+        """Replace THIS tenant's disabled-module set under its composite key (single writer)."""
+        config = TenantModuleConfig(
+            scope=self._modules_scope(), disabled=sorted(set(disabled))
+        )
+        self._inner.put_module_config(config)

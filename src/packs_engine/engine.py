@@ -55,7 +55,7 @@ from shared.signing import PackVerifier, Verifier, verify_pack
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import; avoids runtime coupling to the emitter
     from packs_engine.content_store import PackContentStore
-    from packs_engine.registry import PackRegistry, RegistryEntry
+    from packs_engine.registry import PackRegistryReader, RegistryEntry
     from shared.audit import AuditEmitter
 
 
@@ -180,7 +180,7 @@ class PacksEngine:
         signature_verifier: Verifier | None = None,
         import_verifier: PackVerifier | None = None,
         audit_emitter: AuditEmitter | None = None,
-        registry: PackRegistry | None = None,
+        registry: PackRegistryReader | None = None,
         content_store: PackContentStore | None = None,
         require_integrity: bool = True,
     ) -> None:
@@ -218,6 +218,47 @@ class PacksEngine:
     def attach_audit_emitter(self, emitter: AuditEmitter) -> None:
         """Attach a store-backed audit emitter after construction (used by the API composition)."""
         self._audit_emitter = emitter
+
+    def with_import_registry(self, registry: PackRegistryReader | None) -> PacksEngine:
+        """Return a shallow clone that resolves IMPORTED packs from ``registry`` (issue #68).
+
+        The clone shares this engine's content root, trust gates, content store, and audit emitter
+        but swaps the registry used by :meth:`_resolve_imported_packs`, so the API can hand a run a
+        PER-TENANT view of only the caller tenant's imported packs. Cross-tenant isolation is
+        preserved at the registry boundary: another tenant's imports are simply not in ``registry``,
+        so they can never be resolved or executed. Shipped content-root packs are unaffected (they
+        are loaded from the filesystem, not the registry), and every trust gate still applies —
+        each imported pack is re-verified against the pinned bundle before use (fail closed).
+        """
+        clone = PacksEngine.__new__(PacksEngine)
+        clone.__dict__.update(self.__dict__)
+        clone._registry = registry
+        return clone
+
+    def reserved_pack_ids(self) -> set[str]:
+        """Pack ids owned by platform-shipped/shared packs — reserved against tenant imports (#68).
+
+        The union of (a) the shared REGISTRY entries the catalogue surfaces as built-in and (b) the
+        pack ids shipped on the content-root filesystem — the SAME ids :meth:`load_all` records in
+        ``shipped_ids`` and :meth:`_resolve_imported_packs` reserves (a shipped id owns that id at
+        EVERY version and is never shadowed by an import). A tenant import whose id lands in this
+        set would be admitted+assignable yet silently resolve to NOTHING at runtime (the runtime
+        skips it); :func:`api.app.main.import_pack` rejects such a collision up front (409, fail
+        closed) so the tenant-import id-space stays DISJOINT from shipped/shared. Enumeration is
+        id-only (no signature verification) — a BROADER reserved set is the safe direction.
+        """
+        ids: set[str] = {entry.ref.id for entry in self.registry_entries()}
+        for path in self._iter_pack_files():
+            with contextlib.suppress(Exception):
+                raw = self._parse(path)
+                if not isinstance(raw, dict):
+                    continue
+                manifest_raw = raw.get("manifest")
+                if isinstance(manifest_raw, dict):
+                    pack_id = manifest_raw.get("id")
+                    if isinstance(pack_id, str) and pack_id:
+                        ids.add(pack_id)
+        return ids
 
     def registry_entries(self, pack_type: PackType | None = None) -> list[RegistryEntry]:
         """Read-only listing of published pack versions in the wired registry (issue #57).

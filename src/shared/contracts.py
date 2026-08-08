@@ -527,6 +527,74 @@ class PackAssignment(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
+# Per-tenant imported packs — a custom pack import scoped to the importing tenant (issue #68).
+#
+# An imported pack's VISIBILITY/ownership is per-tenant: the record is namespaced by the tenant
+# partition key (see ``api.app.tenant_state``) exactly like a ``PackAssignment``, so a pack imported
+# by tenant A is never visible to tenant B (deny-by-default). The pack BYTES are NOT stored here —
+# they live in the shared, content-addressed pack content store (issue #44), deduped by ``digest``
+# (a content hash reveals nothing about the tenant). This record is the per-tenant OWNERSHIP index:
+# it binds the pack's identity (``packId``/``version``/``packType``), its content-address
+# ``digest``, and the VERIFIED detached signature (serialized ``signature`` + ``keyId``, exactly as
+# the registry persists it — issue #89) so the runtime resolver can re-verify trust before use.
+# --------------------------------------------------------------------------------------
+class ImportedPack(BaseModel):
+    """A signed pack imported by, and visible ONLY to, one tenant (issue #68).
+
+    ``scope`` is the tenant-namespace carrier (the composite tenant partition key), threaded by
+    :class:`~api.app.tenant_state.TenantScopedState` exactly like :attr:`PackAssignment.workload`;
+    it is internal-only and NEVER egressed to a caller (the tenant prefix must not surface). The
+    content bytes live in the shared content-addressed store keyed by ``digest``; this record is the
+    per-tenant ownership/visibility index the API filters ``GET /api/packs`` and pack ASSIGNMENT by.
+    ``signature`` is the deterministically-serialized detached :class:`PackSignature` verified at
+    import (with its ``keyId``) so the runtime can re-verify it against the pinned trust bundle.
+    """
+
+    scope: str = Field(
+        description="Tenant partition key (namespace carrier; internal — never egressed)"
+    )
+    packId: str = Field(description="Pack id being imported (a registry entry id)")
+    version: str = Field(description="Semantic version of the imported pack, e.g. 1.2.0")
+    packType: PackType = Field(description="Pack type (workload/rule/telemetry/dependency/ops)")
+    digest: str = Field(description="Canonical content-address digest (sha256 hex; store key)")
+    signature: str | None = Field(
+        default=None,
+        description="Serialized verified detached PackSignature (None = legacy-untrusted)",
+    )
+    keyId: str | None = Field(default=None, description="Signing key id of the detached signature")
+    importedBy: str = Field(description="Principal that imported the pack (provenance)")
+    importedAt: datetime = Field(
+        default_factory=_utcnow, description="When the pack was imported (provenance)"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Per-tenant module enablement — which capability modules a tenant has enabled (issue #68).
+#
+# Deny-by-default is NOT required for modules: a tenant that has set NO config keeps today's
+# default-enabled behaviour (so existing single-tenant deployments are unchanged). The config
+# records only the modules a tenant has explicitly DISABLED; once disabled, a module is unusable for
+# that tenant (``GET /api/modules`` reports it disabled, and ``POST /api/modules/{name}/run`` fails
+# closed 403). The config is namespaced by the tenant partition key (see ``api.app.tenant_state``).
+# --------------------------------------------------------------------------------------
+class TenantModuleConfig(BaseModel):
+    """A tenant's module-enablement config — the set of modules it has DISABLED (issue #68).
+
+    ``scope`` is the tenant-namespace carrier (the composite tenant partition key), internal-only
+    and NEVER egressed. ``disabled`` holds the module NAMES the tenant has switched off; a module
+    absent from this set is enabled (default-enabled — deny-by-default is deliberately NOT applied
+    to modules). Module names are static platform identifiers (never PII).
+    """
+
+    scope: str = Field(
+        description="Tenant partition key (namespace carrier; internal — never egressed)"
+    )
+    disabled: list[str] = Field(
+        default_factory=list, description="Module names the tenant has disabled (default-enabled)"
+    )
+
+
+# --------------------------------------------------------------------------------------
 # Audit trail — tamper-evident, append-only record of consequential actions (issue #59).
 #
 # An ``AuditEvent`` records WHO (a non-PII principal id), did WHAT (``action``), to WHICH subject,

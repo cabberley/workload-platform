@@ -13,14 +13,15 @@ Design properties (all guardrail-driven):
     cannot be constructed, so nothing sensitive is ever persisted.
   * **Fail-CLOSED for security-material actions (issue #99, ADR 0014).** For the consequential
     state-mutating actions in :data:`FAIL_CLOSED_ACTIONS` (``run.executed`` / ``finding.emitted`` —
-    which also carry the estate/graph/snapshot replacements), a durable-append failure PROPAGATES
-    as :class:`AuditPersistenceError` so the audited mutation FAILS (the API returns 5xx) rather
-    than silently succeeding with no tamper-evident record — the ACCEPTED, compliance-first policy.
-    A **narrow, documented allowance** keeps genuinely non-material events (the ``pack.verify``
-    FAILURE breadcrumb, module toggles) best-effort/fail-OPEN: a lost breadcrumb there does not
-    correspond to an unrecorded successful mutation (the pack is already rejected fail-closed
-    regardless, and it is emitted mid-pack-load where raising would convert a safe rejection into a
-    crash). A rejected event (PII/validation) is still logged class-name-only and dropped.
+  which also carry the estate/graph/snapshot replacements — plus ``module.enabled`` /
+  ``module.disabled``, the per-tenant module posture change from #68/ADR 0018), a durable-append
+  failure PROPAGATES as :class:`AuditPersistenceError` so the audited mutation FAILS (the API
+  returns 5xx) rather than silently succeeding with no tamper-evident record — the ACCEPTED,
+  compliance-first policy. A **narrow, documented allowance** keeps genuinely non-material events
+  best-effort/fail-OPEN: the ``pack.verify`` FAILURE breadcrumb (emitted mid-pack-load where
+  raising would convert a safe rejection into a crash — the pack is already rejected fail-closed
+  regardless) and the ``pack.import`` / ``pack.assign`` events (the documented issue-#99 platform
+  allowance). A rejected event (PII/validation) is still logged class-name-only and dropped.
   * **Failure is observable.** Any durable-append failure (fail-open or fail-closed) increments the
     PII-free :data:`METRIC_AUDIT_EMIT_FAILURES` counter on the injected process metrics registry, so
     an audit-store outage is visible on ``/api/metrics`` and can drive health/alerting.
@@ -63,12 +64,20 @@ AUDIT_ACTION_LABEL = "action"
 # emission is FAIL-CLOSED — a durable-append failure propagates (as :class:`AuditPersistenceError`)
 # so the audited mutation fails/rolls back (the API returns 5xx) instead of silently succeeding
 # unrecorded. The state-mutating ``put_estate``/``put_graph``/``snapshot`` writes and the run/
-# findings writes are ALL recorded with these two actions (see ``api.app.main``), so they are all
-# fail-closed. Everything else (the ``pack.verify`` FAILURE breadcrumb, module toggles) is the
-# NARROW, documented allowance and stays best-effort/fail-open. This is the ACCEPTED, compliance-
-# first decision — see ``docs/adr/0014-fail-closed-audit-emission.md``.
+# findings writes are ALL recorded with the run/finding actions (see ``api.app.main``); the
+# per-tenant module posture change (#68/ADR 0018) is recorded with ``module.enabled`` /
+# ``module.disabled`` — a config/posture change must be durably audited BEFORE it commits, so those
+# are fail-closed too. Everything else (the ``pack.verify`` FAILURE breadcrumb and the
+# ``pack.import`` / ``pack.assign`` events) is the NARROW, documented issue-#99 allowance and stays
+# best-effort/fail-open. This is the ACCEPTED, compliance-first decision — see
+# ``docs/adr/0014-fail-closed-audit-emission.md``.
 FAIL_CLOSED_ACTIONS: frozenset[AuditAction] = frozenset(
-    {AuditAction.run_executed, AuditAction.finding_emitted}
+    {
+        AuditAction.run_executed,
+        AuditAction.finding_emitted,
+        AuditAction.module_enabled,
+        AuditAction.module_disabled,
+    }
 )
 
 

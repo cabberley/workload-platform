@@ -97,13 +97,15 @@ def run_module(
 class ModuleRegistry:
     """Discovers and holds the enabled modules; used by the API core and worker.
 
-    TODO(human): audit ``module.enabled`` / ``module.disabled`` (issue #59). A module's
-    ``enabled`` state is today a STATIC field on its ``ModuleManifest`` (read at
-    :meth:`enabled_modules`); there is no runtime enable/disable *toggle* path to emit from. When a
-    toggle is introduced (a registry mutator or an API endpoint that flips a module on/off), emit
-    an ``AuditAction.module_enabled`` / ``module_disabled`` event through a store-backed
-    ``AuditEmitter`` at that mutation — actor = the operator's principal id, subject = the module
-    name, result = success/failure. Do NOT invent a toggle subsystem here just to emit.
+    The runtime enable/disable toggle now lives PER-TENANT at the API core (issue #68):
+    ``PUT /api/modules/config`` replaces a tenant's disabled-module set and emits an
+    ``AuditAction.module_enabled`` / ``module_disabled`` event per changed module (actor = the
+    operator's principal id, subject = the module name, result = success), audited BEFORE the write
+    ([ADR 0014](../../docs/adr/0014-fail-closed-audit-emission.md)). The manifest ``enabled`` field
+    here remains the platform-wide DEFAULT (read at :meth:`enabled_modules`); a tenant's effective
+    enablement is the default minus that tenant's disabled set, applied at the API surface
+    (``GET /api/modules`` and the ``POST /api/modules/{name}/run`` fail-closed 403). This registry
+    is intentionally tenant-agnostic — it holds the platform catalogue, not per-tenant state.
     """
 
     def __init__(self) -> None:
