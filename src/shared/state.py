@@ -36,9 +36,12 @@ from shared.contracts import (
     AuditEvent,
     DriftReport,
     Finding,
+    ImportedPack,
     ModuleRunResult,
     PackAssignment,
+    PackType,
     ResourceNode,
+    TenantModuleConfig,
     WorkloadGraph,
 )
 from shared.provenance import enforce_finding_provenance, revalidate_finding_provenance
@@ -49,6 +52,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing-only imports, never needed at run
 
 __all__ = [
     "AzureStateStore",
+    "ImportConflictError",
     "LocalStateStore",
     "ReadOnlyState",
     "ReadableState",
@@ -61,6 +65,17 @@ __all__ = [
 _ENV_BACKEND = "WORKLOADS_STATE_BACKEND"
 _ENV_STATE_DIR = "WORKLOADS_STATE_DIR"
 _DEFAULT_DIR_NAME = "workloads-platform-state"
+
+
+class ImportConflictError(RuntimeError):
+    """Raised when an atomic imported-pack record would break PER-TENANT version immutability (#68).
+
+    The atomic guard :meth:`StateStore.try_record_imported_pack` raises this when a record for
+    ``(scope, packId, version)`` already exists with a DIFFERENT ``digest`` — re-importing the same
+    ``id@version`` with different content is rejected (fail closed) rather than overwriting the
+    first-writer's content. An identical-digest re-import is idempotent and returns the stored
+    record instead of raising. The API maps this to HTTP 409.
+    """
 
 
 def _now_iso() -> str:
@@ -156,6 +171,78 @@ class StateStore(ReadableState, Protocol):
 
     def list_pack_assignments(self) -> list[PackAssignment]:
         """Return every pack-version assignment across all workloads (MS + customer visibility)."""
+        ...
+
+    # -- per-tenant imported packs (issue #68): tenant-scoped custom pack import ---------------
+
+    def put_imported_pack(self, pack: ImportedPack) -> None:
+        """Put/replace a tenant's imported-pack ownership record (single writer).
+
+        ``pack.scope`` is the tenant partition key (the namespace carrier). Keyed by
+        ``(scope, packId, version)`` — one record per imported pack version per tenant. The pack
+        BYTES live in the shared content-addressed store (keyed by ``digest``); this record is the
+        per-tenant visibility/ownership index only. Provenance fields are persisted verbatim.
+
+        Prefer :meth:`try_record_imported_pack` on the import path — it makes per-tenant version
+        immutability ATOMIC (race-safe). This unconditional upsert is retained for administrative
+        replace semantics and tests.
+        """
+        ...
+
+    def try_record_imported_pack(self, pack: ImportedPack) -> ImportedPack:
+        """Atomically insert ``pack`` if absent, else verify the stored digest matches (issue #68).
+
+        The single atomic guard for PER-TENANT version immutability — it closes the read-then-write
+        TOCTOU race two concurrent imports of the same ``(scope, packId, version)`` with DIFFERENT
+        content would otherwise slip through (last-writer-wins). In ONE backend write:
+
+        * if no record exists for ``(scope, packId, version)`` it is inserted and returned;
+        * if a record already exists with the SAME ``digest`` the existing record is returned
+          (idempotent re-import — no write);
+        * if a record exists with a DIFFERENT ``digest`` :class:`ImportConflictError` is raised (the
+          first-writer's content is preserved; the API maps this to HTTP 409).
+
+        The insert itself is the atomic guard (sqlite ``INSERT ... ON CONFLICT DO NOTHING`` under a
+        write lock; Azure ``create_entity`` which fails ``ResourceExists`` when present), so the
+        check+insert cannot interleave with a concurrent writer.
+        """
+        ...
+
+    def get_imported_pack(self, scope: str, pack_id: str, version: str) -> ImportedPack | None:
+        """Return the imported-pack record for ``(scope, pack_id, version)`` or ``None``.
+
+        ``scope`` is the composite tenant partition key: a lookup with another tenant's scope never
+        returns this tenant's record (deny-by-default cross-tenant isolation).
+        """
+        ...
+
+    def list_imported_packs(self, scope: str) -> list[ImportedPack]:
+        """Return the imported-pack records for ``scope`` only (storage-layer tenant filter, #68).
+
+        The list is filtered by ``scope`` (the composite tenant partition key) AT THE BACKEND —
+        sqlite ``WHERE scope = ?``, Azure ``PartitionKey eq`` — so a query for one tenant never
+        scans or returns another tenant's rows, and one tenant's import volume can never degrade
+        another's reads. :class:`TenantScopedState` passes its OWN scope and keeps a cheap
+        defense-in-depth filter on top.
+        """
+        ...
+
+    # -- per-tenant module enablement (issue #68): which modules a tenant has disabled ---------
+
+    def get_module_config(self, scope: str) -> TenantModuleConfig | None:
+        """Return the module-enablement config for tenant ``scope``, or ``None`` if unset.
+
+        ``None`` means the tenant has set no config and every module keeps its default-enabled
+        state (single-tenant behaviour is unchanged). ``scope`` is the composite tenant partition
+        key: another tenant's scope never returns this tenant's config.
+        """
+        ...
+
+    def put_module_config(self, config: TenantModuleConfig) -> None:
+        """Put/replace a tenant's module-enablement config (single writer).
+
+        ``config.scope`` is the tenant partition key (namespace carrier). One row per tenant.
+        """
         ...
 
     def append_audit(self, event: AuditEvent) -> None:
@@ -292,6 +379,19 @@ _SCHEMA = (
     " workload TEXT NOT NULL, pack_id TEXT NOT NULL, version TEXT NOT NULL,"
     " assigned_by TEXT NOT NULL, assigned_at TEXT NOT NULL,"
     " PRIMARY KEY (workload, pack_id))",
+    # Per-tenant imported packs (issue #68). ``scope`` is the tenant partition key (namespace
+    # carrier); the pack BYTES live in the shared content-addressed store keyed by ``digest``, so
+    # this table is the per-tenant OWNERSHIP/visibility index only. One row per imported pack
+    # version per tenant.
+    "CREATE TABLE IF NOT EXISTS imported_packs ("
+    " scope TEXT NOT NULL, pack_id TEXT NOT NULL, version TEXT NOT NULL,"
+    " pack_type TEXT NOT NULL, digest TEXT NOT NULL,"
+    " signature TEXT, key_id TEXT, imported_by TEXT NOT NULL, imported_at TEXT NOT NULL,"
+    " PRIMARY KEY (scope, pack_id, version))",
+    # Per-tenant module enablement (issue #68). ``scope`` is the tenant partition key; ``disabled``
+    # is a JSON array of module names the tenant has switched off. Absent row => default-enabled.
+    "CREATE TABLE IF NOT EXISTS module_config ("
+    " scope TEXT PRIMARY KEY, disabled TEXT NOT NULL, updated_at TEXT NOT NULL)",
     # Append-only audit trail (issue #59). ``seq`` gives a total append order; the triggers below
     # make append-only a hard, storage-enforced invariant — a prior event can never be rewritten or
     # deleted, so the log is tamper-evident even against the single writer itself.
@@ -666,6 +766,145 @@ class LocalStateStore:
             ).fetchall()
         return [self._row_to_assignment(row) for row in rows]
 
+    # -- per-tenant imported packs (issue #68): single-writer put + tenant-scoped read models --
+    @staticmethod
+    def _row_to_imported_pack(row: sqlite3.Row) -> ImportedPack:
+        return ImportedPack(
+            scope=row["scope"],
+            packId=row["pack_id"],
+            version=row["version"],
+            packType=row["pack_type"],
+            digest=row["digest"],
+            signature=row["signature"],
+            keyId=row["key_id"],
+            importedBy=row["imported_by"],
+            importedAt=datetime.fromisoformat(row["imported_at"]),
+        )
+
+    def put_imported_pack(self, pack: ImportedPack) -> None:
+        """Replace the ``(scope, packId, version)`` imported-pack record in one transaction."""
+        with self._transaction() as conn:
+            self._insert_imported_pack(conn, pack, on_conflict_replace=True)
+
+    _IMPORTED_PACK_INSERT_REPLACE = (
+        "INSERT INTO imported_packs"
+        " (scope, pack_id, version, pack_type, digest, signature, key_id,"
+        " imported_by, imported_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(scope, pack_id, version) DO UPDATE SET"
+        " pack_type = excluded.pack_type, digest = excluded.digest,"
+        " signature = excluded.signature, key_id = excluded.key_id,"
+        " imported_by = excluded.imported_by, imported_at = excluded.imported_at"
+    )
+    _IMPORTED_PACK_INSERT_NOOP = (
+        "INSERT INTO imported_packs"
+        " (scope, pack_id, version, pack_type, digest, signature, key_id,"
+        " imported_by, imported_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(scope, pack_id, version) DO NOTHING"
+    )
+
+    @classmethod
+    def _insert_imported_pack(
+        cls, conn: sqlite3.Connection, pack: ImportedPack, *, on_conflict_replace: bool
+    ) -> int:
+        """Insert one imported-pack row; return the affected row count. Pure over ``conn``.
+
+        ``on_conflict_replace=True`` upserts (replace semantics); ``False`` uses
+        ``ON CONFLICT DO NOTHING`` so a conflicting row leaves the stored record untouched and the
+        caller can inspect ``rowcount`` (1 = inserted, 0 = a record already existed). Both SQL texts
+        are fixed literals — never built from any value.
+        """
+        sql = (
+            cls._IMPORTED_PACK_INSERT_REPLACE
+            if on_conflict_replace
+            else cls._IMPORTED_PACK_INSERT_NOOP
+        )
+        cur = conn.execute(
+            sql,
+            (
+                pack.scope,
+                pack.packId,
+                pack.version,
+                pack.packType.value,
+                pack.digest,
+                pack.signature,
+                pack.keyId,
+                pack.importedBy,
+                pack.importedAt.isoformat(),
+            ),
+        )
+        return cur.rowcount
+
+    def try_record_imported_pack(self, pack: ImportedPack) -> ImportedPack:
+        """Atomic insert-if-absent-else-verify-digest under a single write lock (issue #68).
+
+        ``BEGIN IMMEDIATE`` takes the write lock up front, and ``INSERT ... ON CONFLICT DO NOTHING``
+        is the atomic guard: exactly one concurrent importer inserts the row (``rowcount == 1``);
+        any other sees the conflict (``rowcount == 0``) and reads the now-committed row in the SAME
+        transaction — identical digest ⇒ idempotent (return existing), different digest ⇒
+        :class:`ImportConflictError`. No read-then-write window exists, so last-writer-wins is
+        impossible.
+        """
+        with self._transaction(immediate=True) as conn:
+            if self._insert_imported_pack(conn, pack, on_conflict_replace=False) == 1:
+                return pack
+            row = conn.execute(
+                "SELECT scope, pack_id, version, pack_type, digest, signature, key_id,"
+                " imported_by, imported_at FROM imported_packs"
+                " WHERE scope = ? AND pack_id = ? AND version = ?",
+                (pack.scope, pack.packId, pack.version),
+            ).fetchone()
+            existing = self._row_to_imported_pack(row)
+        if existing.digest != pack.digest:
+            raise ImportConflictError(
+                "imported pack version is immutable: a different content digest is already recorded"
+            )
+        return existing
+
+    def get_imported_pack(self, scope: str, pack_id: str, version: str) -> ImportedPack | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT scope, pack_id, version, pack_type, digest, signature, key_id,"
+                " imported_by, imported_at FROM imported_packs"
+                " WHERE scope = ? AND pack_id = ? AND version = ?",
+                (scope, pack_id, version),
+            ).fetchone()
+        return self._row_to_imported_pack(row) if row is not None else None
+
+    def list_imported_packs(self, scope: str) -> list[ImportedPack]:
+        """Return only ``scope``'s imported packs — filtered at the storage layer (issue #68)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT scope, pack_id, version, pack_type, digest, signature, key_id,"
+                " imported_by, imported_at FROM imported_packs"
+                " WHERE scope = ? ORDER BY pack_id, version",
+                (scope,),
+            ).fetchall()
+        return [self._row_to_imported_pack(row) for row in rows]
+
+    # -- per-tenant module enablement (issue #68): single-writer put + read model --------------
+    def get_module_config(self, scope: str) -> TenantModuleConfig | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT scope, disabled FROM module_config WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+        if row is None:
+            return None
+        disabled = json.loads(row["disabled"])
+        return TenantModuleConfig(scope=row["scope"], disabled=list(disabled))
+
+    def put_module_config(self, config: TenantModuleConfig) -> None:
+        """Replace the tenant's module-enablement config in one transaction (single writer)."""
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO module_config (scope, disabled, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(scope) DO UPDATE SET"
+                " disabled = excluded.disabled, updated_at = excluded.updated_at",
+                (config.scope, json.dumps(list(config.disabled)), _now_iso()),
+            )
+
     # -- audit trail (append-only, hash-chained) -----------------------------------------
     def append_audit(self, event: AuditEvent) -> None:
         """Append one hash-chained audit event in a single ``BEGIN IMMEDIATE`` transaction.
@@ -720,6 +959,10 @@ class LocalStateStore:
 _AZ_SNAPSHOTS_TABLE = "snapshots"
 _AZ_INDEX_TABLE = "workloads"
 _AZ_ASSIGNMENTS_TABLE = "packassignments"
+_AZ_IMPORTS_TABLE = "importedpacks"
+_AZ_MODULE_CONFIG_TABLE = "moduleconfig"
+# Reserved RowKey (in each tenant's module-config partition) for the single config entity.
+_AZ_MODULE_CONFIG_ROW = "_config"
 _AZ_INDEX_PARTITION = "_index"
 _AZ_AUDIT_TABLE = "audit"
 _AZ_AUDIT_PARTITION = "_audit"
@@ -777,7 +1020,14 @@ class AzureStateStore:
         container_name = os.environ.get("WORKLOADS_STATE_CONTAINER", "state")
 
         table_service = TableServiceClient(endpoint=table_endpoint, credential=credential)
-        for table in (_AZ_SNAPSHOTS_TABLE, _AZ_INDEX_TABLE, _AZ_ASSIGNMENTS_TABLE, _AZ_AUDIT_TABLE):
+        for table in (
+            _AZ_SNAPSHOTS_TABLE,
+            _AZ_INDEX_TABLE,
+            _AZ_ASSIGNMENTS_TABLE,
+            _AZ_IMPORTS_TABLE,
+            _AZ_MODULE_CONFIG_TABLE,
+            _AZ_AUDIT_TABLE,
+        ):
             table_service.create_table_if_not_exists(table)
 
         blob_service = BlobServiceClient(account_url=blob_endpoint, credential=credential)
@@ -1143,6 +1393,121 @@ class AzureStateStore:
         entities = self._table(_AZ_ASSIGNMENTS_TABLE).list_entities()
         assignments = [self._entity_to_assignment(dict(entity)) for entity in entities]
         return sorted(assignments, key=lambda a: (a.workload, a.packId))
+
+    # -- per-tenant imported packs (issue #68): single-writer put + tenant-scoped read models --
+    @staticmethod
+    def _entity_to_imported_pack(entity: dict[str, Any]) -> ImportedPack:
+        signature = entity.get("signature")
+        key_id = entity.get("key_id")
+        return ImportedPack(
+            scope=str(entity["scope"]),
+            packId=str(entity["pack_id"]),
+            version=str(entity["version"]),
+            packType=PackType(str(entity["pack_type"])),
+            digest=str(entity["digest"]),
+            signature=str(signature) if signature is not None else None,
+            keyId=str(key_id) if key_id is not None else None,
+            importedBy=str(entity["imported_by"]),
+            importedAt=datetime.fromisoformat(str(entity["imported_at"])),
+        )
+
+    def put_imported_pack(self, pack: ImportedPack) -> None:
+        """Upsert the imported-pack record as ONE entity keyed by ``(scope, packId+version)``.
+
+        The partition is the hex-encoded tenant scope, so a query by another tenant's scope can
+        never return this record (deny-by-default cross-tenant isolation). Keys are hex-encoded.
+
+        Prefer :meth:`try_record_imported_pack` on the import path — it makes per-tenant version
+        immutability ATOMIC. This unconditional upsert is retained for administrative replace
+        semantics and tests.
+        """
+        self._table(_AZ_IMPORTS_TABLE).upsert_entity(
+            self._imported_pack_entity(pack), mode="replace"
+        )
+
+    @staticmethod
+    def _imported_pack_entity(pack: ImportedPack) -> dict[str, Any]:
+        return {
+            "PartitionKey": encode_storage_key(pack.scope),
+            "RowKey": encode_storage_key(f"{pack.packId}\x00{pack.version}"),
+            "scope": pack.scope,
+            "pack_id": pack.packId,
+            "version": pack.version,
+            "pack_type": pack.packType.value,
+            "digest": pack.digest,
+            "signature": pack.signature,
+            "key_id": pack.keyId,
+            "imported_by": pack.importedBy,
+            "imported_at": pack.importedAt.isoformat(),
+        }
+
+    def try_record_imported_pack(self, pack: ImportedPack) -> ImportedPack:
+        """Atomic insert-if-absent-else-verify-digest via ``create_entity`` (issue #68).
+
+        ``create_entity`` is the atomic guard: it inserts the entity iff its key is free and fails
+        ``ResourceExistsError`` when the ``(scope, packId, version)`` entity already exists — so two
+        concurrent importers can never both create it (no last-writer-wins). On a conflict we read
+        the stored entity and compare digests: identical ⇒ idempotent (return existing), different
+        ⇒ :class:`ImportConflictError` (the first-writer's content is preserved; API maps to 409).
+        """
+        from azure.core.exceptions import ResourceExistsError
+
+        try:
+            self._table(_AZ_IMPORTS_TABLE).create_entity(self._imported_pack_entity(pack))
+        except ResourceExistsError:
+            existing = self.get_imported_pack(pack.scope, pack.packId, pack.version)
+            if existing is None:  # pragma: no cover - present-then-absent race is not expected
+                raise
+            if existing.digest != pack.digest:
+                raise ImportConflictError(
+                    "imported pack version is immutable: a different content digest is already "
+                    "recorded"
+                ) from None
+            return existing
+        return pack
+
+    def get_imported_pack(self, scope: str, pack_id: str, version: str) -> ImportedPack | None:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            entity = self._table(_AZ_IMPORTS_TABLE).get_entity(
+                encode_storage_key(scope), encode_storage_key(f"{pack_id}\x00{version}")
+            )
+        except ResourceNotFoundError:
+            return None
+        return self._entity_to_imported_pack(dict(entity))
+
+    def list_imported_packs(self, scope: str) -> list[ImportedPack]:
+        """Return only ``scope``'s imports — filtered by ``PartitionKey`` at the backend (#68)."""
+        entities = self._table(_AZ_IMPORTS_TABLE).query_entities(
+            "PartitionKey eq @pk", parameters={"pk": encode_storage_key(scope)}
+        )
+        packs = [self._entity_to_imported_pack(dict(entity)) for entity in entities]
+        return sorted(packs, key=lambda p: (p.packId, p.version))
+
+    # -- per-tenant module enablement (issue #68): single-writer put + read model --------------
+    def get_module_config(self, scope: str) -> TenantModuleConfig | None:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            entity = self._table(_AZ_MODULE_CONFIG_TABLE).get_entity(
+                encode_storage_key(scope), _AZ_MODULE_CONFIG_ROW
+            )
+        except ResourceNotFoundError:
+            return None
+        disabled = json.loads(str(dict(entity).get("disabled", "[]")))
+        return TenantModuleConfig(scope=scope, disabled=list(disabled))
+
+    def put_module_config(self, config: TenantModuleConfig) -> None:
+        """Upsert the tenant's module-enablement config as ONE entity (single writer)."""
+        entity = {
+            "PartitionKey": encode_storage_key(config.scope),
+            "RowKey": _AZ_MODULE_CONFIG_ROW,
+            "scope": config.scope,
+            "disabled": json.dumps(list(config.disabled)),
+            "updated_at": _now_iso(),
+        }
+        self._table(_AZ_MODULE_CONFIG_TABLE).upsert_entity(entity, mode="replace")
 
     # -- audit trail (append-only, hash-chained) -----------------------------------------
     def _audit_head_with_etag(self) -> tuple[dict[str, Any] | None, str | None]:

@@ -39,6 +39,7 @@ from packs_engine.registry import (
     InvalidVersionError,
     PackRef,
     PackRegistry,
+    PackRegistryReader,
     SemVer,
 )
 from shared.connectors import SecretProvider
@@ -229,7 +230,7 @@ class WorkloadPinnedPacks:
     """
 
     def __init__(
-        self, engine: Any, assigned_versions: Mapping[str, str], registry: PackRegistry
+        self, engine: Any, assigned_versions: Mapping[str, str], registry: PackRegistryReader
     ) -> None:
         self._engine = engine
         self._assigned = dict(assigned_versions)
@@ -306,7 +307,7 @@ class WorkloadPinnedPacks:
 
 
 def resolve_packs_for_workload(
-    packs: object | None, assigned_versions: Mapping[str, str], registry: PackRegistry
+    packs: object | None, assigned_versions: Mapping[str, str], registry: PackRegistryReader
 ) -> object | None:
     """Return a packs view that resolves each pack id to a SINGLE version for a workload (#37).
 

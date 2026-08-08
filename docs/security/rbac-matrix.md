@@ -152,8 +152,8 @@ bearer tokens validated against tenant **JWKS public keys** — no secret anywhe
 
 | App role (Entra app role) | Granted actions | Enforced on |
 |---------------------------|-----------------|-------------|
-| **`Workloads.Reader`** | read the read-models | `GET` data endpoints (metrics, modules, packs, workloads, estate, graph, impact, findings, drift) when auth is enabled |
-| **`Workloads.Operator`** | run modules; submit results/estate/graph/findings/snapshot | **all six state-mutating `POST` endpoints** — `/api/modules/{name}/run`, `/api/workloads/{workload}/results\|estate\|graph\|findings\|snapshot` |
+| **`Workloads.Reader`** | read the read-models | `GET` data endpoints (metrics, modules, module config, packs, workloads, estate, graph, impact, findings, drift) when auth is enabled |
+| **`Workloads.Operator`** | run modules; set per-tenant module config; import/assign packs; submit results/estate/graph/findings/snapshot | the state-mutating endpoints — `POST /api/modules/{name}/run`, `PUT /api/modules/config` (per-tenant module enable/disable, issue #68), `POST /api/packs/import` + `PUT /api/workloads/{workload}/pack-assignments` (per-tenant, issue #68), `POST /api/workloads/{workload}/results\|estate\|graph\|findings\|snapshot` |
 | **`Workloads.Admin`** | Operator ⊇ Reader, plus future admin actions | (superset — no admin-only endpoint exists yet) |
 
 - **Deny-by-default & fail-closed *by default*.** Auth is governed by an explicit

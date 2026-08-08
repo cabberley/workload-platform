@@ -27,14 +27,17 @@ from api.app.tenancy import (
     resolve_tenant,
 )
 from api.app.tenant_state import TenantScopedState
+from packs_engine.canonical import canonical_bytes, canonical_digest
+from packs_engine.content_store import PackContentStore
 from packs_engine.engine import PacksEngine
 from packs_engine.registry import (
     DEFAULT_INDEX_PATH,
-    ImmutableVersionError,
-    InvalidVersionError,
+    InMemoryPackRegistry,
     PackRef,
     PackRegistry,
-    RegistryError,
+    RegistryEntry,
+    imported_pack_to_entry,
+    serialize_pack_signature,
 )
 from shared.audit import AuditEmitter, resolve_actor
 from shared.auth import (
@@ -51,6 +54,7 @@ from shared.contracts import (
     DriftReport,
     Finding,
     HealthState,
+    ImportedPack,
     MetricsSnapshotView,
     ModuleManifest,
     ModuleRunResult,
@@ -79,6 +83,7 @@ from shared.observability import (
 from shared.provenance import ProvenanceError, enforce_finding_provenance
 from shared.signing import TrustBundleVerifier
 from shared.state import (
+    ImportConflictError,
     ReadOnlyState,
     StateStore,
     build_state_store,
@@ -370,17 +375,19 @@ def get_tenant_context(
 TenantContextDep = Annotated[TenantContext, Depends(get_tenant_context)]
 
 
-def get_scoped_store(store: StoreDep, tenant: TenantContextDep) -> StateStore:
+def get_scoped_store(store: StoreDep, tenant: TenantContextDep) -> TenantScopedState:
     """Return the single-writer store CONFINED to the request's resolved tenant (issue #65).
 
     Wraps the process-wide store in a :class:`~api.app.tenant_state.TenantScopedState` that
     namespaces every write and filters every read by the tenant partition key, so an endpoint using
     this dependency can only ever touch its own tenant's state and read models — on either backend.
+    The concrete :class:`TenantScopedState` is exposed (not the bare ``StateStore`` Protocol) so
+    endpoints can reach its per-tenant module-config and imported-pack facades (issue #68).
     """
     return TenantScopedState(store, tenant)
 
 
-ScopedStoreDep = Annotated[StateStore, Depends(get_scoped_store)]
+ScopedStoreDep = Annotated[TenantScopedState, Depends(get_scoped_store)]
 
 
 def _request_actor(request: Request) -> str:
@@ -694,6 +701,32 @@ PackRegistryDep = Annotated[PackRegistry, Depends(get_pack_registry)]
 PackImportVerifierDep = Annotated[TrustBundleVerifier, Depends(get_pack_import_verifier)]
 
 
+# The digest-addressed pack content store (issue #44) holds the VERIFIED bytes of imported packs.
+# Per-tenant import (issue #68) records ownership/visibility in the tenant-scoped state store while
+# the BYTES live here, content-addressed by digest — identical bytes are deduped and a content hash
+# reveals nothing about a tenant, so the store is safely shared across tenants. Built once per
+# process (overridable via ``WORKLOADS_PACK_STORE_*``); tests override with a tmp-path store.
+_pack_content_store: PackContentStore | None = None
+
+
+def get_pack_content_store() -> PackContentStore:
+    """Return the process-wide, digest-addressed pack content store (issue #44/#68). Cached.
+
+    Built via :func:`cli.wiring.build_pack_content_store` (lazily imported to keep API↔CLI wiring
+    acyclic, matching ``get_packs``). The BYTES are shared and content-addressed; per-tenant
+    VISIBILITY is enforced entirely by the tenant-scoped ownership records, never by the store.
+    """
+    global _pack_content_store
+    if _pack_content_store is None:
+        from packs_engine.content_store import build_pack_content_store
+
+        _pack_content_store = build_pack_content_store()
+    return _pack_content_store
+
+
+PackContentStoreDep = Annotated[PackContentStore, Depends(get_pack_content_store)]
+
+
 class ModuleHealth(BaseModel):
     """Bounded per-module liveness entry in the health payload (module id + fixed status)."""
 
@@ -863,9 +896,132 @@ def get_metrics_snapshot(metrics: MetricsDep, _principal: ReaderDep) -> MetricsS
 
 
 @app.get("/api/modules")
-def list_modules(_principal: ReaderDep) -> list[ModuleManifest]:
-    """Enumerate modules and their scale profiles (drives infra + the web console)."""
-    return registry.manifests()
+def list_modules(store: ScopedStoreDep, _principal: ReaderDep) -> list[ModuleManifest]:
+    """Enumerate modules with the caller tenant's EFFECTIVE enabled state (issue #68).
+
+    The module CATALOGUE (names + scale profiles) is platform-wide, but whether each module is
+    enabled is PER-TENANT: a module the caller's tenant has disabled is reported ``enabled=False``
+    even though it ships enabled by default. Deny-by-default is deliberately NOT applied to modules
+    — a tenant that has set no config sees today's default-enabled catalogue unchanged (so existing
+    single-tenant deployments are identical), and only an explicit disable flips a module off. The
+    per-tenant disabled set is read through the TENANT-SCOPED store, so one tenant's module config
+    can never influence another's (issue #65).
+    """
+    return _module_catalogue.project(store)
+
+
+class _ModuleCatalogueEgress:
+    """Egress projection for the tenant-effective module catalogue read (issue #68).
+
+    Exposed as a method (a reviewed projection the response boundary trusts, mirroring
+    :class:`_PackCatalogueEgress`) so the route hands back the value FastAPI coerces through its
+    declared ``list[ModuleManifest]`` response model. Each manifest carries only static platform
+    identifiers (module name + scale profile) — never PII and never the internal tenant scope. It
+    applies the caller tenant's disabled set (read through the tenant-scoped store) onto the
+    platform-wide catalogue, so one tenant's module config can never influence another's.
+    """
+
+    @staticmethod
+    def project(store: TenantScopedState) -> list[ModuleManifest]:
+        disabled = store.get_disabled_modules()
+        return [
+            manifest.model_copy(
+                update={"enabled": manifest.enabled and manifest.name not in disabled}
+            )
+            for manifest in registry.manifests()
+        ]
+
+
+_module_catalogue = _ModuleCatalogueEgress()
+
+
+class ModuleConfigView(BaseModel):
+    """Read model for a tenant's module-enablement config (issue #68).
+
+    Carries only the module NAMES the caller's tenant has disabled — static platform identifiers,
+    never PII and never the internal tenant scope. An empty list means the tenant has set no config
+    and every module keeps its default-enabled state.
+    """
+
+    disabled: list[str]
+
+
+class ModuleConfigRequest(BaseModel):
+    """Set the caller tenant's disabled-module set (issue #68).
+
+    ``disabled`` is the FULL desired set of module names to switch off (replace semantics, not a
+    delta). Every name MUST be a known module, else the request is rejected 422 (fail closed) so a
+    typo can never silently disable nothing or leave a phantom entry.
+    """
+
+    disabled: list[str]
+
+
+@app.get("/api/modules/config")
+def get_module_config(store: ScopedStoreDep, _principal: ReaderDep) -> ModuleConfigView:
+    """Return the caller tenant's disabled-module set (empty if unset — default-enabled).
+
+    Tenant-scoped (issue #65/#68): only the resolved tenant's own config is returned; another
+    tenant's config is never visible. Requires the ``reader`` role (deny-by-default, issue #64).
+    """
+    return ModuleConfigView(disabled=sorted(store.get_disabled_modules()))
+
+
+@app.put("/api/modules/config")
+def put_module_config(
+    req: ModuleConfigRequest,
+    request: Request,
+    store: ScopedStoreDep,
+    audit: AuditDep,
+    _principal: OperatorDep,
+) -> ModuleConfigView:
+    """Replace the caller tenant's disabled-module set (single writer, tenant-scoped — issue #68).
+
+    Fail-closed guards, ALL before any write:
+
+    * every requested name MUST be a KNOWN module, else 422 — a typo can never disable nothing or
+      persist a phantom module id;
+    * the enable/disable transition is AUDITED before the write (``module.enabled`` /
+      ``module.disabled`` per changed module, ADR 0014): a hard audit-store outage BLOCKS the
+      config change rather than leaving an unaudited enablement mutation.
+
+    Requires the ``operator`` role (deny-by-default, issue #64). The config is persisted through the
+    TENANT-SCOPED store, so it lands in the resolved tenant's partition and can never affect another
+    tenant (issue #65).
+    """
+    known = set(registry.names())
+    requested = sorted(set(req.disabled))
+    unknown = [name for name in requested if name not in known]
+    if unknown:
+        # Bounded, PII-free body (issue #96): module names are static platform ids, but keep the
+        # rejection reason constant — never echo the caller-supplied list back.
+        raise HTTPException(
+            status_code=422, detail="config rejected: unknown module (fail closed)"
+        )
+    actor = _request_actor(request)
+    previous = store.get_disabled_modules()
+    now_disabled = set(requested)
+    # Audit-BEFORE-write (ADR 0014): record each module's enable/disable transition FIRST so a
+    # committed enablement change can never be unaudited. Module names are audit-safe (validated
+    # known above), so the emit cannot be dropped for a bad subject.
+    for name in sorted(now_disabled - previous):
+        _emit_or_fail_closed(
+            audit,
+            actor=actor,
+            action=AuditAction.module_disabled,
+            subject=name,
+            result=AuditResult.success,
+        )
+    for name in sorted(previous - now_disabled):
+        _emit_or_fail_closed(
+            audit,
+            actor=actor,
+            action=AuditAction.module_enabled,
+            subject=name,
+            result=AuditResult.success,
+        )
+    store.set_disabled_modules(requested)
+    return ModuleConfigView(disabled=requested)
 
 
 class PackRegistryEntryView(BaseModel):
@@ -889,45 +1045,61 @@ class PackRegistryEntryView(BaseModel):
 
 
 @app.get("/api/packs")
-def list_packs(packs: PacksDep, _principal: ReaderDep) -> list[PackRegistryEntryView]:
-    """Read-only catalogue of published pack versions in the wired registry (issue #57).
+def list_packs(
+    packs: PacksDep, store: ScopedStoreDep, _principal: ReaderDep
+) -> list[PackRegistryEntryView]:
+    """Read-only catalogue of the packs VISIBLE to the caller's tenant (issue #57/#68).
 
-    Thin, keyless, PII-free and fail-closed: when no packs engine / registry is wired (no content
-    root, or the import subsystem is absent) this returns ``[]`` — an empty catalogue is never an
-    error and never a fabricated entry. Mirrors the ``GET /api/modules`` pattern (project an
-    in-process read surface for the console) and never verifies/activates anything; it only reads
-    what the registry recorded at admission. ``signed`` reflects whether the entry carries a
-    well-formed detached signature (a version identity/provenance signal for the console — the
-    runtime resolver still independently re-verifies trust before any pack executes).
+    Returns the union of (a) the BUILT-IN/shared registry entries (shipped platform packs) and
+    (b) THIS tenant's own imported packs — never another tenant's imports (issue #68). Imports are
+    per-tenant: an imported pack is recorded in the tenant-scoped state store and surfaces only for
+    the tenant that imported it, so tenant B never sees tenant A's imports. Thin, keyless, PII-free
+    and fail-closed: with no packs engine wired the built-in catalogue is empty; with no imports the
+    tenant simply sees the shared set. ``signed`` reflects whether the entry carries a well-formed
+    detached signature (the runtime resolver still independently re-verifies trust before any pack
+    executes).
     """
-    return _pack_catalogue.project(packs)
+    return _pack_catalogue.project(packs, store)
 
 
 class _PackCatalogueEgress:
-    """Egress projection for the pack-registry catalogue read (issue #57).
+    """Egress projection for the tenant-visible pack catalogue read (issue #57/#68).
 
     Exposed as a method (a reviewed projection the response boundary trusts, mirroring
     :class:`_EstateEgress`) so the route hands back the value FastAPI coerces through its declared
     ``list[PackRegistryEntryView]`` response model. The view carries only the pack's own identity
     (id/version/type), its content-address ``digest`` (the version identity — not a secret), a
     publish timestamp, and a boolean ``signed``; the raw key id / signature bytes are never
-    egressed. Fail-closed: no wired ``PacksEngine`` (hence no registry) ⇒ an empty catalogue.
+    egressed. It projects the BUILT-IN/shared registry entries plus the caller tenant's OWN imported
+    packs (read through the tenant-scoped store), so no cross-tenant import can ever egress.
+    Fail-closed: no wired ``PacksEngine`` ⇒ only the tenant's imports (empty shared catalogue).
     """
 
     @staticmethod
-    def project(packs: object) -> list[PackRegistryEntryView]:
-        if not isinstance(packs, PacksEngine):
-            return []
+    def _view(entry: RegistryEntry) -> PackRegistryEntryView:
+        return PackRegistryEntryView(
+            id=entry.ref.id,
+            version=entry.ref.version,
+            type=entry.type.value,
+            digest=entry.digest,
+            createdAt=entry.createdAt.isoformat(),
+            signed=entry.detached_signature() is not None,
+        )
+
+    @staticmethod
+    def project(packs: object, store: TenantScopedState) -> list[PackRegistryEntryView]:
+        # Built-in/shared registry entries (shipped platform packs) — the same for every tenant.
+        builtin = packs.registry_entries() if isinstance(packs, PacksEngine) else []
+        # THIS tenant's own imported packs (never another tenant's — the store filters by tenant).
+        imported = [imported_pack_to_entry(p) for p in store.list_imported_packs()]
+        # De-dup on the (id, version) ref, shared first, so a shared pack a tenant also imported is
+        # listed once; order by ref for a stable catalogue.
+        by_ref: dict[PackRef, RegistryEntry] = {}
+        for entry in [*builtin, *imported]:
+            by_ref.setdefault(entry.ref, entry)
         return [
-            PackRegistryEntryView(
-                id=entry.ref.id,
-                version=entry.ref.version,
-                type=entry.type.value,
-                digest=entry.digest,
-                createdAt=entry.createdAt.isoformat(),
-                signed=entry.detached_signature() is not None,
-            )
-            for entry in packs.registry_entries()
+            _PackCatalogueEgress._view(entry)
+            for entry in sorted(by_ref.values(), key=lambda e: e.ref)
         ]
 
 
@@ -990,6 +1162,7 @@ def run_module_endpoint(
     packs: PacksDep,
     clients: ClientsDep,
     packs_registry: PackRegistryDep,
+    content_store: PackContentStoreDep,
     metrics: MetricsDep,
     tracer: TracerDep,
     audit: AuditDep,
@@ -1021,6 +1194,14 @@ def run_module_endpoint(
         # Bounded, PII-free body (issue #96): the caller-controlled ``name`` path param must never
         # echo back through the error body (which bypasses the response_model). Constant literal.
         raise HTTPException(status_code=404, detail="unknown module") from exc
+    # Per-tenant module enablement (issue #68): a module the caller's tenant has DISABLED is
+    # unusable — fail closed with a fixed 403 reason code BEFORE any resolve/run/audit/write, so a
+    # disabled module can never execute or mutate state for that tenant. Deny-by-default is not
+    # applied (an unset config keeps default-enabled), but an explicit disable is enforced here at
+    # the execute surface (the read surface is ``GET /api/modules``). The check reads the
+    # TENANT-SCOPED store, so one tenant's config never affects another's runs (issue #65).
+    if name in store.get_disabled_modules():
+        raise HTTPException(status_code=403, detail="module disabled for tenant (fail closed)")
     # Validate the derived run.executed subject (the module id) before any write, so a run whose
     # audit event would be dropped is never persisted (defense in depth; registered names are safe).
     _require_auditable_run_subject(name)
@@ -1036,11 +1217,31 @@ def run_module_endpoint(
     # tenant's own pack assignments — never another tenant's.
     from cli.wiring import resolve_packs_for_workload
 
+    # Per-tenant imported packs (issue #68): the caller tenant's own imported packs (recorded in the
+    # tenant-scoped store, materialized from the shared content-addressed store) are merged with the
+    # BUILT-IN/shared registry entries the engine already resolves, and that COMBINED view is handed
+    # to the engine — so a run resolves the shared catalogue plus THIS tenant's imports, never
+    # another tenant's. Visibility is enforced entirely by these per-tenant ownership records, and
+    # each imported pack is still re-verified against the pinned trust bundle before use (fail
+    # closed). The same combined view pins assignment digest-verification below.
+    tenant_import_entries = [imported_pack_to_entry(p) for p in store.list_imported_packs()]
+    engine_scoped: object | None = packs
+    if isinstance(packs, PacksEngine):
+        combined = InMemoryPackRegistry.from_entries(
+            [*packs.registry_entries(), *tenant_import_entries]
+        )
+        engine_scoped = packs.with_import_registry(combined)
+        pin_registry = combined
+    else:
+        pin_registry = InMemoryPackRegistry.from_entries(
+            [*packs_registry.list(), *tenant_import_entries]
+        )
+
     workload = req.scope.get("workload")
     assigned_versions = (
         {a.packId: a.version for a in store.get_pack_assignments(workload)} if workload else {}
     )
-    resolved_packs = resolve_packs_for_workload(packs, assigned_versions, packs_registry)
+    resolved_packs = resolve_packs_for_workload(engine_scoped, assigned_versions, pin_registry)
     started = perf_counter()
     ok = False
     run_audited = False
@@ -1373,12 +1574,15 @@ class PackImportRequest(BaseModel):
 def import_pack(
     req: PackImportRequest,
     request: Request,
+    store: ScopedStoreDep,
+    packs: PacksDep,
     packs_registry: PackRegistryDep,
+    content_store: PackContentStoreDep,
     import_verifier: PackImportVerifierDep,
     audit: AuditDep,
     _principal: OperatorDep,
 ) -> PackRegistryEntryView:
-    """Verify a signed pack against the SHARED trust root (fail-closed), then publish the version.
+    """Verify a signed pack against the SHARED trust root (fail-closed), then import it PER-TENANT.
 
     Admission verifies the SAME detached signature, from the SAME source, against the SAME trust
     root as the runtime resolver (issue #89, R2) — mirroring
@@ -1391,29 +1595,36 @@ def import_pack(
       the PUBLIC key by ``key_id`` and checks the detached signature over the pack's canonical
       bytes.
 
-    Fail-closed at every step — a pack is registered ONLY if its signature verifies against the
+    Per-tenant import (issue #68): an imported pack is visible ONLY to the importing tenant. The
+    verified pack BYTES are materialized into the SHARED, digest-addressed content store (issue #44
+    — content-addressed, so identical bytes dedupe and a content hash reveals nothing about a
+    tenant), and its OWNERSHIP/visibility is recorded in the TENANT-SCOPED state store. It is NOT
+    published to the process-wide registry, so tenant B never sees or can use tenant A's import.
+    Immutability is enforced PER TENANT and ATOMICALLY: the tenant-scoped store's
+    insert-if-absent-else-verify-digest guard means re-importing the same ``id@version`` with
+    different content is a 409 (the first content is preserved even under a concurrent race), while
+    re-importing identical content is idempotent (200).
+
+    Disjoint id-space (issue #68): tenant imports occupy an id-space DISJOINT from shipped/shared
+    packs. If the imported ``id`` collides with ANY built-in/shared pack id (the same reserved set
+    the catalogue surfaces and the runtime reserves via ``shipped_ids``), the import is rejected
+    409 — a shipped pack owns its id at every version and would silently shadow the import at
+    runtime, so a colliding import could otherwise be admitted+assigned yet resolve to NOTHING.
+
+    Fail-closed at every step — a pack is imported ONLY if its signature verifies against the
     pinned bundle:
 
     * malformed/missing manifest              → 400 (cannot even locate a signature);
     * no ``manifest.pack_signature`` (unsigned)→ 400 (never trusted);
     * unpinned ``key_id`` / invalid / tampered → 400 (``TrustBundleVerifier.verify_pack`` is False);
     * non-audit-safe id:version               → 400 (the admission cannot be audited, issue #59);
-    * malformed manifest / non-semver version → 400 (registry ``publish`` rejects it);
-    * immutable-version conflict              → 409 (same ``id@version``, different content).
+    * malformed manifest / non-semver version → 400;
+    * id reserved by a platform/shared pack    → 409 (disjoint id-space, fail closed);
+    * per-tenant immutable-version conflict    → 409 (same ``id@version``, different content).
 
-    Only after verification does it call :meth:`PackRegistry.publish` (the immutability gate) and
-    return the resulting :class:`~packs_engine.registry.RegistryEntry`. The imported registry is
-    instance-wide platform content (signed packs flow IN), not per-tenant data, so this endpoint is
-    NOT tenant-scoped; requires the ``operator`` role (deny-by-default, issue #64) and records the
-    admission on the append-only audit log (``pack.verify`` + ``pack.import``, issue #59) with a
-    PII-free subject (the pack ``id:version`` — a platform identifier, never customer content).
-
-    TODO(human): materialize the verified imported pack's BYTES into a digest-addressed content
-    store (ADR pending — local disk vs Azure Blob/Files/Table, with statefulness/billing/MSP-
-    tenancy implications) so import->assign->run resolves a BRAND-NEW pack. Today the registry is a
-    pure metadata index (id@version -> verified digest); assigned resolution runs a pack only when
-    a content-root pack's canonical digest matches that verified digest, so a just-imported pack
-    whose bytes are not yet in the content root safely runs nothing under its assignment.
+    Requires the ``operator`` role (deny-by-default, issue #64) and records the admission on the
+    append-only audit log (``pack.verify`` + ``pack.import``, issue #59) with a PII-free subject
+    (the pack ``id:version`` — a platform identifier, never customer content).
     """
     actor = _request_actor(request)
     # Read the detached signature from the SAME place the runtime does — the pack-embedded
@@ -1455,8 +1666,8 @@ def import_pack(
         )
     # Audit-safe subject BEFORE any mutation (issue #59, FIX 5): the pack id:version derived subject
     # must be recordable, else a later emit could be silently dropped and leave a committed-but-
-    # unaudited publish. Use the validated manifest's id/version and reject up front if it is not
-    # audit-safe (e.g. a crafted id bearing ``@``/whitespace) — the registry is never mutated.
+    # unaudited import. Use the validated manifest's id/version and reject up front if it is not
+    # audit-safe (e.g. a crafted id bearing ``@``/whitespace) — nothing is stored.
     pack_id = str(manifest.id)
     pack_version = str(manifest.version)
     subject = f"{pack_id}:{pack_version}"
@@ -1465,8 +1676,34 @@ def import_pack(
             status_code=400,
             detail="import rejected: pack identifiers are not auditable (fail closed)",
         )
+    # Disjoint id-space (issue #68, FIX 3): a tenant import may never take an id owned by a
+    # built-in/shared platform pack. The runtime reserves shipped ids (``shipped_ids``) and SKIPS
+    # any imported entry sharing one, so a colliding import would be admitted+assignable yet resolve
+    # to NOTHING at runtime — a successful-but-unusable assignment. Reject the collision here (409,
+    # fixed reason). The reserved set is engine-INDEPENDENT: it always includes the SHARED on-disk
+    # registry ids (the same set the catalogue surfaces and ``put_pack_assignment`` consults), and —
+    # when a ``PacksEngine`` is wired — is unioned with the content-root shipped-manifest ids. This
+    # keeps the id-space disjoint even when no engine is wired.
+    reserved_ids = {entry.ref.id for entry in packs_registry.list()}
+    if isinstance(packs, PacksEngine):
+        reserved_ids |= packs.reserved_pack_ids()
+    if pack_id in reserved_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="import rejected: pack id reserved by a platform pack (fail closed)",
+        )
+    # Compute the content-address digest over the pack's CANONICAL bytes — the SAME identity the
+    # registry/runtime use — and derive the bytes to persist. A non-canonicalizable pack (e.g. a
+    # non-JSON-native body) is rejected fail closed before anything is stored.
+    try:
+        digest = canonical_digest(req.pack)
+        pack_bytes = canonical_bytes(req.pack)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail="import rejected: pack is not canonicalizable (fail closed)"
+        ) from exc
     # Audit-BEFORE-mutate: the verification succeeded above, so record ``pack.verify`` success FIRST
-    # (fail closed if it cannot be constructed) — before the registry is mutated by ``publish``.
+    # (fail closed if it cannot be constructed) — before any state/content-store mutation.
     _emit_pack_audit_or_fail_closed(
         audit,
         actor=actor,
@@ -1476,24 +1713,30 @@ def import_pack(
         pack_id=pack_id,
         pack_version=pack_version,
     )
+    # Materialize the verified bytes into the SHARED content-addressed store (idempotent by digest;
+    # identical bytes dedupe across tenants and the digest reveals nothing), then record the
+    # per-tenant OWNERSHIP/visibility ATOMICALLY in the tenant-scoped store — the single writer.
+    content_store.put(digest, pack_bytes)
+    candidate = ImportedPack(
+        scope="",  # namespaced by the tenant-scoped store's ``try_record_imported_pack``
+        packId=pack_id,
+        version=pack_version,
+        packType=manifest.type,
+        digest=digest,
+        signature=serialize_pack_signature(signature),
+        keyId=signature.key_id,
+        importedBy=actor,
+    )
+    # Per-tenant immutability (issue #68, FIX 2): the ATOMIC insert-if-absent-else-verify-digest
+    # guard is the authority (closes the read-then-write TOCTOU race). A same-digest re-import is
+    # idempotent and returns the STORED record (its original importedAt); a different-digest
+    # re-import raises :class:`ImportConflictError`, which maps to 409 with the FIRST content
+    # preserved. The ``pack.import`` success audit is emitted ONLY after a non-conflict record.
     try:
-        # FIX 1 (issue #37/#89): persist the SAME verified detached signature (from
-        # ``manifest.pack_signature``) on the entry so the runtime resolver can INDEPENDENTLY
-        # re-verify it against the same pinned bundle. Omitting it would record a legacy-untrusted
-        # entry that the resolver fails closed — every imported pack would then never execute.
-        entry = packs_registry.publish(req.pack, signature=signature)
-    except ImmutableVersionError as exc:
+        imported = store.try_record_imported_pack(candidate)
+    except ImportConflictError as exc:
         raise HTTPException(
             status_code=409, detail="import rejected: immutable version conflict (fail closed)"
-        ) from exc
-    except (InvalidVersionError, ValueError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="import rejected: invalid pack manifest or version (fail closed)",
-        ) from exc
-    except RegistryError as exc:
-        raise HTTPException(
-            status_code=400, detail="import rejected: registry rejected the pack (fail closed)"
         ) from exc
     # Record the completed admission (``pack.import`` success). The subject was pre-validated
     # audit-safe, so this cannot be dropped for a bad subject; a durable-append outage remains the
@@ -1502,20 +1745,20 @@ def import_pack(
         audit,
         actor=actor,
         action=AuditAction.pack_import,
-        subject=f"{entry.ref.id}:{entry.ref.version}",
+        subject=subject,
         result=AuditResult.success,
-        pack_id=entry.ref.id,
-        pack_version=entry.ref.version,
+        pack_id=pack_id,
+        pack_version=pack_version,
     )
     # Egress the keyless, PII-free registry view (id/version/type/digest/createdAt/signed) — the
     # same bounded projection the catalogue uses; the raw key id / signature bytes never egress.
     return PackRegistryEntryView(
-        id=entry.ref.id,
-        version=entry.ref.version,
-        type=entry.type.value,
-        digest=entry.digest,
-        createdAt=entry.createdAt.isoformat(),
-        signed=entry.detached_signature() is not None,
+        id=pack_id,
+        version=pack_version,
+        type=manifest.type.value,
+        digest=digest,
+        createdAt=imported.importedAt.isoformat(),
+        signed=True,
     )
 
 
@@ -1579,12 +1822,24 @@ def put_pack_assignment(
             status_code=422,
             detail="assignment rejected: identifiers are not auditable (fail closed)",
         )
-    entry = packs_registry.get(PackRef(id=req.packId, version=req.version))
+    # Per-tenant visibility (issue #68): an assignment may only bind a pack the caller's tenant can
+    # SEE — a built-in/shared registry entry OR one of THIS tenant's own imported packs. A pack
+    # imported by another tenant is invisible here (the tenant-scoped store never returns it), so it
+    # can never be assigned (fail closed). Precedence is SHARED-FIRST, consistent with the catalogue
+    # and the runtime; since tenant imports occupy a DISJOINT id-space from shipped/shared packs
+    # (enforced at import admission, FIX 3), the order can never change the result — a lookup only
+    # ever matches one space.
+    shared_entry = packs_registry.get(PackRef(id=req.packId, version=req.version))
+    if shared_entry is not None:
+        entry: RegistryEntry | None = shared_entry
+    else:
+        imported = store.get_imported_pack(req.packId, req.version)
+        entry = imported_pack_to_entry(imported) if imported is not None else None
     if entry is None:
         raise HTTPException(
             status_code=422,
             detail=(
-                "assignment rejected: not a verified, imported pack in the registry "
+                "assignment rejected: not a verified pack visible to this tenant "
                 "(import it via POST /api/packs/import first); failing closed"
             ),
         )

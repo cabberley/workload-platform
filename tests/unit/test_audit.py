@@ -49,6 +49,7 @@ from shared.contracts import (
     ScaleProfile,
     Severity,
     SourceReference,
+    TenantModuleConfig,
     WorkloadGraph,
     is_audit_safe,
 )
@@ -1565,6 +1566,10 @@ class _AuditFailingStore(LocalStateStore):
         self.mutations.append("commit_run")
         return super().commit_run(workload, result)
 
+    def put_module_config(self, config: TenantModuleConfig) -> None:
+        self.mutations.append("put_module_config")
+        super().put_module_config(config)
+
 
 @pytest.fixture()
 def failclosed_client(tmp_path):
@@ -1640,4 +1645,17 @@ def test_results_endpoint_fails_closed_when_audit_append_fails(failclosed_client
     assert resp.status_code == 500
     assert store.mutations == []
     assert store.get_findings("epic") == []
+
+
+def test_module_config_put_fails_closed_when_audit_append_fails(failclosed_client) -> None:
+    # FIX 1 (issue #68): module.enabled/module.disabled are now in FAIL_CLOSED_ACTIONS, so a
+    # per-tenant module posture change is audit-BEFORE-write — a durable audit outage must 5xx and
+    # NEVER persist the config (no committed-but-unaudited posture change). Proves the
+    # put_module_config docstring's fail-closed claim.
+    client, store, reg = failclosed_client
+    resp = client.put("/api/modules/config", json={"disabled": ["quality_checks"]})
+    assert resp.status_code == 500  # fail-closed: durable audit append failure surfaces as 5xx
+    assert store.mutations == []  # audit-before-write: the config write was NEVER invoked
+    failures = [s for s in reg.snapshot().counters if s.name == METRIC_AUDIT_EMIT_FAILURES]
+    assert sum(s.value for s in failures) == 1  # the outage is observable on /api/metrics
 

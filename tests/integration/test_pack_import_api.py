@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 from api.app.main import (
     app,
     get_clients,
+    get_pack_content_store,
     get_pack_import_verifier,
     get_pack_registry,
     get_packs,
@@ -158,6 +159,7 @@ def wired(tmp_path):
     ]
     packs = FakePacks(rule_packs)
     registry = PackRegistry(str(tmp_path / "registry" / "index.json"))
+    content_store = LocalPackContentStore(str(tmp_path / "content"))
     signer = Ed25519Signer.generate("test-kid")
     # Seed the registry with the VERIFIED, SIGNED digests of the exact packs the engine serves, so
     # an assignment (bound to a signed+trusted registry entry at write time — FINDING B) resolves at
@@ -170,6 +172,7 @@ def wired(tmp_path):
     app.dependency_overrides[get_packs] = lambda: packs
     app.dependency_overrides[get_clients] = lambda: {}
     app.dependency_overrides[get_pack_registry] = lambda: registry
+    app.dependency_overrides[get_pack_content_store] = lambda: content_store
     app.dependency_overrides[get_pack_import_verifier] = lambda: _trust_verifier(signer)
     with TestClient(app) as client:
         yield client, store, registry, signer
@@ -211,10 +214,14 @@ def test_import_verifies_and_registers_signed_bundle(wired):
     # legacy-untrusted) — else the runtime resolver would fail it closed and it could never run.
     assert entry["signed"] is True
 
-    # The API is the single writer of the registry: the verified version is now published.
-    published = registry.get(PackRef(id="epic-core", version="1.0.0"))
-    assert published is not None
-    assert published.detached_signature() is not None  # signature durably recorded
+    # Per-tenant import (issue #68): the import is NOT published to the process-wide registry — it
+    # is recorded in the caller tenant's own scope. So the shared registry never sees it, but the
+    # importing tenant DOES see it in its visible catalogue (built-in/shared + its own imports).
+    assert registry.get(PackRef(id="epic-core", version="1.0.0")) is None
+    catalogue = client.get("/api/packs").json()
+    mine = [p for p in catalogue if p["id"] == "epic-core" and p["version"] == "1.0.0"]
+    assert len(mine) == 1
+    assert mine[0]["signed"] is True  # verified signature durably recorded per-tenant
 
 
 def test_import_rejects_tampered_bundle_fail_closed(wired):
@@ -439,15 +446,18 @@ def test_put_assignment_rejects_unverified_pack_fail_closed(wired):
 def test_put_assignment_accepts_after_import_binds_to_verified_entry(wired):
     client, _store, registry, signer = wired
     _seed_untagged_vm(client, "epic")  # FIX 3: workload must exist
-    # Import a signed bundle through the fail-closed flow so it lands (verified) in the registry.
+    # Import a signed bundle through the fail-closed flow so it lands (verified) in the caller
+    # tenant's scope (per-tenant import, issue #68 — NOT the process-wide registry).
     resp = client.post("/api/packs/import", json=_signed_bundle(_importable_pack("3.1.0"), signer))
     assert resp.status_code == 200, resp.text
-    assert registry.get(PackRef(id="epic-core", version="3.1.0")) is not None
+    # It is scoped to this tenant, not the shared registry, but is visible in the tenant catalogue.
+    assert registry.get(PackRef(id="epic-core", version="3.1.0")) is None
     # FIX 1: the imported entry persisted the verified signature, so it is SIGNED (not legacy-
     # untrusted) and can be resolved/executed under an assignment.
     assert resp.json()["signed"] is True
-    assert registry.get(PackRef(id="epic-core", version="3.1.0")).detached_signature() is not None
-    # Now the assignment to that exact verified entry is accepted and stored.
+    catalogue = client.get("/api/packs").json()
+    assert any(p["id"] == "epic-core" and p["version"] == "3.1.0" for p in catalogue)
+    # Now the assignment to that exact verified (tenant-scoped) entry is accepted and stored.
     assign = client.put(
         "/api/workloads/epic/pack-assignments",
         json={"packId": "epic-core", "version": "3.1.0"},
