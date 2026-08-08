@@ -169,3 +169,64 @@ export type ImpactResult = {
    *  string) with the displayed graph's `graphRevision` to detect edge-level staleness. */
   graphRevision: string;
 };
+
+/**
+ * Mirrors `contracts.AgentResponse` — the console-facing analytical output of an auto-RCA
+ * (`modules.aiops.rca`). Every field is REQUIRED (always serialized). `sourceReferences` is the
+ * already-cited evidence the grounded explanation is constrained to. The SPA only ever *reads* this
+ * shape; it never produces or mutates an RCA.
+ */
+export type AgentResponse = {
+  agentName: string;
+  taskType: string;
+  inputSummary: string;
+  findings: string[];
+  risks: string[];
+  recommendations: string[];
+  sourceReferences: SourceReference[];
+  confidence: number;
+  nextActions: string[];
+  generatedAt: string;
+};
+
+/**
+ * One grounded, advisory RCA explanation entry — mirrors the `{ "advisory": string }` shape the
+ * aiops module attaches at `ModuleRunResult.extra["rcaExplanation"]` (issue #54), index-aligned
+ * with `extra["rca"]` (the `AgentResponse[]`). An EMPTY `advisory` means the keyless in-boundary
+ * edge was UNCONFIGURED / below the confidence floor / ungrounded — the pure RCA result stands and
+ * the console renders nothing for that entry (fail-closed, advisory-only).
+ */
+export type RcaExplanationEntry = {
+  advisory: string;
+};
+
+/**
+ * The console read-projection pairing an RCA `AgentResponse` with its (optional) grounded advisory
+ * explanation. Purely a UI join over the module run result's `extra.rca` + `extra.rcaExplanation`;
+ * `advisory` is `null` when no grounded explanation is available (nothing is rendered then).
+ */
+export type RcaExplanationView = {
+  rca: AgentResponse;
+  advisory: string | null;
+};
+
+/**
+ * Mirrors `contracts.RcaAdvisory` — the BOUNDED, PII-safe console read model served by
+ * `GET /api/workloads/{workload}/rca-explanations` (issue #54). It is the persisted, grounded,
+ * advisory-only RCA explanation projection (only grounded/non-empty advisories are ever persisted,
+ * so the list is empty when nothing is available — fail-closed by absence). Every field is REQUIRED
+ * (always serialized). `index` aligns with the run's RCA responses; `sourceReferences` is the
+ * already-cited evidence the advisory is grounded on. The SPA only ever *reads* this shape.
+ */
+export type RcaAdvisory = {
+  index: number;
+  agentName: string;
+  taskType: string;
+  confidence: number;
+  advisory: string;
+  findings: string[];
+  risks: string[];
+  recommendations: string[];
+  sourceReferences: SourceReference[];
+  generatedAt: string;
+};

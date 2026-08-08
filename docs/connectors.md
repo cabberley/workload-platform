@@ -16,6 +16,9 @@ lives in [`src/shared/connectors`](../src/shared/connectors); see
   (issue #53); returns only aggregate `LogFeatures`, never a raw log body (see below).
 - **Azure OpenAI enrichment** — thin, keyless, in-boundary **LLM enrichment** edge (issue #53);
   advisory-only, sends only PII-free `LogFeatures`, no-ops when unconfigured (see below).
+- **RCA explanation** — thin, keyless, in-boundary **LLM edge** that gives an advisory, **grounded**
+  natural-language explanation of an existing auto-RCA (issue #54); reuses the #53 AOAI seam, sends
+  only the RCA's already-cited fields, enforces a pure grounding gate, feature-flagged (see below).
 - **Kuiper** — Epic *Kuiper* **discovery assist** (`src/modules/discovery/connectors/kuiper.py`).
   Unlike the AIOps telemetry connectors, Kuiper feeds the **Discovery** module. It is
   **fail-closed by default**: the concrete Kuiper endpoint, payload contract, and auth scheme are an
@@ -204,6 +207,24 @@ lives in [`src/shared/connectors`](../src/shared/connectors); see
   valuable with **no** endpoint configured; the LLM is enrichment, not a dependency. Free-text
   enrichment lands in `extra["logAnomalyEnrichment"]`, which the egress choke point redacts. See
   [ADR 0019](adr/0019-pii-free-log-anomaly-advisory.md).
+- **RCA explanation** — thin **keyless, in-boundary LLM edge** that produces an **advisory,
+  grounded natural-language explanation** of an existing auto-RCA
+  ([`src/modules/aiops/connectors/rca_explanation.py`](../src/modules/aiops/connectors/rca_explanation.py),
+  issue #54). It **reuses the #53 AOAI seam** via the shared
+  [`src/shared/connectors/aoai.py`](../src/shared/connectors/aoai.py) helper (trusted-host suffixes,
+  endpoint validation, region-pin, lazy SDK transport, `COGNITIVE_SCOPE`), so it inherits ALL the
+  #53 guardrails: configured **purely by env-var NAMES**, **region-pins** and validates the endpoint
+  **before** resolving a credential via `DefaultAzureCredential` (keyless), and **no-ops when
+  UNCONFIGURED**. It sends **only** the RCA `AgentResponse`'s already-cited fields
+  (`findings`/`risks`/`recommendations`/`sourceReferences`/`confidence`) — never new data — and a
+  **pure grounding gate** ([`src/modules/aiops/rca_grounding.py`](../src/modules/aiops/rca_grounding.py))
+  rejects any explanation that introduces an un-cited resource id / nodeId / metric (fail-closed).
+  Below `RCA_CONFIDENCE_FLOOR` it asserts nothing and surfaces the support path. The advisory is
+  **advisory-only** (never a finding/remediation/nextAction) and lands in
+  `extra["rcaExplanation"]`, which the egress choke point redacts. **Feature-flagged**
+  (`$AIOPS_RCA_EXPLAIN_ENABLED`); GO-LIVE awaits CELA/HiTrust sign-off (`TODO(human)`). Expected PII
+  egress is **NONE**; exercised with synthetic fixtures only. See
+  [ADR 0020](adr/0020-grounded-rca-explanation-in-boundary-llm.md).
 
 ## The pattern
 

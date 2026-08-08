@@ -60,6 +60,7 @@ from shared.contracts import (
     ModuleRunResult,
     PackAssignment,
     PackManifest,
+    RcaAdvisory,
     ReadinessReport,
     ResourceNode,
     TenantContext,
@@ -2057,6 +2058,24 @@ def get_findings(
 ) -> list[Finding]:
     """Return current findings for ``workload``, optionally filtered to one ``module``."""
     return store.get_findings(workload, module)
+
+
+@app.get("/api/workloads/{workload}/rca-explanations")
+def get_rca_explanations(
+    workload: str, store: ScopedStoreDep, _principal: ReaderDep
+) -> list[RcaAdvisory]:
+    """Return the grounded, advisory-only RCA explanations for ``workload`` (empty if none).
+
+    The in-boundary console read path for issue #54. It serves the BOUNDED, PII-safe
+    :class:`RcaAdvisory` read model persisted by ``commit_run`` — an EXPLICIT typed projection
+    (every field a scalar or the already-egress-classified ``SourceReference``), NOT the blanket
+    ``redact_tree`` egress projection. Authenticated with the same ``ReaderDep`` principal the
+    other workload reads (findings/graph/drift) use; the console is authenticated + in-boundary, so
+    this does not cross the customer trust boundary. Only GROUNDED/non-empty advisories were ever
+    persisted (fail-closed by absence), so a low-confidence/ungrounded/unconfigured run simply
+    yields nothing here.
+    """
+    return store.get_rca_advisories(workload)
 
 
 # The previous-snapshot read models below exist so the worker's read-only `ApiStateReader` can

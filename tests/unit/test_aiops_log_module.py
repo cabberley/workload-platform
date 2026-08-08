@@ -12,8 +12,10 @@ from typing import Any
 
 from modules.aiops.connectors.log_sample import LogFeatureFetchResult
 from modules.aiops.connectors.openai_enrichment import LogAnomalyEnrichment
+from modules.aiops.connectors.rca_explanation import RcaExplanation
 from modules.aiops.module import AiopsModule
 from shared.contracts import (
+    AgentResponse,
     DependencyEdge,
     LogFeatures,
     PackType,
@@ -243,3 +245,69 @@ class OpenAIEnrichmentClientUnconfigured:
 
     def enrich(self, features: LogFeatures) -> LogAnomalyEnrichment:
         return LogAnomalyEnrichment(available=False, error="Unconfigured")
+
+
+class _FakeRcaExplain:
+    """A stand-in grounded RCA-explanation client — returns a fixed advisory (issue #54)."""
+
+    def __init__(self, *, available: bool = True) -> None:
+        self._available = available
+        self.seen: list[Any] = []
+
+    def explain(self, response: Any) -> Any:
+        self.seen.append(response)
+        return RcaExplanation(
+            available=self._available,
+            advisory="synthetic grounded advisory" if self._available else None,
+            grounded=self._available,
+        )
+
+
+def test_rca_explanation_lands_in_extra_aligned_with_rca() -> None:
+    packs = FakePacks([_anomaly_pack()])
+    state = FakeState(estate=_estate(), graph=_graph())
+    log_sample = _FakeLogSample(_baseline_and_spike())
+    explain = _FakeRcaExplain()
+    ctx = ModuleContext(
+        packs=packs,
+        state=state,
+        clients={"log_sample": log_sample, "rca_explanation": explain},
+    )
+    result = AiopsModule().run(ctx, scope={"workload": "epic"})
+
+    rca = result.extra["rca"]
+    entries = result.extra["rcaExplanation"]
+    assert len(rca) >= 1
+    # One advisory per RCA response, index-aligned with extra["rca"].
+    assert len(entries) == len(rca)
+    assert all(e == {"advisory": "synthetic grounded advisory"} for e in entries)
+    # The edge only ever received the analytical AgentResponse (never raw estate/log data).
+    assert len(explain.seen) == len(rca)
+    assert all(isinstance(r, AgentResponse) for r in explain.seen)
+
+
+def test_rca_explanation_absent_leaves_pure_result() -> None:
+    packs = FakePacks([_anomaly_pack()])
+    state = FakeState(estate=_estate(), graph=_graph())
+    log_sample = _FakeLogSample(_baseline_and_spike())
+    ctx = ModuleContext(packs=packs, state=state, clients={"log_sample": log_sample})
+    result = AiopsModule().run(ctx, scope={"workload": "epic"})
+    # No edge configured ⇒ empty advisory list (the no-op IS the off state of the flag).
+    assert result.extra["rcaExplanation"] == []
+    assert len(result.extra["rca"]) >= 1
+
+
+def test_rca_explanation_no_op_client_yields_empty_advisories() -> None:
+    packs = FakePacks([_anomaly_pack()])
+    state = FakeState(estate=_estate(), graph=_graph())
+    log_sample = _FakeLogSample(_baseline_and_spike())
+    explain = _FakeRcaExplain(available=False)
+    ctx = ModuleContext(
+        packs=packs,
+        state=state,
+        clients={"log_sample": log_sample, "rca_explanation": explain},
+    )
+    result = AiopsModule().run(ctx, scope={"workload": "epic"})
+    entries = result.extra["rcaExplanation"]
+    assert len(entries) == len(result.extra["rca"])
+    assert all(e == {"advisory": ""} for e in entries)

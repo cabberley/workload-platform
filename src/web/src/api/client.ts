@@ -11,6 +11,7 @@ import type {
   ModuleManifest,
   PackAssignment,
   PackRegistryEntry,
+  RcaAdvisory,
   WorkloadGraph,
 } from "./types";
 
@@ -93,6 +94,18 @@ export function fetchFindings(workload: string, module?: string): Promise<Findin
 
 export function fetchDrift(workload: string): Promise<DriftReport> {
   return getJson<DriftReport>(`/api/workloads/${encodeURIComponent(workload)}/drift`);
+}
+
+/**
+ * The persisted, grounded, advisory-only RCA explanations for a workload (issue #54). Read-only
+ * in-boundary console path: the backend returns `[]` (never an error) when no grounded advisory is
+ * available — an unconfigured/low-confidence/ungrounded run persists nothing, so an empty list is
+ * "no advisory", NOT an all-clear. The advisory is never a remediation and is never applied.
+ */
+export function fetchRcaExplanations(workload: string): Promise<RcaAdvisory[]> {
+  return getJson<RcaAdvisory[]>(
+    `/api/workloads/${encodeURIComponent(workload)}/rca-explanations`,
+  );
 }
 
 /**

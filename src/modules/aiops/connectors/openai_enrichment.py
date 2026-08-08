@@ -34,33 +34,32 @@ same keyless, region-pinned, fail-closed edge.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from shared.connectors import CredentialProvider, FailClosedObserver
+from shared.connectors.aoai import (
+    TRUSTED_AOAI_HOST_SUFFIXES,
+    AoaiChatTransport,
+    AoaiSdkNotWired,
+    RegionPinMismatch,
+    UntrustedOpenAIEndpoint,
+    build_aoai_chat_transport,
+    enforce_region_pin,
+    validate_openai_endpoint,
+)
 from shared.contracts import LogFeatures
 
 # The well-known client-registry key the AIOps module looks this connector up by.
 CLIENT_KEY = "llm_enrichment"
 
-# The token scope handed to the credential for Azure OpenAI (Cognitive Services). Only ever used to
-# mint a bearer token for a validated, trusted endpoint host.
-COGNITIVE_SCOPE = "https://cognitiveservices.azure.com/.default"
-
-# Trusted Azure OpenAI / Cognitive Services data-plane host suffixes, per cloud. The credential is
-# only ever handed to a client constructed with a host under one of these suffixes.
-_TRUSTED_AOAI_HOST_SUFFIXES: tuple[str, ...] = (
-    ".openai.azure.com",  # Azure public cloud (Azure OpenAI)
-    ".cognitiveservices.azure.com",  # Azure public cloud (Cognitive Services)
-    ".openai.azure.us",  # Azure US Government
-    ".cognitiveservices.azure.us",  # Azure US Government
-    ".openai.azure.cn",  # Azure China (21Vianet)
-    ".cognitiveservices.azure.cn",  # Azure China (21Vianet)
-)
+# Backwards-compatible aliases: the shared AOAI machinery (issue #54 refactor) is the single home
+# for the trusted-host suffixes, scope, and endpoint validator so the RCA-explanation edge reuses
+# EXACTLY the same guardrails. These names are kept so #53 imports/behavior are unchanged.
+_TRUSTED_AOAI_HOST_SUFFIXES = TRUSTED_AOAI_HOST_SUFFIXES
+_validate_openai_endpoint = validate_openai_endpoint
 
 # A bounded advisory. The model is asked for a short, aggregate-only explanation; we also cap the
 # returned text so an over-long response cannot bloat the result envelope.
@@ -77,8 +76,8 @@ _SYSTEM_INSTRUCTION = (
 # An injected transport: given (deployment, system_instruction, features_json) return advisory text.
 # The real backend lazily imports the Azure OpenAI SDK; tests inject a fake so nothing touches the
 # network. The features_json is the serialized PII-free enrichment PROJECTION (signatures dropped) —
-# the ONLY payload sent.
-LLMTransport = Callable[[str, str, str], str]
+# the ONLY payload sent. Aliased to the shared AOAI transport type (issue #54 refactor).
+LLMTransport = AoaiChatTransport
 
 
 class OpenAIEnrichmentConfig(BaseModel):
@@ -100,45 +99,13 @@ class OpenAIEnrichmentConfig(BaseModel):
     max_advisory_chars: int = Field(default=_MAX_ADVISORY_CHARS, ge=1, le=8000)
 
 
-class RegionPinMismatch(ValueError):
-    """Raised when the Azure OpenAI region does not equal the platform region — fail closed."""
+class OpenAIEnrichmentSdkNotWired(AoaiSdkNotWired):
+    """Raised when the optional Azure OpenAI SDK cannot be imported — fail closed.
 
-
-class UntrustedOpenAIEndpoint(ValueError):
-    """Raised when the configured endpoint is not a trusted Azure OpenAI host — fail closed."""
-
-
-class OpenAIEnrichmentSdkNotWired(RuntimeError):
-    """Raised when the optional Azure OpenAI SDK cannot be imported — fail closed."""
-
-
-def _validate_openai_endpoint(endpoint: str) -> str:
-    """Validate an Azure OpenAI endpoint against the trusted hosts — pure, fail-closed.
-
-    Rejects anything that could exfiltrate the Managed-Identity token (SSRF / token replay):
-    requires ``https://``, forbids userinfo, explicit ports, and any query/fragment, and requires a
-    real subdomain under a trusted ``*.openai.azure.*`` / ``*.cognitiveservices.azure.*`` suffix.
-    Returns the normalized ``https://<host>`` on success; raises :class:`UntrustedOpenAIEndpoint`
-    otherwise (before any token is minted). Never logs the endpoint value.
+    A subclass of the shared :class:`~shared.connectors.aoai.AoaiSdkNotWired` so the surfaced
+    error **class name** stays ``OpenAIEnrichmentSdkNotWired`` (unchanged #53 behavior) while the
+    transport machinery is shared.
     """
-    parts = urlsplit(endpoint.strip())
-    if parts.scheme != "https":
-        raise UntrustedOpenAIEndpoint("openai endpoint must use https")
-    if parts.username or parts.password:
-        raise UntrustedOpenAIEndpoint("openai endpoint must not carry userinfo")
-    if parts.query or parts.fragment:
-        raise UntrustedOpenAIEndpoint("openai endpoint must not carry a query or fragment")
-    try:
-        port = parts.port
-    except ValueError as exc:
-        raise UntrustedOpenAIEndpoint("openai endpoint has an invalid port") from exc
-    if port is not None:
-        raise UntrustedOpenAIEndpoint("openai endpoint must not specify a port")
-    host = (parts.hostname or "").lower()
-    for suffix in _TRUSTED_AOAI_HOST_SUFFIXES:
-        if host.endswith(suffix) and len(host) > len(suffix):
-            return f"https://{host}"
-    raise UntrustedOpenAIEndpoint("openai endpoint host is not a trusted Azure OpenAI host")
 
 
 class LogAnomalyEnrichment(BaseModel):
@@ -213,12 +180,9 @@ class OpenAIEnrichmentClient:
             return LogAnomalyEnrichment(available=False, error="NonAggregateInput")
 
         # Region-pin BEFORE resolving any credential or validating the endpoint (fail closed early).
-        if self._config.region.strip().lower() != self._config.platform_region.strip().lower():
-            raise RegionPinMismatch(
-                "azure openai region is not pinned to the platform region"
-            )
+        enforce_region_pin(self._config.region, self._config.platform_region)
         # Validate the endpoint host BEFORE minting/handing over any token (SSRF/token guard).
-        _validate_openai_endpoint(self._config.endpoint)
+        validate_openai_endpoint(self._config.endpoint)
 
         credential = (
             self._credential_provider() if self._credential_provider is not None else None
@@ -243,48 +207,17 @@ class OpenAIEnrichmentClient:
     def _sdk_transport(self, credential: Any) -> LLMTransport:
         """Build a real transport that lazily wraps the Azure OpenAI SDK (keyless, validated).
 
-        The SDK import is lazy so importing this module never needs the package; a missing package
-        fails closed via :class:`OpenAIEnrichmentSdkNotWired`. The credential is handed straight to
-        the keyless SDK — never logged.
+        Delegates to the shared :func:`~shared.connectors.aoai.build_aoai_chat_transport` so the SDK
+        stays lazy (a missing package fails closed via :class:`OpenAIEnrichmentSdkNotWired`) and the
+        keyless credential is handed straight to the SDK — never logged. Unchanged #53 behavior.
         """
-
-        def _transport(deployment: str, system_instruction: str, features_json: str) -> str:
-            assert self._config is not None  # noqa: S101 - _enrich guards None before calling
-            endpoint = _validate_openai_endpoint(self._config.endpoint)
-            try:
-                from azure.ai.inference import (
-                    ChatCompletionsClient,  # noqa: PLC0415 - lazy edge import
-                )
-                from azure.ai.inference.models import (  # noqa: PLC0415 - lazy edge import
-                    SystemMessage,
-                    UserMessage,
-                )
-            except ImportError as exc:
-                raise OpenAIEnrichmentSdkNotWired(
-                    "azure-ai-inference is not installed; the enrichment edge is unavailable"
-                ) from exc
-            client = ChatCompletionsClient(
-                endpoint=f"{endpoint}/openai/deployments/{deployment}",
-                credential=credential,
-                credential_scopes=[COGNITIVE_SCOPE],
-            )
-            try:
-                response = client.complete(
-                    messages=[
-                        SystemMessage(content=system_instruction),
-                        UserMessage(content=features_json),
-                    ],
-                    timeout=self._config.timeout_s,
-                )
-                choice = response.choices[0]
-                content = choice.message.content
-                return content if isinstance(content, str) else ""
-            finally:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    close()
-
-        return _transport
+        assert self._config is not None  # noqa: S101 - _enrich guards None before calling
+        return build_aoai_chat_transport(
+            endpoint=self._config.endpoint,
+            credential=credential,
+            timeout_s=self._config.timeout_s,
+            sdk_not_wired=OpenAIEnrichmentSdkNotWired,
+        )
 
 
 __all__ = [

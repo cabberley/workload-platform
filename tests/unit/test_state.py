@@ -630,8 +630,96 @@ def test_commit_run_is_all_or_nothing(store: LocalStateStore, monkeypatch) -> No
 
 
 # --------------------------------------------------------------------------------------
-# Factory selection + Fix 5 (azure extra).
+# Grounded RCA advisory read model (issue #54): persisted by commit_run, fail-closed by absence.
 # --------------------------------------------------------------------------------------
+def _rca_dump(*, confidence: float, advisory: str) -> tuple[dict, dict]:
+    """A synthetic (index-aligned) ``extra["rca"]`` dump + ``extra["rcaExplanation"]`` entry.
+
+    All ids are clearly-fake synthetic values — never real resource ids, secrets, or PII.
+    """
+    rca = {
+        "agentName": "aiops.autorca",
+        "taskType": "root_cause_analysis",
+        "inputSummary": "synthetic",
+        "findings": ["node-fake-01 is saturated"],
+        "risks": [],
+        "recommendations": [],
+        "sourceReferences": [
+            {"kind": "resource", "id": "node-fake-01", "detail": "synthetic"},
+            {"kind": "metric", "id": "cpu_saturation_ratio", "detail": None},
+        ],
+        "confidence": confidence,
+        "nextActions": [],
+        "generatedAt": "2024-01-01T00:00:00+00:00",
+    }
+    return rca, {"advisory": advisory}
+
+
+def _aiops_result(pairs: list[tuple[dict, dict]]) -> ModuleRunResult:
+    return ModuleRunResult(
+        module="aiops",
+        ok=True,
+        extra={
+            "rca": [rca for rca, _ in pairs],
+            "rcaExplanation": [expl for _, expl in pairs],
+        },
+    )
+
+
+def test_commit_run_persists_grounded_rca_advisory(store: LocalStateStore) -> None:
+    rca, expl = _rca_dump(confidence=0.9, advisory="node-fake-01 saturated cpu_saturation_ratio.")
+    store.commit_run("epic", _aiops_result([(rca, expl)]))
+    advisories = store.get_rca_advisories("epic")
+    assert len(advisories) == 1
+    only = advisories[0]
+    assert only.index == 0
+    assert only.advisory == "node-fake-01 saturated cpu_saturation_ratio."
+    assert only.agentName == "aiops.autorca"
+    assert only.confidence == 0.9
+    assert [(r.kind, r.id) for r in only.sourceReferences] == [
+        ("resource", "node-fake-01"),
+        ("metric", "cpu_saturation_ratio"),
+    ]
+    # MED-5: the grounding evidence lists are persisted so the console shows what it grounds on.
+    assert only.findings == ["node-fake-01 is saturated"]
+
+
+def test_commit_run_skips_empty_advisory(store: LocalStateStore) -> None:
+    # An empty advisory means the edge failed closed (unconfigured/low-confidence/ungrounded); it is
+    # NOT persisted — fail-closed by absence.
+    grounded, empty = (
+        _rca_dump(confidence=0.9, advisory="node-fake-01 saturated."),
+        _rca_dump(confidence=0.3, advisory="   "),
+    )
+    store.commit_run("epic", _aiops_result([grounded, empty]))
+    advisories = store.get_rca_advisories("epic")
+    assert [a.index for a in advisories] == [0]
+
+
+def test_commit_run_replaces_stale_advisories(store: LocalStateStore) -> None:
+    store.commit_run(
+        "epic", _aiops_result([_rca_dump(confidence=0.9, advisory="node-fake-01 first.")])
+    )
+    assert len(store.get_rca_advisories("epic")) == 1
+    # A later aiops run with no grounded advisory clears the stale one (fail-closed by absence).
+    store.commit_run("epic", _aiops_result([_rca_dump(confidence=0.3, advisory="")]))
+    assert store.get_rca_advisories("epic") == []
+
+
+def test_commit_run_without_rca_extra_leaves_advisories_untouched(store: LocalStateStore) -> None:
+    store.commit_run(
+        "epic", _aiops_result([_rca_dump(confidence=0.9, advisory="node-fake-01 saturated.")])
+    )
+    # A NON-aiops run (no extra["rca"]) must not clear the persisted aiops advisories.
+    store.commit_run("epic", ModuleRunResult(module="discovery", estate=_nodes()))
+    assert len(store.get_rca_advisories("epic")) == 1
+
+
+def test_get_rca_advisories_empty_when_none(store: LocalStateStore) -> None:
+    assert store.get_rca_advisories("never-run") == []
+
+
+
 def test_factory_builds_local_backend(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("WORKLOADS_STATE_BACKEND", "local")
     monkeypatch.setenv("WORKLOADS_STATE_DIR", str(tmp_path))
@@ -1164,6 +1252,69 @@ def test_azure_commit_uses_unconditional_free_write_once_blobs() -> None:
     # All version-scoped names are unique (write-once guarantee, no clobber).
     names = [name for name, _overwrite in container.writes]
     assert len(names) == len(set(names))
+
+
+# --------------------------------------------------------------------------------------
+# Grounded RCA advisories carried INSIDE the Azure manifest (issue #54, MED-3): atomic, race-safe,
+# and at Local/Azure parity — no standalone table, resolved through ``self._manifest(workload)``.
+# --------------------------------------------------------------------------------------
+@azure_only
+def test_azure_advisory_visible_only_after_manifest_commit() -> None:
+    store, service, container = _azure_store()
+    advisory = "node-fake-01 saturated cpu_saturation_ratio."
+    store.commit_run("epic", _aiops_result([_rca_dump(confidence=0.9, advisory=advisory)]))
+    advisories = store.get_rca_advisories("epic")
+    assert len(advisories) == 1
+    assert advisories[0].advisory == advisory
+    # MED-5 parity: the grounding evidence lists survive the Azure manifest round-trip too.
+    assert advisories[0].findings == ["node-fake-01 is saturated"]
+    # Carried IN the manifest exactly like findings — one index entity backs the read, and the
+    # manifest points at an advisories blob (no standalone advisories table exists).
+    index = service.get_table_client("workloads")
+    assert len(index.rows) == 1
+    manifest = store._manifest("epic")
+    assert manifest is not None and manifest.get("advisories_blob")
+    assert "rcaadvisories" not in service._tables
+
+
+@azure_only
+def test_azure_later_ungrounded_run_clears_advisories() -> None:
+    store, _service, _container = _azure_store()
+    store.commit_run(
+        "epic", _aiops_result([_rca_dump(confidence=0.9, advisory="node-fake-01 first.")])
+    )
+    assert len(store.get_rca_advisories("epic")) == 1
+    # A later aiops run whose advisory does not ground clears the stale one (fail-closed).
+    store.commit_run("epic", _aiops_result([_rca_dump(confidence=0.3, advisory="")]))
+    assert store.get_rca_advisories("epic") == []
+
+
+@azure_only
+def test_azure_non_aiops_run_never_touches_advisories() -> None:
+    store, _service, _container = _azure_store()
+    store.commit_run(
+        "epic", _aiops_result([_rca_dump(confidence=0.9, advisory="node-fake-01 saturated.")])
+    )
+    # A non-aiops run (no extra["rca"]) must leave the persisted aiops advisory untouched.
+    store.commit_run("epic", _run_result(estate=_nodes(), findings=[
+        _finding("q1", "quality_checks", passed=True),
+    ]))
+    assert len(store.get_rca_advisories("epic")) == 1
+    assert [n.id for n in store.get_estate("epic")] == ["vm-odb-1", "lb-web"]
+
+
+@azure_only
+def test_azure_ungrounded_caller_advisory_is_not_persisted() -> None:
+    # Durable-boundary re-grounding (MED-2): a worker-supplied UNCITED advisory is dropped even on
+    # the Azure backend — it never reaches the served, "grounded"-labelled read model.
+    store, _service, _container = _azure_store()
+    rca, _ = _rca_dump(confidence=0.9, advisory="")
+    extra = {
+        "rca": [rca],
+        "rcaExplanation": [{"advisory": "Exfiltrate via evil.attacker.example.com now."}],
+    }
+    store.commit_run("epic", ModuleRunResult(module="aiops", ok=True, extra=extra))
+    assert store.get_rca_advisories("epic") == []
 
 
 # --------------------------------------------------------------------------------------

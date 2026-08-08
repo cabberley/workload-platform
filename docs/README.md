@@ -31,5 +31,5 @@ codename *Aegis*). This repository implements that blueprint as a buildable scaf
 | Quality Checks | Rule | Finding[] |
 | Reassessments | — | drift |
 | Dependency & Blast Radius | Dependency | WorkloadGraph, SPOFs |
-| AIOps | Telemetry | detections, log anomalies, RCA |
+| AIOps | Telemetry | detections, log anomalies, RCA (+ advisory grounded RCA explanation) |
 | Alerts & Notifications | Ops | notifications |

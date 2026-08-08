@@ -97,6 +97,14 @@ ENV_AIOPS_LLM_ENDPOINT = "AIOPS_LLM_ENDPOINT"
 ENV_AIOPS_LLM_DEPLOYMENT = "AIOPS_LLM_DEPLOYMENT"
 ENV_AIOPS_LLM_REGION = "AIOPS_LLM_REGION"
 ENV_PLATFORM_REGION = "WP_PLATFORM_REGION"
+# Keyless, grounded RCA-explanation edge (aiops auto-RCA, issue #54). OPTIONAL, advisory-only, and
+# fail-closed: it produces a natural-language explanation of an existing RCA, grounded STRICTLY on
+# that RCA's already-cited evidence. It REUSES the #53 in-boundary AOAI seam, so it reads the same
+# ``AIOPS_LLM_*`` + ``WP_PLATFORM_REGION`` non-secret Key Vault-backed values (keyless — Managed
+# Identity). It is additionally gated on an explicit feature flag (``$AIOPS_RCA_EXPLAIN_ENABLED``)
+# because GO-LIVE of this pattern awaits CELA/HiTrust sign-off — absent/false the edge is never
+# registered and the pure RCA result stands unchanged (the no-op IS the off state of the flag).
+ENV_AIOPS_RCA_EXPLAIN_ENABLED = "AIOPS_RCA_EXPLAIN_ENABLED"
 
 _DEFAULT_CONTENT_ROOT = "content"
 _WEBHOOK_TIMEOUT_S = 10.0
@@ -441,6 +449,7 @@ def build_client_registry(*, config: Mapping[str, str] | None = None) -> dict[st
     _add_telemetry_exporter(registry, cfg, credential)
     _add_log_sample(registry, cfg, credential)
     _add_llm_enrichment(registry, cfg, credential)
+    _add_rca_explanation(registry, cfg, credential)
 
     return registry
 
@@ -735,6 +744,64 @@ def _add_llm_enrichment(
             ),
             credential_provider=lambda: credential,
             # Keyless observer (issue #60): a fail-closed enrichment increments
+            # connector_fail_closed_total{module="aiops"} on the process registry.
+            fail_closed_observer=connector_fail_closed_observer("aiops"),
+        )
+    except Exception:  # noqa: BLE001 - fail closed: omit the edge, never crash wiring
+        return
+
+
+def _add_rca_explanation(
+    registry: dict[str, object], cfg: Mapping[str, str], credential: object | None
+) -> None:
+    """aiops auto-RCA's keyless, grounded RCA-explanation edge (issue #54).
+
+    OPTIONAL, advisory-only, and fail-closed. Registered ONLY when the explicit feature flag
+    (``$AIOPS_RCA_EXPLAIN_ENABLED``) is truthy AND the same in-boundary AOAI config the #53 edge
+    uses is fully present — endpoint (``$AIOPS_LLM_ENDPOINT``), deployment
+    (``$AIOPS_LLM_DEPLOYMENT``), AOAI region (``$AIOPS_LLM_REGION``), the platform region
+    (``$WP_PLATFORM_REGION``), **and** a keyless credential. Absent any of these the key is simply
+    absent and the pure RCA result stands alone (the no-op IS the off state of the flag). A
+    ``credential_provider`` closure over the wiring credential keeps it keyless (Managed Identity
+    via ``DefaultAzureCredential``); no key/secret/connection string is read here. The region is
+    pinned to the platform region and the endpoint host is validated against the trusted Azure
+    OpenAI hosts at the edge (SSRF guard); the SDK imports lazily, so a missing package fails closed
+    at call time. This builder never raises.
+
+    TODO(human): GO-LIVE of this in-boundary, no-Microsoft-processing pattern is gated on
+    CELA/HiTrust sign-off (external legal gate, NOT a code blocker). Keep the flag default-off until
+    signed off, then ship-enable via ``$AIOPS_RCA_EXPLAIN_ENABLED``.
+    """
+    enabled = (cfg.get(ENV_AIOPS_RCA_EXPLAIN_ENABLED) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return
+    endpoint = (cfg.get(ENV_AIOPS_LLM_ENDPOINT) or "").strip()
+    deployment = (cfg.get(ENV_AIOPS_LLM_DEPLOYMENT) or "").strip()
+    region = (cfg.get(ENV_AIOPS_LLM_REGION) or "").strip()
+    platform_region = (cfg.get(ENV_PLATFORM_REGION) or "").strip()
+    if not endpoint or not deployment or not region or not platform_region or credential is None:
+        return
+    try:
+        from modules.aiops.connectors.rca_explanation import (
+            CLIENT_KEY,
+            RcaExplanationClient,
+            RcaExplanationConfig,
+        )
+
+        registry[CLIENT_KEY] = RcaExplanationClient(
+            RcaExplanationConfig(
+                endpoint=endpoint,
+                deployment=deployment,
+                region=region,
+                platform_region=platform_region,
+            ),
+            credential_provider=lambda: credential,
+            # Keyless observer (issue #60): a fail-closed explanation increments
             # connector_fail_closed_total{module="aiops"} on the process registry.
             fail_closed_observer=connector_fail_closed_observer("aiops"),
         )

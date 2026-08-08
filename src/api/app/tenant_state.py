@@ -33,6 +33,7 @@ from shared.contracts import (
     ImportedPack,
     ModuleRunResult,
     PackAssignment,
+    RcaAdvisory,
     ResourceNode,
     TenantContext,
     TenantModuleConfig,
@@ -95,6 +96,9 @@ class TenantScopedState:
 
     def get_previous_node_ids(self, workload: str) -> list[str]:
         return self._inner.get_previous_node_ids(self._key(workload))
+
+    def get_rca_advisories(self, workload: str) -> list[RcaAdvisory]:
+        return self._inner.get_rca_advisories(self._key(workload))
 
     # -- writes (tenant-namespaced; API core is the single writer) -----------------------
     def put_estate(self, workload: str, nodes: list[ResourceNode]) -> None:
