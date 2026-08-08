@@ -27,3 +27,42 @@ services:
       context: ../../
   # Module workers are deployed as ACA Jobs by Bicep (see infra/bicep/modules).
   # They share the worker image built from Dockerfile.worker.
+
+# Lifecycle hooks make `azd provision` a genuinely working, keyless deploy (issue #67, Phase 1):
+#   preprovision  — ensure the ACR (admin disabled) exists and `az acr build` ALL THREE images
+#                   (api · worker · web) into it, so the Bicep the platform provisions can pull them.
+#                   The `worker` image the ACA Jobs depend on is staged here (azd's own service build
+#                   only covers api + web), closing the gap.
+#   postprovision — run the API-only-writer boundary gate (scripts/cleanup_verify_state_writers.py),
+#                   identical to the scripted path.
+#
+# SUPPORTED azd FLOW: `azd provision` (infra + these hooks). NOTE: `azd up`/`azd deploy` additionally
+# run azd's per-service image push, which requires each container app to carry an `azd-service-name`
+# tag mapping — that wiring is deliberately NOT added here (it would diverge from the release.yml /
+# scripted image model). The fully-supported turnkey Phase-1 path is the scripted infra/deploy
+# scripts; `azd provision` is the supported azd convenience. See docs/delivery/customer-deployment.md.
+# TODO(human): if end-to-end `azd up` (per-service push) is desired, add `azd-service-name` tags to
+# the api/web container apps and reconcile azd's injected image names with main.bicep's imageTag.
+hooks:
+  preprovision:
+    posix:
+      shell: sh
+      run: infra/deploy/azd-hooks/preprovision.sh
+      interactive: false
+      continueOnError: false
+    windows:
+      shell: pwsh
+      run: infra/deploy/azd-hooks/preprovision.ps1
+      interactive: false
+      continueOnError: false
+  postprovision:
+    posix:
+      shell: sh
+      run: infra/deploy/azd-hooks/postprovision.sh
+      interactive: false
+      continueOnError: false
+    windows:
+      shell: pwsh
+      run: infra/deploy/azd-hooks/postprovision.ps1
+      interactive: false
+      continueOnError: false

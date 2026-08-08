@@ -1,6 +1,8 @@
 // Read-only API client for the platform read models. Every call is a GET — the console never
-// writes state (no POST/PUT/DELETE anywhere in the SPA). Requests hit the same origin; the dev
-// server proxies `/api` to the FastAPI core (see `vite.config.ts`).
+// writes state (no POST/PUT/DELETE anywhere in the SPA). Requests hit the same origin: in dev the
+// Vite server proxies `/api` to the FastAPI core (see `vite.config.ts`); in the deployed topology
+// the web container's nginx reverse-proxies same-origin `/api/*` to the API's internal ingress
+// (see `infra/docker/nginx.conf.template`), so the browser never contacts the internal API directly.
 
 import type {
   DriftReport,

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "_comment": "azd parameter wiring for infra/bicep/main.bicep (issue #67, Phase 1). azd substitutes ${VAR} from the selected environment's .env (set via `azd env set <VAR> <value>`) during `azd provision`/`azd up`, then passes the resolved values to Bicep. NO subscription/tenant/resource-group/secret is hardcoded — all values are non-secret. Only the env-driven parameters are wired here; imageTag (latest) and manageStateImmutabilityPolicy (true) intentionally fall back to main.bicep's own defaults. authMode is set EXPLICITLY to 'disabled' here as the Phase-1 DELIVERED default (Option 3, issue #127): safe ONLY because the API is internal-only (network-isolated, not publicly exposed). This does NOT change main.bicep's own authMode default, which stays 'required' (fail-closed) for anyone deploying main.bicep directly. To harden, set authMode to 'required' plus WP_AUTH_TENANT_ID/WP_AUTH_AUDIENCE — see the 'Enable required auth (hardening)' section of docs/delivery/customer-deployment.md.",
+  "parameters": {
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "containerRegistry": {
+      "value": "${AZURE_CONTAINER_REGISTRY_NAME}"
+    },
+    "authMode": {
+      "value": "disabled"
+    },
+    "authTenantId": {
+      "value": "${WP_AUTH_TENANT_ID}"
+    },
+    "authAudience": {
+      "value": "${WP_AUTH_AUDIENCE}"
+    }
+  }
+}

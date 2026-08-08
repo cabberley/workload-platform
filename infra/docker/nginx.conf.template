@@ -1,0 +1,40 @@
+# nginx site config for the web SPA (issue #67).
+#
+# This is an ENVSUBST TEMPLATE: the nginx image's entrypoint expands ${WP_API_BASE_URL} at container
+# start (nginx runtime $variables like $uri / $scheme are left untouched because they are not
+# environment variables). It serves the built Vite SPA and reverse-proxies same-origin /api/* to the
+# API core's INTERNAL ingress, so the browser talks only to this in-boundary web app, which proxies
+# for it.
+#
+# Exposure invariant (review-67-v4): the API is ALWAYS internal-only. In Phase-1 (authMode=disabled)
+# the WEB app is ALSO internal — main.bicep gates web's external ingress on (authMode == 'required')
+# — so this proxy is reachable ONLY from within the customer's private network (the Container Apps
+# environment VNet). The web app is exposed publicly ONLY when authMode=required, in which case the
+# API enforces bearer-token auth. Thus the public web front door can never front an unauthenticated
+# API. Keyless & fail-closed: nginx adds NO credentials; the caller's Authorization header is
+# forwarded unchanged and the API enforces its own Entra bearer auth when required.
+server {
+    listen       80;
+    server_name  _;
+
+    root   /usr/share/nginx/html;
+    index  index.html;
+
+    # Reverse-proxy the read-only API. WP_API_BASE_URL is the API app's internal ingress base URL
+    # (https://wp-api.internal.<env>.<region>.azurecontainerapps.io), injected by main.bicep from the
+    # API container app's ingress FQDN (never a hardcoded host). proxy_pass WITHOUT a URI part
+    # preserves the original /api/... path (the FastAPI core serves its routes under /api), and nginx
+    # sets the upstream Host from the proxy target so Container Apps ingress routes correctly.
+    location /api/ {
+        proxy_pass              ${WP_API_BASE_URL};
+        proxy_http_version      1.1;
+        proxy_ssl_server_name   on;
+        proxy_set_header        X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto $scheme;
+    }
+
+    # SPA fallback for client-side routing (history API).
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

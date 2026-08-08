@@ -52,6 +52,9 @@ param authTenantId string = ''
 @description('Expected token audience — the API app registration Application ID URI / client id (issue #64). Non-secret. Empty => not injected.')
 param authAudience string = ''
 
+@description('Whether this app gets PUBLIC (external) Container Apps ingress. Only meaningful for the web app; the API is ALWAYS internal. review-67-v4 invariant: the public web front door is opened ONLY when the platform enforces required auth — main.bicep sets this to (authMode == required). Default false => internal-only (fail-closed, zero public surface).')
+param ingressExternal bool = false
+
 // Assemble this module's KEDA scale rules from its declared triggers (keyless queue auth via MI).
 var queueRules = empty(queueName) ? [] : [
   {
@@ -125,8 +128,14 @@ var authAudienceEnv = empty(authAudience) ? [] : [
 ]
 var authEnv = concat(authModeEnv, authTenantEnv, authAudienceEnv)
 
+// Azure RESOURCE NAMES (Microsoft.App/containerApps, and the container label below) allow only
+// lowercase alphanumerics and hyphens — an underscore makes `az deployment` fail. Hyphenate the
+// module id for the Azure name ONLY; the real module identity (WP_MODULE env below) keeps the
+// underscore so the worker dispatches on the true module name.
+var resourceName = replace(moduleName, '_', '-')
+
 resource app 'Microsoft.App/containerApps@2025-01-01' = {
-  name: 'wp-${moduleName}'
+  name: 'wp-${resourceName}'
   location: location
   identity: {
     type: 'UserAssigned'
@@ -141,8 +150,11 @@ resource app 'Microsoft.App/containerApps@2025-01-01' = {
       registries: [
         { server: '${registry}.azurecr.io', identity: identityId }
       ]
+      // The API is ALWAYS internal (external: false). The web app is external ONLY when
+      // ingressExternal is true — main.bicep couples that to authMode == 'required' so the public
+      // web front door can never be open while the API is unauthenticated (review-67-v4).
       ingress: moduleName == 'api' || moduleName == 'web' ? {
-        external: moduleName == 'web'
+        external: moduleName == 'web' ? ingressExternal : false
         targetPort: moduleName == 'api' ? 8000 : 80
         transport: 'auto'
       } : null
@@ -150,7 +162,7 @@ resource app 'Microsoft.App/containerApps@2025-01-01' = {
     template: {
       containers: [
         {
-          name: moduleName
+          name: resourceName
           image: '${registry}.azurecr.io/workloads-platform/${image}:${imageTag}'
           command: empty(command) ? null : command
           resources: { cpu: json(cpu), memory: memoryGi }
